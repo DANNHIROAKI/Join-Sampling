@@ -12,7 +12,8 @@
 #include "baseline2.hpp"
 #include "ours.hpp"
 
-using namespace rectsampler;
+using namespace rect_sampler;
+
 
 // 用于对 RectPair 排序的比较函数
 struct RectPairLess {

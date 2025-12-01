@@ -9,6 +9,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <cstdio>
+#include <unistd.h>
 
 #include "geometry.hpp"
 
@@ -16,17 +18,15 @@ namespace rect_sampler {
 
 // ======================== CSV 读取 ========================
 
-// 从 CSV 读取矩形数据：
-// 格式：id,x_min,y_min,x_max,y_max,width,height,area
-// 只使用前 5 列，其余列直接忽略
-inline std::vector<Rect> load_rectangles_csv(const std::string& path,
-                                             bool is_c_flag) {
+// 从 CSV 读取矩形：id,x_min,y_min,x_max,y_max,width,height,area
+inline RectList load_rectangles_csv(const std::string& path,
+                                    bool is_c_flag) {
     std::ifstream ifs(path);
     if (!ifs) {
         throw std::runtime_error("Failed to open CSV file: " + path);
     }
 
-    std::vector<Rect> rects;
+    RectList rects;
     std::string line;
 
     // 跳过表头
@@ -82,14 +82,12 @@ public:
         start_ = clock::now();
     }
 
-    // 返回毫秒
     double elapsed_ms() const {
         auto now = clock::now();
         std::chrono::duration<double, std::milli> diff = now - start_;
         return diff.count();
     }
 
-    // 返回秒
     double elapsed_sec() const {
         auto now = clock::now();
         std::chrono::duration<double> diff = now - start_;
@@ -100,7 +98,6 @@ private:
     clock::time_point start_;
 };
 
-// RAII 计时 + 自动打印/记录（可选用）
 class ScopedTimer {
 public:
     ScopedTimer(const std::string& name, bool auto_print = true)
@@ -125,7 +122,6 @@ private:
 
 inline std::size_t getCurrentRSS() {
 #if defined(__linux__)
-    // Linux: 读取 /proc/self/statm
     long rss = 0L;
     FILE* fp = std::fopen("/proc/self/statm", "r");
     if (!fp) {
@@ -137,17 +133,14 @@ inline std::size_t getCurrentRSS() {
         return 0;
     }
     std::fclose(fp);
-    long page_size_kb = sysconf(_SC_PAGESIZE); // in bytes
-    return static_cast<std::size_t>(rss) * static_cast<std::size_t>(page_size_kb);
+    long page_size = sysconf(_SC_PAGESIZE); // bytes
+    return static_cast<std::size_t>(rss) * static_cast<std::size_t>(page_size);
 #else
-    // 其他平台这里留空实现（返回 0），需要的话可以自行扩展
     return 0;
 #endif
 }
 
-// 在 main 中可以自己维护一个全局 max_rss = max(max_rss, getCurrentRSS());
-
-// ======================== 简单日志工具 ========================
+// ======================== 简单日志 ========================
 
 inline void append_line_to_file(const std::string& path,
                                 const std::string& line) {

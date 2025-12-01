@@ -4,138 +4,206 @@
 #include <algorithm>
 #include <random>
 #include <cstddef>
-#include <cstdint>
 
 #include "geometry.hpp"
 #include "structures.hpp"
-#include "utils.hpp"
 
-// ========================================
-// Ours：O(n log n + t) i.i.d. 均匀采样
-// ========================================
-//
-// 接口：
-//   ours_sample(Rc, Rbar, t, rng, samples_out);
-//
-// 其中：
-//   - Rc / Rbar: 输入矩形集合
-//   - t: 需要采样的样本数
-//   - rng: 随机数引擎（例如 std::mt19937_64）
-//   - samples_out: 输出长度 t 的 RectPair 序列（函数内部会 clear）
+namespace rect_sampler {
+namespace ours {
 
-namespace ours_detail {
+namespace detail {
 
-    enum EventType : int {
-        END_EVENT   = 0,
-        START_EVENT = 1
-    };
+enum EventType : int {
+    END_EVENT   = 0,
+    START_EVENT = 1
+};
 
-    struct Event {
-        double x{0.0};
-        EventType type{END_EVENT};
-        bool is_c{false};  // true: Rc, false: Rbar
-        int  idx{-1};      // 在对应集合中的索引
-        int  start_id{-1}; // 仅 START 事件使用：在 START 集合中的编号 [0, num_starts)
-    };
+struct Event {
+    double    x{0.0};
+    EventType type{END_EVENT};
+    bool      is_c{false};   // true: from Rc, false: from Rbar
+    int       rect_idx{-1};  // index in Rc or Rbar
+    int       start_id{-1};  // index of START event in [0, num_starts)
+};
 
-    inline bool event_less(const Event& a, const Event& b) {
-        if (a.x < b.x) return true;
-        if (a.x > b.x) return false;
-        // x 相同：END 在 START 前
-        if (a.type != b.type) return a.type < b.type;
-        // 同为 START：固定 R_c 在 R_{\bar c} 前
-        if (a.type == START_EVENT && b.type == START_EVENT) {
-            if (a.is_c != b.is_c) return a.is_c > b.is_c; // true 在前
-        }
-        return false;
+inline bool event_less(const Event& a, const Event& b) {
+    if (a.x < b.x) return true;
+    if (a.x > b.x) return false;
+    // same x: END before START
+    if (a.type != b.type) return a.type < b.type;
+    // both START: Rc before Rbar (is_c = true first)
+    if (a.type == START_EVENT && b.type == START_EVENT) {
+        if (a.is_c != b.is_c) return a.is_c > b.is_c;
+    }
+    return false;
+}
+
+// 简单 alias 表，用于在 START 事件上按权重 w_e 采样
+struct AliasTable {
+    std::vector<double> prob;   // 列的“保留”概率
+    std::vector<int>    alias;  // 列的备选索引
+
+    void clear() {
+        prob.clear();
+        alias.clear();
     }
 
-} // namespace ours_detail
+    // weights[i] >= 0，且至少有一个 > 0
+    void build(const std::vector<double>& weights) {
+        clear();
+        const int n = static_cast<int>(weights.size());
+        if (n == 0) return;
 
-/// Ours：在不显式枚举 J 的前提下，从 J 上 i.i.d. 均匀采样 t 次
+        prob.resize(n);
+        alias.resize(n);
+
+        std::vector<double> scaled(n);
+        double sum = 0.0;
+        for (int i = 0; i < n; ++i) {
+            sum += weights[i];
+        }
+        if (sum <= 0.0) {
+            // 退化情况：全部权重为 0，直接设成均匀（理论上不会走到这）
+            for (int i = 0; i < n; ++i) {
+                prob[i]  = 1.0;
+                alias[i] = i;
+            }
+            return;
+        }
+
+        for (int i = 0; i < n; ++i) {
+            scaled[i] = weights[i] * n / sum;
+        }
+
+        std::vector<int> small, large;
+        small.reserve(n);
+        large.reserve(n);
+        for (int i = 0; i < n; ++i) {
+            if (scaled[i] < 1.0) small.push_back(i);
+            else                 large.push_back(i);
+        }
+
+        while (!small.empty() && !large.empty()) {
+            int s = small.back(); small.pop_back();
+            int l = large.back();
+            prob[s]  = scaled[s];
+            alias[s] = l;
+            scaled[l] = (scaled[l] + scaled[s]) - 1.0;
+            if (scaled[l] < 1.0) {
+                small.push_back(l);
+                large.pop_back();
+            }
+        }
+        while (!large.empty()) {
+            int l = large.back(); large.pop_back();
+            prob[l]  = 1.0;
+            alias[l] = l;
+        }
+        while (!small.empty()) {
+            int s = small.back(); small.pop_back();
+            prob[s]  = 1.0;
+            alias[s] = s;
+        }
+    }
+
+    template <class URNG>
+    int sample(URNG& rng) const {
+        const int n = static_cast<int>(prob.size());
+        if (n == 0) return -1;
+        std::uniform_int_distribution<int> col_dist(0, n - 1);
+        std::uniform_real_distribution<double> u01(0.0, 1.0);
+        int col = col_dist(rng);
+        double u = u01(rng);
+        return (u < prob[col]) ? col : alias[col];
+    }
+};
+
+} // namespace detail
+
+// ======================== 主接口 ========================
+//
+// 从全体跨集合相交对 J 中 i.i.d. 均匀采样 t 个样本。
+// 采样结果存到 samples_out（RectPair 里是索引，而不是几何数据）。
+//
 template <class URNG>
-inline void ours_sample(
-    const std::vector<Rect>& Rc,
-    const std::vector<Rect>& Rbar,
+inline void sample_pairs(
+    const RectList& Rc,
+    const RectList& Rbar,
     std::size_t t,
     URNG& rng,
-    std::vector<RectPair>& samples_out
+    PairList& samples_out
 ) {
-    using namespace ours_detail;
+    using namespace detail;
 
     samples_out.clear();
     if (t == 0) return;
 
     const int n1 = static_cast<int>(Rc.size());
     const int n2 = static_cast<int>(Rbar.size());
+    if (n1 == 0 || n2 == 0) {
+        // 没有任何跨集合相交对
+        return;
+    }
 
-    // ========== 0. 构建 1D 结构的全集（interval + point） ==========
-
-    // R_c
-    std::vector<DynamicIntervalStabbing::Interval> intervals_c;
-    intervals_c.reserve(n1);
+    // ---------- 1. 准备 y 方向的全集（端点 & 点） ----------
+    std::vector<double> endpoints_c;
+    std::vector<double> endpoints_bar;
     std::vector<double> points_c;
+    std::vector<double> points_bar;
+
+    endpoints_c.reserve(2 * n1);
     points_c.reserve(n1);
     for (int i = 0; i < n1; ++i) {
-        DynamicIntervalStabbing::Interval I;
-        I.lo = Rc[i].y_min;
-        I.hi = Rc[i].y_max;
-        I.id = i;
-        intervals_c.push_back(I);
+        endpoints_c.push_back(Rc[i].y_min);
+        endpoints_c.push_back(Rc[i].y_max);
         points_c.push_back(Rc[i].y_min);
     }
 
-    // R_{\bar c}
-    std::vector<DynamicIntervalStabbing::Interval> intervals_bar;
-    intervals_bar.reserve(n2);
-    std::vector<double> points_bar;
+    endpoints_bar.reserve(2 * n2);
     points_bar.reserve(n2);
     for (int i = 0; i < n2; ++i) {
-        DynamicIntervalStabbing::Interval I;
-        I.lo = Rbar[i].y_min;
-        I.hi = Rbar[i].y_max;
-        I.id = i;
-        intervals_bar.push_back(I);
+        endpoints_bar.push_back(Rbar[i].y_min);
+        endpoints_bar.push_back(Rbar[i].y_max);
         points_bar.push_back(Rbar[i].y_min);
     }
 
-    DynamicIntervalStabbing stab_c(intervals_c);
-    DynamicIntervalStabbing stab_bar(intervals_bar);
-    DynamicRangeTree      range_c(points_c);
-    DynamicRangeTree      range_bar(points_bar);
-
-    // ========== 1. 构建事件数组并排序 ==========
-
+    // ---------- 2. 构建事件数组并排序 ----------
     std::vector<Event> events;
     events.reserve((n1 + n2) * 2);
 
+    // Rc 的 START / END
     for (int i = 0; i < n1; ++i) {
-        Event s, e;
-        s.x    = Rc[i].x_min;
-        s.type = START_EVENT;
-        s.is_c = true;
-        s.idx  = i;
+        Event s,e;
+        s.x        = Rc[i].x_min;
+        s.type     = START_EVENT;
+        s.is_c     = true;
+        s.rect_idx = i;
+        s.start_id = -1;
 
-        e.x    = Rc[i].x_max;
-        e.type = END_EVENT;
-        e.is_c = true;
-        e.idx  = i;
+        e.x        = Rc[i].x_max;
+        e.type     = END_EVENT;
+        e.is_c     = true;
+        e.rect_idx = i;
+        e.start_id = -1;
 
         events.push_back(s);
         events.push_back(e);
     }
 
+    // Rbar 的 START / END
     for (int i = 0; i < n2; ++i) {
-        Event s, e;
-        s.x    = Rbar[i].x_min;
-        s.type = START_EVENT;
-        s.is_c = false;
-        s.idx  = i;
+        Event s,e;
+        s.x        = Rbar[i].x_min;
+        s.type     = START_EVENT;
+        s.is_c     = false;
+        s.rect_idx = i;
+        s.start_id = -1;
 
-        e.x    = Rbar[i].x_max;
-        e.type = END_EVENT;
-        e.is_c = false;
-        e.idx  = i;
+        e.x        = Rbar[i].x_max;
+        e.type     = END_EVENT;
+        e.is_c     = false;
+        e.rect_idx = i;
+        e.start_id = -1;
 
         events.push_back(s);
         events.push_back(e);
@@ -143,258 +211,241 @@ inline void ours_sample(
 
     std::sort(events.begin(), events.end(), event_less);
 
-    // 给所有 START 事件分配 start_id
+    // ---------- 3. 第一遍扫描：只做计数，得到每个 START 事件的 w_e, k_e^{(1)}, k_e^{(2)} ----------
+
+    // 统计 START 事件总数
     int num_starts = 0;
-    for (auto& ev : events) {
-        if (ev.type == START_EVENT) {
-            ev.start_id = num_starts++;
-        }
+    for (const auto& ev : events) {
+        if (ev.type == START_EVENT) ++num_starts;
     }
     if (num_starts == 0) {
-        // 没有任何 START 事件 → 没有相交对
-        samples_out.resize(0);
+        // 没有矩形变成 active，就一定没有相交对
         return;
     }
 
-    // ========== 2. 第一次扫描：只计数 k1, k2, w = k1 + k2 = |J_e| = |K_e^{(1)}| + |K_e^{(2)}| ==========
+    std::vector<std::size_t> k1(num_starts, 0), k2(num_starts, 0), w(num_starts, 0);
 
-    std::vector<std::uint64_t> k1(num_starts, 0);
-    std::vector<std::uint64_t> k2(num_starts, 0);
-    std::vector<std::uint64_t> w (num_starts, 0);
+    DynamicStabbing1D stab_c(endpoints_c);
+    DynamicStabbing1D stab_bar(endpoints_bar);
+    RangeTree1D      range_c(points_c);
+    RangeTree1D      range_bar(points_bar);
 
-    for (const auto& ev : events) {
+    int next_start_id = 0;
+    std::size_t total_w = 0;
+
+    for (auto& ev : events) {
         if (ev.type == END_EVENT) {
             if (ev.is_c) {
-                stab_c.deactivate(ev.idx);
-                range_c.deactivate(ev.idx);
+                const Rect& r = Rc[ev.rect_idx];
+                stab_c.deactivate(ev.rect_idx, r.y_min, r.y_max);
+                range_c.deactivate(ev.rect_idx);
             } else {
-                stab_bar.deactivate(ev.idx);
-                range_bar.deactivate(ev.idx);
+                const Rect& r = Rbar[ev.rect_idx];
+                stab_bar.deactivate(ev.rect_idx, r.y_min, r.y_max);
+                range_bar.deactivate(ev.rect_idx);
             }
-        } else {
-            // START_EVENT
-            const int e_id = ev.start_id;
+        } else { // START_EVENT
+            int sid = next_start_id++;
+            ev.start_id = sid;
+
             if (ev.is_c) {
-                const Rect& r = Rc[ev.idx];
+                const Rect& r = Rc[ev.rect_idx];
                 double D = r.y_min;
                 double U = r.y_max;
 
-                // K_e^{(1)}：D(r_bar) <= D < U(r_bar)
-                std::size_t cnt1 = stab_bar.count(D);
+                std::size_t cnt1 = stab_bar.count(D);      // K_e^{(1)}
+                std::size_t cnt2 = range_bar.count(D, U);  // K_e^{(2)}，(D,U)
 
-                // K_e^{(2)}：D < D(r_bar) < U
-                std::size_t cnt2 = range_bar.count(D, U);
+                k1[sid] = cnt1;
+                k2[sid] = cnt2;
+                w[sid]  = cnt1 + cnt2;
+                total_w += w[sid];
 
-                k1[e_id] = static_cast<std::uint64_t>(cnt1);
-                k2[e_id] = static_cast<std::uint64_t>(cnt2);
-                w [e_id] = k1[e_id] + k2[e_id];
-
-                // 激活 r ∈ R_c
-                stab_c.activate(ev.idx);
-                range_c.activate(ev.idx);
+                // 把 r 插入 R_c 的结构
+                stab_c.activate(ev.rect_idx, r.y_min, r.y_max);
+                range_c.activate(ev.rect_idx);
             } else {
-                const Rect& r = Rbar[ev.idx];
+                const Rect& r = Rbar[ev.rect_idx];
                 double D = r.y_min;
                 double U = r.y_max;
 
                 std::size_t cnt1 = stab_c.count(D);
                 std::size_t cnt2 = range_c.count(D, U);
 
-                k1[e_id] = static_cast<std::uint64_t>(cnt1);
-                k2[e_id] = static_cast<std::uint64_t>(cnt2);
-                w [e_id] = k1[e_id] + k2[e_id];
+                k1[sid] = cnt1;
+                k2[sid] = cnt2;
+                w[sid]  = cnt1 + cnt2;
+                total_w += w[sid];
 
-                stab_bar.activate(ev.idx);
-                range_bar.activate(ev.idx);
+                stab_bar.activate(ev.rect_idx, r.y_min, r.y_max);
+                range_bar.activate(ev.rect_idx);
             }
         }
     }
 
-    // 计算全局 |J| = sum_e w_e
-    std::uint64_t total_pairs = 0;
-    for (int e = 0; e < num_starts; ++e) {
-        total_pairs += w[e];
-    }
-    if (total_pairs == 0) {
-        // 没有任何相交对，按约定直接返回空
-        samples_out.resize(0);
+    if (total_w == 0) {
+        // 没有相交对，直接返回空
         return;
     }
 
-    // ========== 3. 第二阶段：事件级别 alias + slot 规划 ==========
+    // ---------- 4. 第二阶段：采样规划（事件级 alias + 类型分配） ----------
 
-    // 只在 w_e > 0 的事件上建 alias
-    std::vector<int>    nonzero_events;
-    std::vector<double> event_weights;
-    nonzero_events.reserve(num_starts);
-    event_weights.reserve(num_starts);
+    // 只在 w_e > 0 的事件上做 alias
+    std::vector<int>    active_sids;
+    std::vector<double> weights;
+    active_sids.reserve(num_starts);
+    weights.reserve(num_starts);
 
-    for (int e = 0; e < num_starts; ++e) {
-        if (w[e] > 0) {
-            nonzero_events.push_back(e);
-            event_weights.push_back(static_cast<double>(w[e]));
+    for (int sid = 0; sid < num_starts; ++sid) {
+        if (w[sid] > 0) {
+            active_sids.push_back(sid);
+            weights.push_back(static_cast<double>(w[sid]));
         }
     }
+    if (active_sids.empty()) {
+        // 理论上不会发生，因为 total_w > 0
+        return;
+    }
 
-    AliasTable event_alias;
-    event_alias.build(event_weights);
+    detail::AliasTable alias;
+    alias.build(weights);
 
-    // 为每个事件 e 和类型 g=1,2 维护 slots 集合
-    std::vector<std::vector<std::size_t>> slots_k1(num_starts);
-    std::vector<std::vector<std::size_t>> slots_k2(num_starts);
+    // 每个 START 事件 / 类型，对应要填的样本槽位
+    std::vector<std::vector<std::size_t>> slots1(num_starts);
+    std::vector<std::vector<std::size_t>> slots2(num_starts);
 
-    std::uniform_real_distribution<double> dist01(0.0, 1.0);
+    std::uniform_real_distribution<double> u01(0.0, 1.0);
 
     for (std::size_t j = 0; j < t; ++j) {
-        // step1: 在事件集合（非零权重）上按 w_e 抽一个 e
-        int col = event_alias.sample(rng);
-        if (col < 0) {
-            // 理论上不会发生
-            continue;
-        }
-        int e_id = nonzero_events[col];
+        int col = alias.sample(rng);
+        if (col < 0) continue; // 防御式，正常不会触发
 
-        std::uint64_t k1e = k1[e_id];
-        std::uint64_t k2e = k2[e_id];
-        std::uint64_t we  = w [e_id];
+        int sid = active_sids[col];
 
-        if (we == 0) continue; // 防守式
+        double p1 = (w[sid] == 0)
+            ? 0.0
+            : static_cast<double>(k1[sid]) / static_cast<double>(w[sid]);
 
-        int group = 1;
-        if (k1e == 0 && k2e == 0) {
-            // 不应发生（we>0），防守
-            continue;
-        } else if (k1e == 0) {
-            group = 2;
-        } else if (k2e == 0) {
-            group = 1;
+        double u = u01(rng);
+        if (u < p1) {
+            // 类型 1：K_e^{(1)}
+            slots1[sid].push_back(j);
         } else {
-            double p = static_cast<double>(k1e) / static_cast<double>(we);
-            double u = dist01(rng);
-            group = (u < p ? 1 : 2);
-        }
-
-        if (group == 1) {
-            slots_k1[e_id].push_back(j);
-        } else {
-            slots_k2[e_id].push_back(j);
+            // 类型 2：K_e^{(2)}
+            slots2[sid].push_back(j);
         }
     }
 
-    // ========== 4. 第二次构建 1D 结构 & 第三阶段第二次扫描 ==========
-
-    // 重新构建 1D 结构，以清空活跃集
-    stab_c.build(intervals_c);
-    stab_bar.build(intervals_bar);
-    range_c.build(points_c);
-    range_bar.build(points_bar);
-
-    samples_out.clear();
+    // 预分配输出数组
     samples_out.resize(t);
-    // 先填充一个非法值，便于 debug 时检测
     for (std::size_t j = 0; j < t; ++j) {
         samples_out[j].idx_c   = -1;
         samples_out[j].idx_bar = -1;
     }
 
-    std::vector<int> local_ids;   // 复用的局部采样数组
+    // ---------- 5. 第三阶段：第二次扫描 + 局部采样 + 回填 ----------
+
+    DynamicStabbing1D stab_c2(endpoints_c);
+    DynamicStabbing1D stab_bar2(endpoints_bar);
+    RangeTree1D      range_c2(points_c);
+    RangeTree1D      range_bar2(points_bar);
+
+    std::vector<int> local_ids;
 
     for (const auto& ev : events) {
         if (ev.type == END_EVENT) {
             if (ev.is_c) {
-                stab_c.deactivate(ev.idx);
-                range_c.deactivate(ev.idx);
+                const Rect& r = Rc[ev.rect_idx];
+                stab_c2.deactivate(ev.rect_idx, r.y_min, r.y_max);
+                range_c2.deactivate(ev.rect_idx);
             } else {
-                stab_bar.deactivate(ev.idx);
-                range_bar.deactivate(ev.idx);
+                const Rect& r = Rbar[ev.rect_idx];
+                stab_bar2.deactivate(ev.rect_idx, r.y_min, r.y_max);
+                range_bar2.deactivate(ev.rect_idx);
             }
-        } else {
-            // START_EVENT
-            const int e_id = ev.start_id;
-            const std::size_t need1 = slots_k1[e_id].size();
-            const std::size_t need2 = slots_k2[e_id].size();
+        } else { // START_EVENT
+            int sid = ev.start_id;
+            if (sid < 0) continue; // 理论上不会
 
             if (ev.is_c) {
-                const Rect& r = Rc[ev.idx];
+                const Rect& r = Rc[ev.rect_idx];
                 double D = r.y_min;
                 double U = r.y_max;
 
-                // ---- 类型 1：K_e^{(1)}，使用 stabbing 结构在 R_{\bar c} 上采样 need1 次 ----
-                if (need1 > 0) {
+                // 类型 1：从 K_e^{(1)} 中采样（stab_bar2）
+                auto& S1 = slots1[sid];
+                if (!S1.empty()) {
                     local_ids.clear();
-                    stab_bar.sample(D, need1, rng, local_ids);
-                    // 写回对应 slots
-                    const auto& slots = slots_k1[e_id];
-                    const std::size_t m = std::min(need1, local_ids.size());
-                    for (std::size_t i = 0; i < m; ++i) {
-                        std::size_t j = slots[i];
-                        RectPair p;
-                        p.idx_c   = ev.idx;
-                        p.idx_bar = local_ids[i];
-                        samples_out[j] = p;
+                    stab_bar2.sample(D, S1.size(), rng, local_ids);
+                    for (std::size_t i = 0; i < S1.size() && i < local_ids.size(); ++i) {
+                        std::size_t slot = S1[i];
+                        int idx_bar = local_ids[i];
+                        samples_out[slot].idx_c   = ev.rect_idx;
+                        samples_out[slot].idx_bar = idx_bar;
                     }
+                    S1.clear();
                 }
 
-                // ---- 类型 2：K_e^{(2)}，使用 range 结构在 R_{\bar c} 上采样 need2 次 ----
-                if (need2 > 0) {
+                // 类型 2：从 K_e^{(2)} 中采样（range_bar2）
+                auto& S2 = slots2[sid];
+                if (!S2.empty()) {
                     local_ids.clear();
-                    range_bar.sample(D, U, need2, rng, local_ids);
-                    const auto& slots = slots_k2[e_id];
-                    const std::size_t m = std::min(need2, local_ids.size());
-                    for (std::size_t i = 0; i < m; ++i) {
-                        std::size_t j = slots[i];
-                        RectPair p;
-                        p.idx_c   = ev.idx;
-                        p.idx_bar = local_ids[i];
-                        samples_out[j] = p;
+                    range_bar2.sample(D, U, S2.size(), rng, local_ids);
+                    for (std::size_t i = 0; i < S2.size() && i < local_ids.size(); ++i) {
+                        std::size_t slot = S2[i];
+                        int idx_bar = local_ids[i];
+                        samples_out[slot].idx_c   = ev.rect_idx;
+                        samples_out[slot].idx_bar = idx_bar;
                     }
+                    S2.clear();
                 }
 
-                // 最后把 r 加入 R_c 的活跃集
-                stab_c.activate(ev.idx);
-                range_c.activate(ev.idx);
-            } else {
-                // r ∈ R_{\bar c}，对称处理
-                const Rect& r = Rbar[ev.idx];
+                // 激活 r ∈ R_c
+                stab_c2.activate(ev.rect_idx, r.y_min, r.y_max);
+                range_c2.activate(ev.rect_idx);
+
+            } else { // r ∈ Rbar
+                const Rect& r = Rbar[ev.rect_idx];
                 double D = r.y_min;
                 double U = r.y_max;
 
-                if (need1 > 0) {
+                // 类型 1：K_e^{(1)}，stabbing 在 R_c 上
+                auto& S1 = slots1[sid];
+                if (!S1.empty()) {
                     local_ids.clear();
-                    stab_c.sample(D, need1, rng, local_ids);
-                    const auto& slots = slots_k1[e_id];
-                    const std::size_t m = std::min(need1, local_ids.size());
-                    for (std::size_t i = 0; i < m; ++i) {
-                        std::size_t j = slots[i];
-                        RectPair p;
-                        p.idx_c   = local_ids[i];
-                        p.idx_bar = ev.idx;
-                        samples_out[j] = p;
+                    stab_c2.sample(D, S1.size(), rng, local_ids);
+                    for (std::size_t i = 0; i < S1.size() && i < local_ids.size(); ++i) {
+                        std::size_t slot = S1[i];
+                        int idx_c = local_ids[i];
+                        samples_out[slot].idx_c   = idx_c;
+                        samples_out[slot].idx_bar = ev.rect_idx;
                     }
+                    S1.clear();
                 }
 
-                if (need2 > 0) {
+                // 类型 2：K_e^{(2)}，range 在 R_c 上
+                auto& S2 = slots2[sid];
+                if (!S2.empty()) {
                     local_ids.clear();
-                    range_c.sample(D, U, need2, rng, local_ids);
-                    const auto& slots = slots_k2[e_id];
-                    const std::size_t m = std::min(need2, local_ids.size());
-                    for (std::size_t i = 0; i < m; ++i) {
-                        std::size_t j = slots[i];
-                        RectPair p;
-                        p.idx_c   = local_ids[i];
-                        p.idx_bar = ev.idx;
-                        samples_out[j] = p;
+                    range_c2.sample(D, U, S2.size(), rng, local_ids);
+                    for (std::size_t i = 0; i < S2.size() && i < local_ids.size(); ++i) {
+                        std::size_t slot = S2[i];
+                        int idx_c = local_ids[i];
+                        samples_out[slot].idx_c   = idx_c;
+                        samples_out[slot].idx_bar = ev.rect_idx;
                     }
+                    S2.clear();
                 }
 
-                stab_bar.activate(ev.idx);
-                range_bar.activate(ev.idx);
+                // 激活 r ∈ R_{\bar c}
+                stab_bar2.activate(ev.rect_idx, r.y_min, r.y_max);
+                range_bar2.activate(ev.rect_idx);
             }
         }
     }
 
-    // （可选）这里可以检查是否所有 samples_out[j] 都被填上了合法值
-    // for (std::size_t j = 0; j < t; ++j) {
-    //     assert(samples_out[j].idx_c >= 0 && samples_out[j].idx_bar >= 0);
-    // }
+    // 理论上到这里，samples_out[0..t-1] 全部都应该是合法 pair（如果 total_w>0）
 }
+
+} // namespace ours
+} // namespace rect_sampler

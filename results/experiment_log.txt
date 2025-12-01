@@ -1,0 +1,15 @@
+# algo,t,time_enum_ms,time_sample_ms,time_total_ms,mem_bytes,flag_equal_gt,bad_sample_count,extra
+baseline1_enum,0,113548,0,113548,16785408,1,0,ground_truth_enum
+baseline2_enum,0,7187.59,0,7187.59,171032576,1,0,b2_enum_vs_gt
+baseline1_sample,1000,0,0.135118,0.135118,171032576,1,0,baseline1_sample
+baseline2_sample,1000,0,0.129578,0.129578,171032576,1,0,baseline2_sample
+ours,1000,0,0,12265.6,473030656,1,0,ours_total
+baseline1_sample,10000,0,1.09409,1.09409,473030656,1,0,baseline1_sample
+baseline2_sample,10000,0,1.11067,1.11067,473030656,1,0,baseline2_sample
+ours,10000,0,0,12236.4,601739264,1,0,ours_total
+baseline1_sample,100000,0,6.67774,6.67774,601739264,1,0,baseline1_sample
+baseline2_sample,100000,0,6.64774,6.64774,601739264,1,0,baseline2_sample
+ours,100000,0,0,12567.5,670150656,1,0,ours_total
+baseline1_sample,1000000,0,32.9212,32.9212,670150656,1,0,baseline1_sample
+baseline2_sample,1000000,0,32.872,32.872,670150656,1,0,baseline2_sample
+ours,1000000,0,0,13800.7,703459328,1,0,ours_total
