@@ -28,3 +28,13 @@ git commit -m "first commit"
 git branch -M main
 git remote add origin https://github.com/DANNHIROAKI/Join-Sampling.git
 git push -u origin main
+
+
+
+
+
+git status
+git add .
+git commit -m "Initial commit"
+git branch -M main
+git push -u origin main
