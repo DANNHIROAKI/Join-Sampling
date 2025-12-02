@@ -50,8 +50,18 @@ inline void enumerate_all_pairs(
 
     all_pairs_out.clear();
 
-    const int n1 = static_cast<int>(Rc.size());
-    const int n2 = static_cast<int>(Rbar.size());
+    const std::size_t n1 = Rc.size();
+    const std::size_t n2 = Rbar.size();
+
+    if (n1 > 0 && n2 > 0) {
+        const std::size_t max_reservable = all_pairs_out.max_size();
+        // Safely compute n1 * n2 without overflow; fall back to max_size if it would wrap.
+        if (n1 > max_reservable / n2) {
+            all_pairs_out.reserve(max_reservable);
+        } else {
+            all_pairs_out.reserve(std::min<std::size_t>(n1 * n2, max_reservable));
+        }
+    }
 
     // ---------- 构建 1D 结构的全集 ----------
 
@@ -61,7 +71,7 @@ inline void enumerate_all_pairs(
     std::vector<double> points_c;
     points_c.reserve(n1);
 
-    for (int i = 0; i < n1; ++i) {
+    for (std::size_t i = 0; i < n1; ++i) {
         endpoints_c.push_back(Rc[i].y_min);
         endpoints_c.push_back(Rc[i].y_max);
         points_c.push_back(Rc[i].y_min);
@@ -73,7 +83,7 @@ inline void enumerate_all_pairs(
     std::vector<double> points_bar;
     points_bar.reserve(n2);
 
-    for (int i = 0; i < n2; ++i) {
+    for (std::size_t i = 0; i < n2; ++i) {
         endpoints_bar.push_back(Rbar[i].y_min);
         endpoints_bar.push_back(Rbar[i].y_max);
         points_bar.push_back(Rbar[i].y_min);
@@ -89,33 +99,33 @@ inline void enumerate_all_pairs(
     std::vector<Event> events;
     events.reserve((n1 + n2) * 2);
 
-    for (int i = 0; i < n1; ++i) {
+    for (std::size_t i = 0; i < n1; ++i) {
         Event s,e;
         s.x    = Rc[i].x_min;
         s.type = START_EVENT;
         s.is_c = true;
-        s.idx  = i;
+        s.idx  = static_cast<int>(i);
 
         e.x    = Rc[i].x_max;
         e.type = END_EVENT;
         e.is_c = true;
-        e.idx  = i;
+        e.idx  = static_cast<int>(i);
 
         events.push_back(s);
         events.push_back(e);
     }
 
-    for (int i = 0; i < n2; ++i) {
+    for (std::size_t i = 0; i < n2; ++i) {
         Event s,e;
         s.x    = Rbar[i].x_min;
         s.type = START_EVENT;
         s.is_c = false;
-        s.idx  = i;
+        s.idx  = static_cast<int>(i);
 
         e.x    = Rbar[i].x_max;
         e.type = END_EVENT;
         e.is_c = false;
-        e.idx  = i;
+        e.idx  = static_cast<int>(i);
 
         events.push_back(s);
         events.push_back(e);

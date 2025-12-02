@@ -20,7 +20,13 @@ inline void enumerate_all_pairs(
     const std::size_t n2 = Rbar.size();
 
     if (n1 > 0 && n2 > 0) {
-        all_pairs_out.reserve(std::min<std::size_t>(n1 * 4, n1 * n2));
+        const std::size_t max_reservable = all_pairs_out.max_size();
+        // Safely compute n1 * n2 without overflow; fall back to max_size if it would wrap.
+        if (n1 > max_reservable / n2) {
+            all_pairs_out.reserve(max_reservable);
+        } else {
+            all_pairs_out.reserve(std::min<std::size_t>(n1 * n2, max_reservable));
+        }
     }
 
     for (std::size_t i = 0; i < n1; ++i) {

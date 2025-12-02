@@ -11,6 +11,7 @@
 #include "baseline1.hpp"
 #include "baseline2.hpp"
 #include "ours.hpp"
+#include "ours_adaptive.hpp"
 
 using namespace rect_sampler;
 
@@ -243,6 +244,33 @@ int main() {
                     << 1 << ","              // 只要 bad_ours_samples=0 就视为 flag=1
                     << bad_ours_samples << ","
                     << "ours_total\n";
+            }
+
+            // ---------- 4.4 Ours-Adaptive：自适应枚举/计数采样 ----------
+            PairList samples_adaptive;
+            timer.reset();
+            ours_adaptive::sample_pairs_adaptive(Rc, Rbar, t, rng, samples_adaptive);
+            double ours_adaptive_ms = timer.elapsed_ms();
+            std::size_t rss_after_adaptive = getCurrentRSS();
+
+            std::size_t bad_adaptive_samples =
+                count_pairs_not_in(gt_sorted, samples_adaptive);
+
+            std::cout << "[INFO] Ours-Adaptive total sample time = "
+                      << ours_adaptive_ms << " ms\n";
+            std::cout << "[INFO] Ours-Adaptive bad samples vs GT = "
+                      << bad_adaptive_samples << "\n";
+
+            {
+                std::ofstream ofs(log_path, std::ios::app);
+                ofs << "ours_adaptive," << t << ","
+                    << 0 << ","
+                    << 0 << ","
+                    << ours_adaptive_ms << ","
+                    << rss_after_adaptive << ","
+                    << 1 << ","
+                    << bad_adaptive_samples << ","
+                    << "ours_adaptive_total\n";
             }
         }
 
