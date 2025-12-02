@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <random>
 #include <cstddef>
+#include <limits>
 
 #include "geometry.hpp"
 #include "structures.hpp"
@@ -23,7 +24,7 @@ struct Event {
     EventType type{END_EVENT};
     bool      is_c{false};   // true: from Rc, false: from Rbar
     int       rect_idx{-1};  // index in Rc or Rbar
-    int       start_id{-1};  // index of START event in [0, num_starts)
+    std::size_t start_id{std::numeric_limits<std::size_t>::max()};  // index of START event in [0, num_starts)
 };
 
 inline bool event_less(const Event& a, const Event& b) {
@@ -41,7 +42,7 @@ inline bool event_less(const Event& a, const Event& b) {
 // 简单 alias 表，用于在 START 事件上按权重 w_e 采样
 struct AliasTable {
     std::vector<double> prob;   // 列的“保留”概率
-    std::vector<int>    alias;  // 列的备选索引
+    std::vector<std::size_t>    alias;  // 列的备选索引
 
     void clear() {
         prob.clear();
@@ -51,7 +52,7 @@ struct AliasTable {
     // weights[i] >= 0，且至少有一个 > 0
     void build(const std::vector<double>& weights) {
         clear();
-        const int n = static_cast<int>(weights.size());
+        const std::size_t n = weights.size();
         if (n == 0) return;
 
         prob.resize(n);
@@ -59,33 +60,33 @@ struct AliasTable {
 
         std::vector<double> scaled(n);
         double sum = 0.0;
-        for (int i = 0; i < n; ++i) {
+        for (std::size_t i = 0; i < n; ++i) {
             sum += weights[i];
         }
         if (sum <= 0.0) {
             // 退化情况：全部权重为 0，直接设成均匀（理论上不会走到这）
-            for (int i = 0; i < n; ++i) {
+            for (std::size_t i = 0; i < n; ++i) {
                 prob[i]  = 1.0;
                 alias[i] = i;
             }
             return;
         }
 
-        for (int i = 0; i < n; ++i) {
+        for (std::size_t i = 0; i < n; ++i) {
             scaled[i] = weights[i] * n / sum;
         }
 
-        std::vector<int> small, large;
+        std::vector<std::size_t> small, large;
         small.reserve(n);
         large.reserve(n);
-        for (int i = 0; i < n; ++i) {
+        for (std::size_t i = 0; i < n; ++i) {
             if (scaled[i] < 1.0) small.push_back(i);
             else                 large.push_back(i);
         }
 
         while (!small.empty() && !large.empty()) {
-            int s = small.back(); small.pop_back();
-            int l = large.back();
+            std::size_t s = small.back(); small.pop_back();
+            std::size_t l = large.back();
             prob[s]  = scaled[s];
             alias[s] = l;
             scaled[l] = (scaled[l] + scaled[s]) - 1.0;
@@ -95,24 +96,24 @@ struct AliasTable {
             }
         }
         while (!large.empty()) {
-            int l = large.back(); large.pop_back();
+            std::size_t l = large.back(); large.pop_back();
             prob[l]  = 1.0;
             alias[l] = l;
         }
         while (!small.empty()) {
-            int s = small.back(); small.pop_back();
+            std::size_t s = small.back(); small.pop_back();
             prob[s]  = 1.0;
             alias[s] = s;
         }
     }
 
     template <class URNG>
-    int sample(URNG& rng) const {
-        const int n = static_cast<int>(prob.size());
-        if (n == 0) return -1;
-        std::uniform_int_distribution<int> col_dist(0, n - 1);
+    std::size_t sample(URNG& rng) const {
+        const std::size_t n = prob.size();
+        if (n == 0) return std::numeric_limits<std::size_t>::max();
+        std::uniform_int_distribution<std::size_t> col_dist(0, n - 1);
         std::uniform_real_distribution<double> u01(0.0, 1.0);
-        int col = col_dist(rng);
+        std::size_t col = col_dist(rng);
         double u = u01(rng);
         return (u < prob[col]) ? col : alias[col];
     }
@@ -136,10 +137,14 @@ inline void sample_pairs(
     using namespace detail;
 
     samples_out.clear();
-    if (t == 0) return;
+    const std::size_t max_samples = samples_out.max_size();
+    if (t == 0 || max_samples == 0) return;
+    if (t > max_samples) {
+        t = max_samples;
+    }
 
-    const int n1 = static_cast<int>(Rc.size());
-    const int n2 = static_cast<int>(Rbar.size());
+    const std::size_t n1 = Rc.size();
+    const std::size_t n2 = Rbar.size();
     if (n1 == 0 || n2 == 0) {
         // 没有任何跨集合相交对
         return;
@@ -151,17 +156,23 @@ inline void sample_pairs(
     std::vector<double> points_c;
     std::vector<double> points_bar;
 
-    endpoints_c.reserve(2 * n1);
-    points_c.reserve(n1);
-    for (int i = 0; i < n1; ++i) {
+    const std::size_t max_endpoints_c = endpoints_c.max_size();
+    const std::size_t need_endpoints_c = (n1 > max_endpoints_c / 2) ? max_endpoints_c : n1 * 2;
+    endpoints_c.reserve(need_endpoints_c);
+    const std::size_t max_points_c = points_c.max_size();
+    points_c.reserve(std::min<std::size_t>(n1, max_points_c));
+    for (std::size_t i = 0; i < n1; ++i) {
         endpoints_c.push_back(Rc[i].y_min);
         endpoints_c.push_back(Rc[i].y_max);
         points_c.push_back(Rc[i].y_min);
     }
 
-    endpoints_bar.reserve(2 * n2);
-    points_bar.reserve(n2);
-    for (int i = 0; i < n2; ++i) {
+    const std::size_t max_endpoints_bar = endpoints_bar.max_size();
+    const std::size_t need_endpoints_bar = (n2 > max_endpoints_bar / 2) ? max_endpoints_bar : n2 * 2;
+    endpoints_bar.reserve(need_endpoints_bar);
+    const std::size_t max_points_bar = points_bar.max_size();
+    points_bar.reserve(std::min<std::size_t>(n2, max_points_bar));
+    for (std::size_t i = 0; i < n2; ++i) {
         endpoints_bar.push_back(Rbar[i].y_min);
         endpoints_bar.push_back(Rbar[i].y_max);
         points_bar.push_back(Rbar[i].y_min);
@@ -169,41 +180,49 @@ inline void sample_pairs(
 
     // ---------- 2. 构建事件数组并排序 ----------
     std::vector<Event> events;
-    events.reserve((n1 + n2) * 2);
+    const std::size_t max_event_capacity = events.max_size();
+    const std::size_t sum_n = (n1 > std::numeric_limits<std::size_t>::max() - n2)
+        ? std::numeric_limits<std::size_t>::max()
+        : n1 + n2;
+    if (sum_n > max_event_capacity / 2) {
+        events.reserve(max_event_capacity);
+    } else {
+        events.reserve(std::min<std::size_t>(sum_n * 2, max_event_capacity));
+    }
 
     // Rc 的 START / END
-    for (int i = 0; i < n1; ++i) {
+    for (std::size_t i = 0; i < n1; ++i) {
         Event s,e;
         s.x        = Rc[i].x_min;
         s.type     = START_EVENT;
         s.is_c     = true;
-        s.rect_idx = i;
-        s.start_id = -1;
+        s.rect_idx = static_cast<int>(i);
+        s.start_id = std::numeric_limits<std::size_t>::max();
 
         e.x        = Rc[i].x_max;
         e.type     = END_EVENT;
         e.is_c     = true;
-        e.rect_idx = i;
-        e.start_id = -1;
+        e.rect_idx = static_cast<int>(i);
+        e.start_id = std::numeric_limits<std::size_t>::max();
 
         events.push_back(s);
         events.push_back(e);
     }
 
     // Rbar 的 START / END
-    for (int i = 0; i < n2; ++i) {
+    for (std::size_t i = 0; i < n2; ++i) {
         Event s,e;
         s.x        = Rbar[i].x_min;
         s.type     = START_EVENT;
         s.is_c     = false;
-        s.rect_idx = i;
-        s.start_id = -1;
+        s.rect_idx = static_cast<int>(i);
+        s.start_id = std::numeric_limits<std::size_t>::max();
 
         e.x        = Rbar[i].x_max;
         e.type     = END_EVENT;
         e.is_c     = false;
-        e.rect_idx = i;
-        e.start_id = -1;
+        e.rect_idx = static_cast<int>(i);
+        e.start_id = std::numeric_limits<std::size_t>::max();
 
         events.push_back(s);
         events.push_back(e);
@@ -214,7 +233,7 @@ inline void sample_pairs(
     // ---------- 3. 第一遍扫描：只做计数，得到每个 START 事件的 w_e, k_e^{(1)}, k_e^{(2)} ----------
 
     // 统计 START 事件总数
-    int num_starts = 0;
+    std::size_t num_starts = 0;
     for (const auto& ev : events) {
         if (ev.type == START_EVENT) ++num_starts;
     }
@@ -230,7 +249,7 @@ inline void sample_pairs(
     RangeTree1D      range_c(points_c);
     RangeTree1D      range_bar(points_bar);
 
-    int next_start_id = 0;
+    std::size_t next_start_id = 0;
     std::size_t total_w = 0;
 
     for (auto& ev : events) {
@@ -245,7 +264,7 @@ inline void sample_pairs(
                 range_bar.deactivate(ev.rect_idx);
             }
         } else { // START_EVENT
-            int sid = next_start_id++;
+            std::size_t sid = next_start_id++;
             ev.start_id = sid;
 
             if (ev.is_c) {
@@ -291,12 +310,12 @@ inline void sample_pairs(
     // ---------- 4. 第二阶段：采样规划（事件级 alias + 类型分配） ----------
 
     // 只在 w_e > 0 的事件上做 alias
-    std::vector<int>    active_sids;
+    std::vector<std::size_t>    active_sids;
     std::vector<double> weights;
     active_sids.reserve(num_starts);
     weights.reserve(num_starts);
 
-    for (int sid = 0; sid < num_starts; ++sid) {
+    for (std::size_t sid = 0; sid < num_starts; ++sid) {
         if (w[sid] > 0) {
             active_sids.push_back(sid);
             weights.push_back(static_cast<double>(w[sid]));
@@ -317,10 +336,10 @@ inline void sample_pairs(
     std::uniform_real_distribution<double> u01(0.0, 1.0);
 
     for (std::size_t j = 0; j < t; ++j) {
-        int col = alias.sample(rng);
-        if (col < 0) continue; // 防御式，正常不会触发
+        std::size_t col = alias.sample(rng);
+        if (col == std::numeric_limits<std::size_t>::max()) continue; // 防御式，正常不会触发
 
-        int sid = active_sids[col];
+        std::size_t sid = active_sids[col];
 
         double p1 = (w[sid] == 0)
             ? 0.0
@@ -364,8 +383,8 @@ inline void sample_pairs(
                 range_bar2.deactivate(ev.rect_idx);
             }
         } else { // START_EVENT
-            int sid = ev.start_id;
-            if (sid < 0) continue; // 理论上不会
+            std::size_t sid = ev.start_id;
+            if (sid == std::numeric_limits<std::size_t>::max()) continue; // 理论上不会
 
             if (ev.is_c) {
                 const Rect& r = Rc[ev.rect_idx];
