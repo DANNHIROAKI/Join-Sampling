@@ -91,6 +91,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -336,7 +337,7 @@ struct Value {
   double num{0.0};
   std::string str;
   std::vector<Value> arr;
-  std::unordered_map<std::string, Value> obj;
+  std::unordered_map<std::string, std::unique_ptr<Value>> obj;
 
   bool IsNull() const { return type == Type::Null; }
   bool IsBool() const { return type == Type::Bool; }
@@ -545,7 +546,7 @@ class Parser {
       SkipWs();
       Value val;
       if (!ParseValue(&val, err)) return false;
-      out->obj.emplace(std::move(key.str), std::move(val));
+      out->obj.emplace(std::move(key.str), std::make_unique<Value>(std::move(val)));
       SkipWs();
       if (i_ >= s_.size()) { SetErr(err, "json parse: unterminated object"); return false; }
       if (s_[i_] == ',') {
@@ -570,7 +571,7 @@ inline const Value* Get(const Value& obj, std::string_view key) {
   if (!obj.IsObject()) return nullptr;
   auto it = obj.obj.find(std::string(key));
   if (it == obj.obj.end()) return nullptr;
-  return &it->second;
+  return it->second.get();
 }
 
 inline bool GetString(const Value& v, std::string* out) {
@@ -661,7 +662,7 @@ inline std::unordered_map<std::string, std::string> GetStringMap(const Value* v)
   if (!v || !v->IsObject()) return out;
   out.reserve(v->obj.size());
   for (const auto& kv : v->obj) {
-    const Value& vv = kv.second;
+    const Value& vv = *kv.second;
     if (vv.IsString()) out.emplace(kv.first, vv.str);
     else if (vv.IsNumber()) out.emplace(kv.first, std::to_string(vv.num));
     else if (vv.IsBool()) out.emplace(kv.first, vv.b ? "true" : "false");
