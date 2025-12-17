@@ -3,6 +3,7 @@
 // Regression tests for write_results utilities.
 
 #include "sjs/baselines/baseline_api.h"
+#include "sjs/core/types.h"
 #include "sjs/io/write_results.h"
 
 #include <filesystem>
@@ -56,6 +57,22 @@ int main() {
   CHECK(t, !err.empty());
   CHECK(t, err.find("not a directory") != std::string::npos);
   CHECK(t, !fs::exists(target));
+
+  // Summaries should reject datasets with no successful runs.
+  const fs::path summary_path = tmp_root / "summary.tsv";
+  std::vector<sjs::baselines::RunReport> runs(2);
+  runs[0].ok = false;
+  runs[1].ok = false;
+  std::string summary_err;
+  const bool summary_ok = sjs::io::WriteSummaryTSV(
+      summary_path.string(),
+      sjs::Span<const sjs::baselines::RunReport>(runs.data(), runs.size()),
+      &summary_err);
+
+  CHECK(t, !summary_ok);
+  CHECK(t, !summary_err.empty());
+  CHECK(t, summary_err.find("No successful runs") != std::string::npos);
+  CHECK(t, !fs::exists(summary_path));
 
   fs::remove_all(tmp_root, ec);
 

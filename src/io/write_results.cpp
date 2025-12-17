@@ -408,6 +408,11 @@ bool WriteSummaryTSV(const std::string& path,
     if (baseline.empty()) baseline = r.baseline_name;
   }
 
+  if (total_ms.empty()) {
+    SetErr(err, "No successful runs to summarize");
+    return false;
+  }
+
   const Summary s_ms = Summarize(total_ms);
   const Summary s_cnt = Summarize(count_est);
 
