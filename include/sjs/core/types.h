@@ -138,8 +138,8 @@ inline constexpr std::string_view ToString(Method m) noexcept {
     case Method::TLSOP: return "tlsop";
     case Method::SIRS: return "sirs";
     case Method::Rejection: return "rejection";
-    case Method::Unknown: return "unknown";
     case Method::Tsunami: return "tsunami";
+    case Method::Unknown: return "unknown";
   }
   return "unknown";
 }
@@ -205,7 +205,11 @@ inline bool ParseMethod(std::string_view s, Method* out) noexcept {
       detail::EqualsIgnoreCase(s, "kds-reject")) {
     *out = Method::Rejection; return true;
   }
-  if (detail::EqualsIgnoreCase(s, "tsunami")) { *out = Method::Tsunami; return true; }
+  if (detail::EqualsIgnoreCase(s, "tsunami") || detail::EqualsIgnoreCase(s, "tsunami20") ||
+      detail::EqualsIgnoreCase(s, "tsunami_20") || detail::EqualsIgnoreCase(s, "tsunami-20")) {
+    *out = Method::Tsunami;
+    return true;
+  }
   *out = Method::Unknown;
   return false;
 }
