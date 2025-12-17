@@ -17,6 +17,7 @@
 
 #include "sjs/baselines/baseline_api.h"
 #include "sjs/io/csv_io.h"
+#include "sjs/io/write_results.h"
 
 #include <algorithm>
 #include <chrono>
@@ -41,7 +42,11 @@ inline void SetErr(std::string* err, const std::string& msg) {
 inline bool EnsureDirExists(const std::filesystem::path& dir, std::string* err) {
   std::error_code ec;
   if (dir.empty()) return true;
-  if (std::filesystem::exists(dir, ec)) return true;
+  if (std::filesystem::exists(dir, ec)) {
+    if (std::filesystem::is_directory(dir, ec)) return true;
+    SetErr(err, "Path exists but is not a directory: " + dir.string());
+    return false;
+  }
   if (!std::filesystem::create_directories(dir, ec)) {
     SetErr(err, "Failed to create directory: " + dir.string() + " (" + ec.message() + ")");
     return false;
