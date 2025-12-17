@@ -52,6 +52,12 @@ cmake --build . -j
 
 编译后生成的可执行文件在 `build/` 目录下（例如 `build/sjs_run`）。
 
+
+```bash
+./sjs_run --help
+```
+
+
 ---
 
 ## 2) 快速开始（合成数据）
