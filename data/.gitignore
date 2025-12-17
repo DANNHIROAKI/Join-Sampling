@@ -1,0 +1,7 @@
+# Ignore generated datasets while keeping placeholders
+*
+!.gitignore
+!real/
+!synthetic/
+!real/.gitkeep
+!synthetic/.gitkeep
