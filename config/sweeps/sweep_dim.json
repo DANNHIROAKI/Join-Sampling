@@ -1,1 +1,76 @@
-{}
+{
+    "base": {
+      "dataset": {
+        "source": "synthetic",
+        "name": "stripe_dim",
+        "dim": 2,
+        "synthetic": {
+          "generator": "stripe_ctrl_alpha",
+          "n_r": 50000,
+          "n_s": 50000,
+          "alpha": 1.0,
+          "seed": 1,
+          "params": {
+            "control_axis": 1,
+            "core_lo": 0.45,
+            "core_hi": 0.55,
+            "gap_factor": 0.1,
+            "delta_factor": 0.25,
+            "shuffle_strips": true,
+            "shuffle_r": false,
+            "swap_sides": false
+          }
+        }
+      },
+  
+      "run": {
+        "method": "ours",
+        "variant": "sampling",
+        "t": 100000,
+        "seed": 1,
+        "repeats": 3,
+        "j_star": 1000000,
+        "enum_cap": 0,
+        "write_samples": false,
+        "verify": false,
+        "extra": {
+          "sirs_leaf_size": 32,
+          "pbsm_k": 0,
+          "tlsop_nx": 128,
+          "tlsop_ny": 128
+        }
+      },
+  
+      "output": {
+        "out_dir": "results/sweeps/dim",
+        "run_tag": "dim_sweep"
+      },
+  
+      "logging": {
+        "level": "info",
+        "with_timestamp": true,
+        "with_thread_id": false
+      },
+  
+      "sys": {
+        "threads": 1
+      }
+    },
+  
+    "sweep": {
+      "dim": [2],
+      "method": ["ours"],
+      "variant": ["sampling"],
+      "t": [100000]
+    },
+  
+    "files": {
+      "raw": "sweep_raw.csv",
+      "summary": "sweep_summary.csv"
+    },
+  
+    "meta": {
+      "note": "Dim sweep placeholder. Current build hard-codes Dim=2 in apps; extend the project to Dim>2 then add values to sweep.dim and adjust generators/baselines accordingly. Unknown sweep keys are ignored by current parser."
+    }
+  }
+  

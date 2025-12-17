@@ -1,1 +1,80 @@
-{}
+{
+    "dataset": {
+      "source": "synthetic",
+      "name": "default_stripe",
+      "dim": 2,
+      "path_r": "",
+      "path_s": "",
+      "synthetic": {
+        "generator": "stripe_ctrl_alpha",
+        "n_r": 100000,
+        "n_s": 100000,
+        "alpha": 1.0,
+        "seed": 1,
+        "params": {
+          "control_axis": 1,
+          "core_lo": 0.45,
+          "core_hi": 0.55,
+          "gap_factor": 0.1,
+          "delta_factor": 0.25,
+          "shuffle_strips": true,
+          "shuffle_r": false,
+          "swap_sides": false
+        }
+      }
+    },
+  
+    "run": {
+      "method": "ours",
+      "variant": "sampling",
+      "t": 100000,
+      "seed": 1,
+      "repeats": 5,
+  
+      "j_star": 1000000,
+      "enum_cap": 0,
+      "write_samples": false,
+      "verify": false,
+  
+      "extra": {
+        "csv_sep": "tab",
+  
+        "pbsm_scheme": "stripes",
+        "pbsm_k": 0,
+        "pbsm_part_axis": 0,
+        "pbsm_sweep": "orthogonal",
+  
+        "tlsop_nx": 128,
+        "tlsop_ny": 128,
+        "tlsop_reuse_sort": true,
+  
+        "sirs_outer": "",
+        "sirs_leaf_size": 32,
+  
+        "rej_index": "S",
+        "rej_rep_center": false,
+        "rej_count_draws": 50000,
+        "rej_max_factor": 10000
+      }
+    },
+  
+    "output": {
+      "out_dir": "results/raw",
+      "run_tag": ""
+    },
+  
+    "sys": {
+      "threads": 1
+    },
+  
+    "logging": {
+      "level": "info",
+      "with_timestamp": true,
+      "with_thread_id": false
+    },
+  
+    "meta": {
+      "note": "This file is a human-friendly default config template. Apps currently read config from CLI; sjs_sweep reads JSON under top-level {base: {...}}."
+    }
+  }
+  
