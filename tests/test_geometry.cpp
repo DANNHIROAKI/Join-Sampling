@@ -132,29 +132,38 @@ void TestEmbeddingIntersectRange(TestContext& t) {
   // r2 does NOT intersect q (touch at boundary x=1).
   const B2 r2(P2{1.0, 0.0}, P2{2.0, 1.0});
 
+  // r3 does NOT intersect q (touch at boundary y=1) but DOES overlap in x.
+  // This is useful for testing SkipDim0 embeddings, where x overlap is assumed
+  // to have been enforced by a sweep.
+  const B2 r3(P2{0.5, 1.0}, P2{1.5, 2.0});
+
   // Build embedding domain bounds.
   sjs::DomainBounds<2, Scalar> dom;
   dom.ExpandToInclude(q);
   dom.ExpandToInclude(r1);
   dom.ExpandToInclude(r2);
+  dom.ExpandToInclude(r3);
 
   const auto p1 = sjs::EmbedLowerUpper<2, Scalar>(r1);
   const auto p2 = sjs::EmbedLowerUpper<2, Scalar>(r2);
+  const auto p3 = sjs::EmbedLowerUpper<2, Scalar>(r3);
 
   const auto range = sjs::MakeIntersectQueryRange<2, Scalar>(q, dom);
 
   // For this embedding, intersection implies the embedded point lies in range.
   CHECK(t, sjs::ContainsHalfOpen(range, p1));
   CHECK(t, !sjs::ContainsHalfOpen(range, p2));
+  CHECK(t, !sjs::ContainsHalfOpen(range, p3));
 
-  // Skip-dim0 embedding (drop x): still should accept r1 and reject r2
-  // because x-condition is baked into the query range construction.
+  // Skip-dim0 embedding (drop x): this embedding only enforces dims 1..Dim-1.
+  // It must be used together with an x-sweep (or other pre-filter) that ensures x-overlap.
+  // Therefore we use r3 (which overlaps in x but fails in y) to test rejection.
   const auto p1s = sjs::EmbedLowerUpperSkipDim0<2, Scalar>(r1);
-  const auto p2s = sjs::EmbedLowerUpperSkipDim0<2, Scalar>(r2);
+  const auto p3s = sjs::EmbedLowerUpperSkipDim0<2, Scalar>(r3);
   const auto ranges = sjs::MakeIntersectQueryRangeSkipDim0<2, Scalar>(q, dom);
 
   CHECK(t, sjs::ContainsHalfOpen(ranges, p1s));
-  CHECK(t, !sjs::ContainsHalfOpen(ranges, p2s));
+  CHECK(t, !sjs::ContainsHalfOpen(ranges, p3s));
 }
 
 }  // namespace
