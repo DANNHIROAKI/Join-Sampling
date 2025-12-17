@@ -1,0 +1,42 @@
+# Build directories
+build/
+cmake-build-*/
+
+# CMake generator files
+CMakeFiles/
+CMakeCache.txt
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+Testing/
+
+# Compiled objects and libraries
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.dylib
+*.exe
+*.out
+
+# Logs and profiles
+*.log
+*.cache
+
+# IDE metadata
+.vscode/
+.idea/
+
+# Local datasets
+/data/real/*
+/data/synthetic/*
+!/data/real/.gitkeep
+!/data/synthetic/.gitkeep
+
+# Generated results
+/results/raw/*
+/results/summary/*
+!/results/raw/.gitkeep
+!/results/summary/.gitkeep

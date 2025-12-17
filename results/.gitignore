@@ -1,0 +1,7 @@
+# Ignore generated result artifacts while keeping placeholders
+*
+!.gitignore
+!raw/
+!summary/
+!raw/.gitkeep
+!summary/.gitkeep
