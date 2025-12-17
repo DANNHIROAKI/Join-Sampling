@@ -77,10 +77,9 @@ Span<const BaselineSpec2D> BaselineRegistry2D() noexcept {
       {Method::Rejection, Variant::Adaptive, "rejection/adaptive", "Rejection baseline + adaptive small/large join"},
 
       // Tsunami baseline (NOTE: requires Method::Tsunami to exist in core/types.h)
-      // Uncomment after adding Method::Tsunami.
-      // {Method::Tsunami, Variant::Sampling, "tsunami/sampling", "Tsunami-style sampling baseline"},
-      // {Method::Tsunami, Variant::EnumSampling, "tsunami/enum_sampling", "Tsunami baseline + enumerate then sample"},
-      // {Method::Tsunami, Variant::Adaptive, "tsunami/adaptive", "Tsunami baseline + adaptive small/large join"},
+      {Method::Tsunami, Variant::Sampling, "tsunami/sampling", "Tsunami-style sampling baseline"},
+      {Method::Tsunami, Variant::EnumSampling, "tsunami/enum_sampling", "Tsunami baseline + enumerate then sample"},
+      {Method::Tsunami, Variant::Adaptive, "tsunami/adaptive", "Tsunami baseline + adaptive small/large join"},
   };
 
   return Span<const BaselineSpec2D>(kReg, sizeof(kReg) / sizeof(kReg[0]));

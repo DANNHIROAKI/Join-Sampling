@@ -194,6 +194,17 @@ std::unique_ptr<IBaseline<2, Scalar>> CreateBaseline2D(Method method,
           return std::make_unique<rejection::RejectionAdaptiveBaseline<2, Scalar>>();
       }
       break;
+    
+    case Method::Tsunami:
+      switch (variant) {
+        case Variant::Sampling:
+          return std::make_unique<tsunami::TsunamiSamplingBaseline<2, Scalar>>();
+        case Variant::EnumSampling:
+          return std::make_unique<tsunami::TsunamiEnumSamplingBaseline<2, Scalar>>();
+        case Variant::Adaptive:
+          return std::make_unique<tsunami::TsunamiAdaptiveBaseline<2, Scalar>>();
+      }
+      break;
 
     case Method::Unknown:
       // fallthrough
