@@ -8,7 +8,8 @@
 #include "baselines/baseline_factory_2d.h"
 
 #include <algorithm>
-#include <ostringstream>
+// #include <ostringstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
