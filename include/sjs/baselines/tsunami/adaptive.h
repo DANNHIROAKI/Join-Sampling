@@ -47,6 +47,7 @@ class TsunamiAdaptiveBaseline final : public IBaseline<Dim, T> {
     deg_order_.clear();
     mode_ = Mode::Unknown;
     all_pairs_.clear();
+    j_star_used_ = 0;
   }
 
   bool Build(const DatasetT& ds, const Config& cfg, PhaseRecorder* phases, std::string* err) override {
@@ -76,11 +77,27 @@ class TsunamiAdaptiveBaseline final : public IBaseline<Dim, T> {
     auto scoped = phases ? phases->Scoped("phase1_count_and_maybe_enumerate")
                          : PhaseRecorder::ScopedPhase(nullptr, "");
 
-    const u64 JSTAR = cfg.run.j_star;
+    // Adaptive threshold J* selection (per Tsunami'20 baseline writeup §4).
+    // If j_star is 0, use automatic calculation based on time trade-off:
+    //   J*^time = C * t  (where C is a heuristic constant)
+    // Also apply memory budget constraint: J* <= 100M pairs (default ~800MB for PairId)
+    u64 JSTAR = cfg.run.j_star;
+    if (JSTAR == 0) {
+      // Auto-calculate using time trade-off: J* = C * t
+      // C = 100 is a reasonable default (allows storing pairs for small-medium t)
+      const u64 JSTAR_time = 100ULL * cfg.run.t;
+      // Memory constraint: limit to 100M pairs (~800MB for PairId)
+      const u64 JSTAR_mem = 100'000'000ULL;
+      JSTAR = (JSTAR_time < JSTAR_mem) ? JSTAR_time : JSTAR_mem;
+    }
+    j_star_used_ = JSTAR;  // Store for use in Sample()
 
     counted_ = false;
     W_ = 0;
     deg_order_.assign(prep_.QueryOrder().size(), 0ULL);
+    
+    // Note: JSTAR may be auto-calculated above (if cfg.run.j_star was 0),
+    // so we always use the computed JSTAR value here.
     mode_ = (JSTAR > 0) ? Mode::EnumerateAll : Mode::CountOnly;
     all_pairs_.clear();
     if (mode_ == Mode::EnumerateAll) {
@@ -167,11 +184,10 @@ class TsunamiAdaptiveBaseline final : public IBaseline<Dim, T> {
       return true;
     }
 
-    const u64 JSTAR = cfg.run.j_star;
     if (mode_ == Mode::EnumerateAll) {
       // Small join branch: sample from stored list.
-      if (JSTAR == 0) {
-        if (err) *err = "TsunamiAdaptiveBaseline::Sample: internal error (EnumerateAll but JSTAR==0)";
+      if (j_star_used_ == 0) {
+        if (err) *err = "TsunamiAdaptiveBaseline::Sample: internal error (EnumerateAll but j_star_used_==0)";
         return false;
       }
       if (all_pairs_.size() != static_cast<usize>(W_)) {
@@ -224,6 +240,7 @@ class TsunamiAdaptiveBaseline final : public IBaseline<Dim, T> {
   std::vector<u64> deg_order_;      // aligned with prep_.QueryOrder()
   Mode mode_ = Mode::Unknown;
   std::vector<PairId> all_pairs_;   // only when mode_==EnumerateAll
+  u64 j_star_used_ = 0;             // JSTAR value actually used (may be auto-calculated)
 };
 
 }  // namespace tsunami

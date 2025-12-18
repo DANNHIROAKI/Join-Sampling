@@ -16,11 +16,25 @@
 //           within such a query, stop early once the maximum requested local
 //           rank is reached.
 //
+// INDEX IMPLEMENTATION NOTE:
+//   The original Tsunami'20 paper uses Grid Tree + Augmented Grid as the learned
+//   multi-dimensional index. For this baseline, we use a StaticKDTree as a
+//   practical replacement that provides the same interface (range filtering over
+//   high-dimensional points) and deterministic query results. This substitution
+//   maintains the algorithmic correctness while making the implementation more
+//   accessible and reproducible.
+//
 // Implementation note (strict inequalities / half-open semantics):
-// We use half-open boxes [lo,hi). The condition R_i(r) > L_i(q) is encoded as
-//   R_i(r) >= nextafter(L_i(q), +inf)
-// so that a half-open range query [lo, +inf) matches the strict inequality.
-// This is exact for floating-point Scalars.
+//   The Tsunami'20 paper suggests using integer coordinates with ±1 boundary
+//   adjustments (scaling floats to integers if needed). However, we use a
+//   floating-point approach with nextafter() because:
+//   1. It is exact for floating-point data without scaling errors
+//   2. It avoids the need for coordinate scaling/compression preprocessing
+//   3. It preserves the original data precision
+//   The condition R_i(r) > L_i(q) is encoded as:
+//     R_i(r) >= nextafter(L_i(q), +inf)
+//   so that a half-open range query [lo, +inf) matches the strict inequality.
+//   This is exact for floating-point Scalars.
 
 #include "sjs/baselines/baseline_api.h"
 
@@ -105,6 +119,11 @@ join::Side ChooseIndexSide(const Dataset<Dim, T>& ds, const Config& cfg) {
 // We keep a small KD-tree implementation local to this baseline because we
 // need an incremental iterator (Next()) to implement deterministic join
 // enumeration without materializing full query results.
+//
+// NOTE: This serves as a practical replacement for Tsunami's Grid Tree +
+// Augmented Grid index, providing the same range filtering interface while
+// being simpler to implement and verify. The deterministic traversal order
+// ensures consistent results across runs.
 
 template <int K, class T>
 class StaticKDTree {
