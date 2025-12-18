@@ -347,8 +347,30 @@ class DynamicRTree {
   }
 
   // Draw k i.i.d. uniform samples WITH replacement from the set
-  // { obj : bbox(obj) intersects q }.
+  // K(Q) = { obj : bbox(obj) intersects q }.
   // Returns false if the intersection set is empty.
+  //
+  // Uniformity guarantee (mathematical proof):
+  //   Step A: Build frontier components that partition K(Q) into disjoint sets:
+  //     - FullNode components: entire subtrees where MBR ⊆ Q (weight = subtree.size)
+  //     - LeafHits components: filtered leaf entries that intersect Q (weight = |hits|)
+  //     - Components are disjoint: K(Q) = disjoint_union of all components
+  //     - Total weight W = sum(component.weight) = |K(Q)|
+  //
+  //   Step B: For each of k samples:
+  //     - Select component C with probability w_C / W (via alias table)
+  //     - Uniformly sample one object from component C:
+  //       * LeafHits: uniform selection from hits array (probability 1/w_C)
+  //       * FullNode: SampleFromSubtree() guarantees uniform over subtree (probability 1/w_C)
+  //
+  //   Therefore, for any object obj in K(Q):
+  //     Pr(obj) = sum_{C containing obj} Pr(C) * Pr(obj | C)
+  //              = sum_{C containing obj} (w_C / W) * (1 / w_C)
+  //              = sum_{C containing obj} (1 / W)
+  //              = 1 / W = 1 / |K(Q)|
+  //
+  //   This guarantees uniform distribution over K(Q). Independence follows from
+  //   independent random number generation for each sample.
   bool SampleIntersect(const BoxT& q, u32 k, Rng* rng, std::vector<u32>* out, QueryStats* st = nullptr) const {
     if (!rng || !out) return false;
     out->clear();
@@ -796,6 +818,21 @@ class DynamicRTree {
     }
   }
 
+  // Uniformly sample one leaf entry from the subtree rooted at nid.
+  //
+  // Uniformity guarantee (mathematical proof):
+  //   Let the subtree have n leaf entries, each with subtree size s_i = 1.
+  //   The root has total size S = sum(s_i) = n.
+  //   On the path from root to leaf i, at each internal node we choose a child
+  //   with probability s_child / s_parent (proportional to subtree size).
+  //   Therefore, the probability of selecting leaf i is:
+  //     Pr(leaf i) = product_{path} (s_child / s_parent) = s_i / S = 1/n.
+  //   This guarantees uniform distribution over all n leaf entries.
+  //
+  // Implementation:
+  //   - At each internal node, we use weighted random selection proportional to child.size
+  //   - At leaf nodes, we uniformly select from the children array
+  //   - The size field is maintained accurately during Insert/Delete operations
   u32 SampleFromSubtree(u32 nid, Rng* rng) const {
     SJS_DASSERT(rng);
     SJS_DASSERT(nid != kNull);
@@ -805,11 +842,13 @@ class DynamicRTree {
       const Node& n = nodes_[static_cast<usize>(cur)];
       SJS_DASSERT(n.size > 0);
       if (n.leaf) {
+        // Leaf node: uniform selection from children array.
         const u32 j = rng->UniformU32(static_cast<u32>(n.children.size()));
         return n.children[static_cast<usize>(j)].ref;
       }
 
-      // Choose child proportional to child.size.
+      // Internal node: choose child proportional to child.size (weighted random selection).
+      // This ensures that each leaf entry in the subtree has equal probability 1/n.size.
       const u64 total = static_cast<u64>(n.size);
       u64 r = rng->UniformU64(total);
       for (const auto& e : n.children) {

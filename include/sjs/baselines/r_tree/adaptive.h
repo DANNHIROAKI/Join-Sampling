@@ -169,12 +169,23 @@ class RTreeAdaptiveBaseline final : public IBaseline<Dim, T> {
 
       if (e.side == join::Side::R) {
         const ProjBoxT& q = proj_r_[e.index];
+        
+        // Step A: Always count first (required for accurate weight w_e and total W).
+        // This ensures we have the exact weight before making enumeration decisions.
         const u64 w = tree_s_.CountIntersect(q);
         w_total_[sid] = w;
         W += w;
 
+        // Step B: Threshold check and optional enumeration.
+        // Key invariant: "Count first, then decide" prevents the scenario where
+        // we enumerate part of an event's pairs and then discover W > J_star.
+        // Since ReportIntersect() is atomic (returns all hits at once), we either:
+        //   - Enumerate the entire event's contribution (if W <= J_star), OR
+        //   - Skip enumeration entirely (if W > J_star after counting this event).
+        // This guarantees that AllPairs.size() <= J_star at all times.
         if (mode_ == Mode::Enumerate) {
           if (W <= J_star) {
+            // Safe to enumerate: current total W is within threshold.
             hits.clear();
             tree_s_.ReportIntersect(q, &hits);
             // Safety: ReportIntersect should match CountIntersect.
@@ -183,20 +194,30 @@ class RTreeAdaptiveBaseline final : public IBaseline<Dim, T> {
             for (u32 sidx : hits) {
               all_pairs_.push_back(PairId{rid, ds_->S.GetId(static_cast<usize>(sidx))});
             }
+            // Note: After appending, if W > J_star, we will switch mode on the next event.
+            // The current event's pairs are already in all_pairs_, but they will be
+            // discarded if we switch (see else branch below).
           } else {
-            // Trigger switch.
+            // Threshold exceeded: switch to COUNT_ONLY mode.
+            // Discard any previously enumerated pairs (they may have pushed W over J_star).
             mode_ = Mode::CountOnly;
             all_pairs_.clear();
+            // From now on, we only count (w_e) but do not enumerate pairs.
           }
         }
+        // If mode_ == Mode::CountOnly, we skip enumeration entirely.
 
+        // Step C: Insert this box into its own active tree.
         (void)tree_r_.Insert(static_cast<u32>(e.index), q);
       } else {
         const ProjBoxT& q = proj_s_[e.index];
+        
+        // Step A: Always count first (same logic as R side).
         const u64 w = tree_r_.CountIntersect(q);
         w_total_[sid] = w;
         W += w;
 
+        // Step B: Threshold check and optional enumeration (same logic as R side).
         if (mode_ == Mode::Enumerate) {
           if (W <= J_star) {
             hits.clear();
@@ -211,6 +232,7 @@ class RTreeAdaptiveBaseline final : public IBaseline<Dim, T> {
           }
         }
 
+        // Step C: Insert this box into its own active tree.
         (void)tree_s_.Insert(static_cast<u32>(e.index), q);
       }
     }
