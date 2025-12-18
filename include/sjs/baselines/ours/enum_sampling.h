@@ -1,22 +1,23 @@
 #pragma once
 // sjs/baselines/ours/enum_sampling.h
 //
-// Our method (Enumerate+Sampling variant).
+// "Our Method" — Enumerate+Sampling variant.
 //
-// In the unified experiment protocol, Enum+Sampling baselines expose a
-// deterministic join enumerator; sampling is then performed by a generic
-// two-pass rank-sampling routine (see sjs/sampling/rank_sampling.h) to obtain
-// i.i.d. uniform samples with replacement.
+// This variant is the baseline described in "Our Method.md":
+//   1) One sweep enumerates *all* join pairs and materializes them into memory.
+//   2) Draw t i.i.d. uniform samples with replacement by indexing that array.
 //
-// This baseline intentionally keeps the enumerator simple and robust by using
-// the existing deterministic plane-sweep join stream.
+// Memory: Theta(|J|).
 
-#include "sjs/baselines/ours/sampling.h"  // reuse PlaneSweepEnumeratorWrapper
-#include "sjs/sampling/rank_sampling.h"
+#include "sjs/baselines/ours/sampling.h"  // reuse 2D preprocessing + indices
 
+#include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace sjs {
 namespace baselines {
@@ -33,59 +34,81 @@ class OursEnumSamplingBaseline final : public IBaseline<Dim, T> {
   std::string_view Name() const noexcept override { return "ours_enum+sampling"; }
 
   void Reset() override {
-    ds_ = nullptr;
+    ctx_.Reset();
     built_ = false;
   }
 
-  bool Build(const DatasetT& ds,
-             const Config& cfg,
-             PhaseRecorder* phases,
-             std::string* err) override {
+  bool Build(const DatasetT& ds, const Config& cfg, PhaseRecorder* phases, std::string* err) override {
     (void)cfg;
-    auto ph = phases ? phases->Scoped("build") : PhaseRecorder::ScopedPhase(nullptr, "");
+    Reset();
 
-    ds_ = &ds;
+    if (!ctx_.Build(ds, phases, err)) return false;
+
     built_ = true;
-
-    if constexpr (Dim != 2) {
-      // The project currently only runs 2D. We keep a friendly error rather than static_assert.
-      if (err) *err = "OursEnumSamplingBaseline: currently only Dim=2 is supported";
-      built_ = false;
-      return false;
-    }
-
     return true;
   }
 
-  bool Count(const Config& cfg,
-             Rng* rng,
-             CountResult* out,
-             PhaseRecorder* phases,
-             std::string* err) override {
+  // Exact join cardinality using the same sweep+index logic (count only).
+  bool Count(const Config& cfg, Rng* rng, CountResult* out, PhaseRecorder* phases, std::string* err) override {
     (void)cfg;
     (void)rng;
-    if (!built_ || ds_ == nullptr) {
+
+    if (!built_ || !ctx_.built() || ctx_.dataset() == nullptr) {
       if (err) *err = "OursEnumSamplingBaseline::Count: call Build() first";
       return false;
     }
-    auto ph = phases ? phases->Scoped("count") : PhaseRecorder::ScopedPhase(nullptr, "");
 
-    join::PlaneSweepOptions opt;
-    opt.axis = 0;
-    opt.side_order = join::SideTieBreak::RBeforeS;
-    opt.skip_axis_check = true;
+    auto scoped = phases ? phases->Scoped("count") : PhaseRecorder::ScopedPhase(nullptr, "");
 
-    const u64 n = join::CountPlaneSweep<Dim, T>(ds_->R, ds_->S, opt);
-    if (out) *out = MakeExactCount(n);
+    ctx_.ResetActive();
+
+    u64 W = 0;
+
+    auto& ar = ctx_.active_r();
+    auto& as = ctx_.active_s();
+
+    const auto& events = ctx_.events();
+    const auto& sid_of_pos = ctx_.start_id_of_event();
+
+    const auto& ylo_r = ctx_.ylo_rank_r();
+    const auto& yhi_r = ctx_.yhi_lb_rank_r();
+    const auto& ylo_s = ctx_.ylo_rank_s();
+    const auto& yhi_s = ctx_.yhi_lb_rank_s();
+
+    for (usize pos = 0; pos < events.size(); ++pos) {
+      const auto& ev = events[pos];
+      const u32 handle = static_cast<u32>(ev.index);
+
+      if (ev.kind == join::EventKind::End) {
+        if (ev.side == join::Side::R) ar.Erase(handle);
+        else as.Erase(handle);
+        continue;
+      }
+
+      const i32 sid_i32 = sid_of_pos[pos];
+      (void)sid_i32;  // only for debug sanity
+      SJS_DASSERT(sid_i32 >= 0);
+
+      const bool q_is_r = (ev.side == join::Side::R);
+      const u32 q_ylo = q_is_r ? ylo_r[ev.index] : ylo_s[ev.index];
+      const u32 q_yhi = q_is_r ? yhi_r[ev.index] : yhi_s[ev.index];
+
+      const detail::ActiveIndex2D& other = q_is_r ? as : ar;
+      W += other.CountA(q_ylo) + other.CountB(q_ylo, q_yhi);
+
+      if (q_is_r) ar.Insert(handle, q_ylo, q_yhi);
+      else as.Insert(handle, q_ylo, q_yhi);
+    }
+
+    ctx_.ResetActive();
+
+    if (out) *out = MakeExactCount(W);
     return true;
   }
 
-  bool Sample(const Config& cfg,
-              Rng* rng,
-              SampleSet* out,
-              PhaseRecorder* phases,
-              std::string* err) override {
-    if (!built_ || ds_ == nullptr) {
+  // Materialize all pairs then sample by uniform indexing.
+  bool Sample(const Config& cfg, Rng* rng, SampleSet* out, PhaseRecorder* phases, std::string* err) override {
+    if (!built_ || !ctx_.built() || ctx_.dataset() == nullptr) {
       if (err) *err = "OursEnumSamplingBaseline::Sample: call Build() first";
       return false;
     }
@@ -94,37 +117,37 @@ class OursEnumSamplingBaseline final : public IBaseline<Dim, T> {
       return false;
     }
 
-    auto ph = phases ? phases->Scoped("sample") : PhaseRecorder::ScopedPhase(nullptr, "");
+    const u32 t = cfg.run.t;
 
-    const u64 t = cfg.run.t;
     out->Clear();
-
-    // Build a deterministic enumerator and perform two-pass rank sampling.
-    std::string enum_err;
-    auto enumerator = Enumerate(cfg, nullptr, &enum_err);
-    if (!enumerator) {
-      if (err) *err = "OursEnumSamplingBaseline::Sample: Enumerate failed: " + enum_err;
-      return false;
-    }
-
-    sampling::RankSamplingInfo info;
-    std::vector<PairId> samples;
-    if (!sampling::RankSampleWithReplacement<IJoinEnumerator, PairId>(enumerator.get(), t, rng, &samples, &info, err)) {
-      return false;
-    }
-
-    out->pairs = std::move(samples);
-    out->weighted = false;
     out->with_replacement = true;
+    out->weighted = false;
+
+    if (t == 0) return true;
+
+    std::vector<PairId> all_pairs;
+    {
+      auto scoped = phases ? phases->Scoped("enumerate_all") : PhaseRecorder::ScopedPhase(nullptr, "");
+      if (!EnumerateAllPairs(&all_pairs, err)) return false;
+    }
+
+    const u64 W = static_cast<u64>(all_pairs.size());
+    if (W == 0) return true;
+
+    out->pairs.resize(t);
+    for (u32 i = 0; i < t; ++i) {
+      const u64 idx = rng->UniformU64(W);
+      out->pairs[i] = all_pairs[static_cast<usize>(idx)];
+    }
     return true;
   }
 
-  std::unique_ptr<IJoinEnumerator> Enumerate(const Config& cfg,
-                                             PhaseRecorder* phases,
-                                             std::string* err) override {
+  // Provide a deterministic enumerator; for consistency with the rest of the
+  // codebase we return the generic plane-sweep stream wrapper.
+  std::unique_ptr<IJoinEnumerator> Enumerate(const Config& cfg, PhaseRecorder* phases, std::string* err) override {
     (void)cfg;
     (void)phases;
-    if (!built_ || ds_ == nullptr) {
+    if (!built_ || !ctx_.built() || ctx_.dataset() == nullptr) {
       if (err) *err = "OursEnumSamplingBaseline::Enumerate: call Build() first";
       return nullptr;
     }
@@ -134,12 +157,80 @@ class OursEnumSamplingBaseline final : public IBaseline<Dim, T> {
     opt.side_order = join::SideTieBreak::RBeforeS;
     opt.skip_axis_check = true;
 
-    return std::make_unique<detail::PlaneSweepEnumeratorWrapper<Dim, T>>(ds_->R, ds_->S, opt);
+    const auto* ds = ctx_.dataset();
+    return std::make_unique<detail::PlaneSweepEnumeratorWrapper<Dim, T>>(ds->R, ds->S, opt);
   }
 
  private:
-  const DatasetT* ds_{nullptr};
+  bool EnumerateAllPairs(std::vector<PairId>* out_pairs, std::string* err) {
+    SJS_DASSERT(out_pairs != nullptr);
+    out_pairs->clear();
+
+    const auto* ds = ctx_.dataset();
+    if (!ds) {
+      if (err) *err = "OursEnumSamplingBaseline::EnumerateAllPairs: missing dataset";
+      return false;
+    }
+
+    ctx_.ResetActive();
+
+    auto& ar = ctx_.active_r();
+    auto& as = ctx_.active_s();
+
+    const auto& events = ctx_.events();
+
+    const auto& ylo_r = ctx_.ylo_rank_r();
+    const auto& yhi_r = ctx_.yhi_lb_rank_r();
+    const auto& ylo_s = ctx_.ylo_rank_s();
+    const auto& yhi_s = ctx_.yhi_lb_rank_s();
+
+    std::vector<u32> tmp;
+    tmp.reserve(1024);
+
+    for (usize pos = 0; pos < events.size(); ++pos) {
+      const auto& ev = events[pos];
+      const u32 handle = static_cast<u32>(ev.index);
+
+      if (ev.kind == join::EventKind::End) {
+        if (ev.side == join::Side::R) ar.Erase(handle);
+        else as.Erase(handle);
+        continue;
+      }
+
+      // START
+      const bool q_is_r = (ev.side == join::Side::R);
+      const u32 q_ylo = q_is_r ? ylo_r[ev.index] : ylo_s[ev.index];
+      const u32 q_yhi = q_is_r ? yhi_r[ev.index] : yhi_s[ev.index];
+
+      const detail::ActiveIndex2D& other = q_is_r ? as : ar;
+
+      // Pattern A
+      tmp.clear();
+      other.ReportA(q_ylo, &tmp);
+      for (u32 oh : tmp) {
+        if (q_is_r) out_pairs->push_back(PairId{ds->R.GetId(ev.index), ds->S.GetId(oh)});
+        else out_pairs->push_back(PairId{ds->R.GetId(oh), ds->S.GetId(ev.index)});
+      }
+
+      // Pattern B
+      tmp.clear();
+      other.ReportB(q_ylo, q_yhi, &tmp);
+      for (u32 oh : tmp) {
+        if (q_is_r) out_pairs->push_back(PairId{ds->R.GetId(ev.index), ds->S.GetId(oh)});
+        else out_pairs->push_back(PairId{ds->R.GetId(oh), ds->S.GetId(ev.index)});
+      }
+
+      // Insert q
+      if (q_is_r) ar.Insert(handle, q_ylo, q_yhi);
+      else as.Insert(handle, q_ylo, q_yhi);
+    }
+
+    ctx_.ResetActive();
+    return true;
+  }
+
   bool built_{false};
+  detail::Ours2DContext<Dim, T> ctx_;
 };
 
 }  // namespace ours
