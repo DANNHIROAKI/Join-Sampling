@@ -51,7 +51,9 @@
 #include "sjs/sampling/alias_table.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <fstream>
 #include <limits>
 #include <string>
 #include <utility>
@@ -745,6 +747,15 @@ class OursSamplingBaseline final : public IBaseline<Dim, T> {
 
     u64 W = 0;
 
+    // #region agent log
+    {
+      std::ofstream log("/home/dhy/PhD/Join-Sampling/.cursor/debug.log", std::ios::app);
+      if (log.is_open()) {
+        log << "{\"id\":\"log_count_start\",\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << ",\"location\":\"sampling.h:746\",\"message\":\"Count phase1 start\",\"data\":{\"events_size\":" << events_.size() << ",\"start_events\":" << start_event_pos_.size() << "},\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"A\"}\n";
+      }
+    }
+    // #endregion
+
     // Sweep state is stored inside active_*; since each box is inserted once and
     // erased once, the structures end empty.
     for (usize ev_pos = 0; ev_pos < events_.size(); ++ev_pos) {
@@ -766,6 +777,15 @@ class OursSamplingBaseline final : public IBaseline<Dim, T> {
       SJS_DASSERT(eid_i32 >= 0);
       const usize eid = static_cast<usize>(eid_i32);
 
+      // #region agent log
+      {
+        std::ofstream log("/home/dhy/PhD/Join-Sampling/.cursor/debug.log", std::ios::app);
+        if (log.is_open()) {
+          log << "{\"id\":\"log_event_mapping\",\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << ",\"location\":\"sampling.h:767\",\"message\":\"Event index mapping\",\"data\":{\"ev_pos\":" << ev_pos << ",\"eid_i32\":" << eid_i32 << ",\"eid\":" << eid << ",\"side\":\"" << (e.side == join::Side::R ? "R" : "S") << "\"},\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"C\"}\n";
+        }
+      }
+      // #endregion
+
       if (e.side == join::Side::R) {
         const u32 q_ylo = ylo_rank_r_[e.index];
         const u32 q_yhi = yhi_lb_rank_r_[e.index];
@@ -774,9 +794,30 @@ class OursSamplingBaseline final : public IBaseline<Dim, T> {
         const u64 wb = active_s_.CountB(q_ylo, q_yhi);
         const u64 w = wa + wb;
 
+        // #region agent log
+        {
+          std::ofstream log("/home/dhy/PhD/Join-Sampling/.cursor/debug.log", std::ios::app);
+          if (log.is_open()) {
+            log << "{\"id\":\"log_weight_calc\",\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << ",\"location\":\"sampling.h:775\",\"message\":\"Weight calculation R-side\",\"data\":{\"eid\":" << eid << ",\"wa\":" << wa << ",\"wb\":" << wb << ",\"w\":" << w << ",\"W_before\":" << W << "},\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"E\"}\n";
+          }
+        }
+        // #endregion
+
         w_a_[eid] = wa;
         w_b_[eid] = wb;
         w_total_[eid] = w;
+        
+        // #region agent log
+        {
+          std::ofstream log("/home/dhy/PhD/Join-Sampling/.cursor/debug.log", std::ios::app);
+          if (log.is_open()) {
+            const u64 W_before = W;
+            const bool would_overflow = (W > std::numeric_limits<u64>::max() - w);
+            log << "{\"id\":\"log_overflow_check\",\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << ",\"location\":\"sampling.h:780\",\"message\":\"W accumulation overflow check\",\"data\":{\"W_before\":" << W_before << ",\"w\":" << w << ",\"would_overflow\":" << (would_overflow ? "true" : "false") << ",\"max_u64\":" << std::numeric_limits<u64>::max() << "},\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"A\"}\n";
+          }
+        }
+        // #endregion
+        
         W += w;
 
         // Insert q into its side.
@@ -789,14 +830,44 @@ class OursSamplingBaseline final : public IBaseline<Dim, T> {
         const u64 wb = active_r_.CountB(q_ylo, q_yhi);
         const u64 w = wa + wb;
 
+        // #region agent log
+        {
+          std::ofstream log("/home/dhy/PhD/Join-Sampling/.cursor/debug.log", std::ios::app);
+          if (log.is_open()) {
+            log << "{\"id\":\"log_weight_calc\",\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << ",\"location\":\"sampling.h:790\",\"message\":\"Weight calculation S-side\",\"data\":{\"eid\":" << eid << ",\"wa\":" << wa << ",\"wb\":" << wb << ",\"w\":" << w << ",\"W_before\":" << W << "},\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"E\"}\n";
+          }
+        }
+        // #endregion
+
         w_a_[eid] = wa;
         w_b_[eid] = wb;
         w_total_[eid] = w;
+        
+        // #region agent log
+        {
+          std::ofstream log("/home/dhy/PhD/Join-Sampling/.cursor/debug.log", std::ios::app);
+          if (log.is_open()) {
+            const u64 W_before = W;
+            const bool would_overflow = (W > std::numeric_limits<u64>::max() - w);
+            log << "{\"id\":\"log_overflow_check\",\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << ",\"location\":\"sampling.h:795\",\"message\":\"W accumulation overflow check\",\"data\":{\"W_before\":" << W_before << ",\"w\":" << w << ",\"would_overflow\":" << (would_overflow ? "true" : "false") << ",\"max_u64\":" << std::numeric_limits<u64>::max() << "},\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"A\"}\n";
+          }
+        }
+        // #endregion
+        
         W += w;
 
         active_s_.Insert(static_cast<u32>(e.index), q_ylo, q_yhi);
       }
     }
+
+    // #region agent log
+    {
+      std::ofstream log("/home/dhy/PhD/Join-Sampling/.cursor/debug.log", std::ios::app);
+      if (log.is_open()) {
+        log << "{\"id\":\"log_count_end\",\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << ",\"location\":\"sampling.h:801\",\"message\":\"Count phase1 end\",\"data\":{\"W\":" << W << "},\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"A\"}\n";
+      }
+    }
+    // #endregion
 
     W_ = W;
     weights_valid_ = true;
@@ -863,11 +934,23 @@ class OursSamplingBaseline final : public IBaseline<Dim, T> {
         // Robustly avoid any accidental zero-weight bucket (should not happen).
         u32 eid = 0;
         u64 w = 0;
+        int tries_count = 0;
         for (int tries = 0; tries < 16; ++tries) {
           eid = static_cast<u32>(alias.Sample(rng));
           w = w_total_[eid];
+          tries_count = tries + 1;
           if (w > 0) break;
         }
+        
+        // #region agent log
+        {
+          std::ofstream log("/home/dhy/PhD/Join-Sampling/.cursor/debug.log", std::ios::app);
+          if (log.is_open()) {
+            log << "{\"id\":\"log_alias_sample\",\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << ",\"location\":\"sampling.h:871\",\"message\":\"Alias table sampling\",\"data\":{\"slot\":" << j << ",\"eid\":" << eid << ",\"w\":" << w << ",\"tries\":" << tries_count << ",\"W_\":" << W_ << "},\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"B\"}\n";
+          }
+        }
+        // #endregion
+        
         if (w == 0) {
           if (err) *err = "OursSamplingBaseline::Sample: alias produced only zero-weight events (unexpected)";
           return false;
@@ -886,6 +969,15 @@ class OursSamplingBaseline final : public IBaseline<Dim, T> {
           const u64 r = rng->UniformU64(w);
           pat = (r < wa) ? 0 : 1;
         }
+
+        // #region agent log
+        {
+          std::ofstream log("/home/dhy/PhD/Join-Sampling/.cursor/debug.log", std::ios::app);
+          if (log.is_open()) {
+            log << "{\"id\":\"log_pattern_choice\",\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << ",\"location\":\"sampling.h:888\",\"message\":\"Pattern A/B choice\",\"data\":{\"slot\":" << j << ",\"eid\":" << eid << ",\"wa\":" << wa << ",\"wb\":" << wb << ",\"pat\":" << static_cast<int>(pat) << "},\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"E\"}\n";
+          }
+        }
+        // #endregion
 
         assign.push_back(Assignment{eid, pat, j});
       }
@@ -926,6 +1018,15 @@ class OursSamplingBaseline final : public IBaseline<Dim, T> {
         SJS_DASSERT(eid_i32 >= 0);
         const u32 eid = static_cast<u32>(eid_i32);
 
+        // #region agent log
+        {
+          std::ofstream log("/home/dhy/PhD/Join-Sampling/.cursor/debug.log", std::ios::app);
+          if (log.is_open()) {
+            log << "{\"id\":\"log_phase3_event\",\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << ",\"location\":\"sampling.h:927\",\"message\":\"Phase3 event processing\",\"data\":{\"ev_pos\":" << ev_pos << ",\"eid\":" << eid << ",\"side\":\"" << (e.side == join::Side::R ? "R" : "S") << "\",\"ptr\":" << ptr << ",\"assign_size\":" << assign.size() << "},\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"C\"}\n";
+          }
+        }
+        // #endregion
+
         // Consume all assignments for this event.
         while (ptr < assign.size() && assign[ptr].eid == eid) {
           const u8 pat = assign[ptr].pat;
@@ -947,6 +1048,16 @@ class OursSamplingBaseline final : public IBaseline<Dim, T> {
             } else {
               ok = active_s_.SampleB(q_ylo, q_yhi, k, rng, &tmp_handles);
             }
+            
+            // #region agent log
+            {
+              std::ofstream log("/home/dhy/PhD/Join-Sampling/.cursor/debug.log", std::ios::app);
+              if (log.is_open()) {
+                log << "{\"id\":\"log_sample_result\",\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << ",\"location\":\"sampling.h:950\",\"message\":\"SampleA/B result R-side\",\"data\":{\"eid\":" << eid << ",\"pat\":" << static_cast<int>(pat) << ",\"k\":" << k << ",\"ok\":" << (ok ? "true" : "false") << "},\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"D\"}\n";
+              }
+            }
+            // #endregion
+            
             if (!ok) {
               if (err) *err = "OursSamplingBaseline::Sample: unexpected empty candidate set in phase3 (R-start)";
               return false;
@@ -967,6 +1078,16 @@ class OursSamplingBaseline final : public IBaseline<Dim, T> {
             } else {
               ok = active_r_.SampleB(q_ylo, q_yhi, k, rng, &tmp_handles);
             }
+            
+            // #region agent log
+            {
+              std::ofstream log("/home/dhy/PhD/Join-Sampling/.cursor/debug.log", std::ios::app);
+              if (log.is_open()) {
+                log << "{\"id\":\"log_sample_result\",\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() << ",\"location\":\"sampling.h:970\",\"message\":\"SampleA/B result S-side\",\"data\":{\"eid\":" << eid << ",\"pat\":" << static_cast<int>(pat) << ",\"k\":" << k << ",\"ok\":" << (ok ? "true" : "false") << "},\"sessionId\":\"debug-session\",\"runId\":\"run1\",\"hypothesisId\":\"D\"}\n";
+              }
+            }
+            // #endregion
+            
             if (!ok) {
               if (err) *err = "OursSamplingBaseline::Sample: unexpected empty candidate set in phase3 (S-start)";
               return false;
