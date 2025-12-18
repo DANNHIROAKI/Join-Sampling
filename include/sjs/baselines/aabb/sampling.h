@@ -170,6 +170,10 @@ class DynamicAABBTree {
       if (!n.aabb.Intersects(q)) continue;
 
       if (n.IsLeaf()) {
+        // At leaf level, n.aabb is the actual box AABB (not fat AABB),
+        // so the earlier n.aabb.Intersects(q) check already performs the exact
+        // half-open intersection test. If we ever switch to fat AABBs, we would
+        // need to store the actual box here and perform an explicit intersection test.
         out->push_back(n.obj);
         if (st) ++st->leaf_tests;
       } else {
@@ -802,8 +806,20 @@ class AABBJoinEnumerator final : public baselines::IJoinEnumerator {
 
     while (true) {
       if (scanning_) {
-        if (cur_pos_ < cur_candidates_.size()) {
+        while (cur_pos_ < cur_candidates_.size()) {
           const u32 other_idx = cur_candidates_[cur_pos_++];
+          
+          // Exact half-open intersection test (as required by the algorithm spec).
+          // ReportIntersect may return candidates based on node AABB intersection,
+          // but we need to verify the actual projected boxes intersect.
+          const ProjBoxT& q_proj = (cur_side_ == join::Side::R) ? proj_r_[cur_index_] : proj_s_[cur_index_];
+          const ProjBoxT& other_proj = (cur_side_ == join::Side::R) ? proj_s_[other_idx] : proj_r_[other_idx];
+          
+          if (!q_proj.Intersects(other_proj)) {
+            // Skip false positive candidate (should be rare if not using fat AABBs).
+            continue;
+          }
+          
           if (cur_side_ == join::Side::R) {
             *out = PairId{cur_id_, S_->GetId(static_cast<usize>(other_idx))};
           } else {
@@ -1106,25 +1122,36 @@ class AABBSamplingBaseline final : public IBaseline<Dim, T> {
     {
       auto scoped = phases ? phases->Scoped("phase2_assign") : PhaseRecorder::ScopedPhase(nullptr, "");
 
+      // Filter out zero-weight events before building alias table to avoid
+      // sampling zero-weight events. This is more efficient than retry logic.
+      std::vector<u64> filtered_weights;
+      std::vector<u32> eid_map;  // maps filtered index -> original event id
+      filtered_weights.reserve(w_total_.size());
+      eid_map.reserve(w_total_.size());
+      for (usize i = 0; i < w_total_.size(); ++i) {
+        if (w_total_[i] > 0) {
+          filtered_weights.push_back(w_total_[i]);
+          eid_map.push_back(static_cast<u32>(i));
+        }
+      }
+
+      if (filtered_weights.empty()) {
+        if (err) *err = "AABBSamplingBaseline::Sample: all events have zero weight (unexpected)";
+        return false;
+      }
+
       sampling::AliasTable alias;
-      if (!alias.BuildFromU64(Span<const u64>(w_total_), err)) {
+      if (!alias.BuildFromU64(Span<const u64>(filtered_weights), err)) {
         if (err && err->empty()) *err = "AABBSamplingBaseline::Sample: failed to build alias table";
         return false;
       }
 
       assign.reserve(t);
       for (u32 j = 0; j < t; ++j) {
-        u32 eid = 0;
-        u64 w = 0;
-        for (int tries = 0; tries < 16; ++tries) {
-          eid = static_cast<u32>(alias.Sample(rng));
-          w = w_total_[eid];
-          if (w > 0) break;
-        }
-        if (w == 0) {
-          if (err) *err = "AABBSamplingBaseline::Sample: alias produced only zero-weight events (unexpected)";
-          return false;
-        }
+        const usize filtered_idx = alias.Sample(rng);
+        SJS_DASSERT(filtered_idx < eid_map.size());
+        const u32 eid = eid_map[filtered_idx];
+        SJS_DASSERT(w_total_[eid] > 0);  // Sanity check
         assign.push_back(Assignment{eid, j});
       }
       std::sort(assign.begin(), assign.end(), assign_less);

@@ -296,24 +296,37 @@ class AABBAdaptiveBaseline final : public IBaseline<Dim, T> {
     std::vector<Assignment> assign;
     {
       auto scoped = phases ? phases->Scoped("phase2_assign") : PhaseRecorder::ScopedPhase(nullptr, "");
+      
+      // Filter out zero-weight events before building alias table to avoid
+      // sampling zero-weight events. This is more efficient than retry logic.
+      std::vector<u64> filtered_weights;
+      std::vector<u32> eid_map;  // maps filtered index -> original event id
+      filtered_weights.reserve(w_total_.size());
+      eid_map.reserve(w_total_.size());
+      for (usize i = 0; i < w_total_.size(); ++i) {
+        if (w_total_[i] > 0) {
+          filtered_weights.push_back(w_total_[i]);
+          eid_map.push_back(static_cast<u32>(i));
+        }
+      }
+
+      if (filtered_weights.empty()) {
+        if (err) *err = "AABBAdaptiveBaseline::Sample: all events have zero weight (unexpected)";
+        return false;
+      }
+
       sampling::AliasTable alias;
-      if (!alias.BuildFromU64(Span<const u64>(w_total_), err)) {
+      if (!alias.BuildFromU64(Span<const u64>(filtered_weights), err)) {
         if (err && err->empty()) *err = "AABBAdaptiveBaseline::Sample: failed to build alias table";
         return false;
       }
+
       assign.reserve(t);
       for (u32 j = 0; j < t; ++j) {
-        u32 eid = 0;
-        u64 w = 0;
-        for (int tries = 0; tries < 16; ++tries) {
-          eid = static_cast<u32>(alias.Sample(rng));
-          w = w_total_[eid];
-          if (w > 0) break;
-        }
-        if (w == 0) {
-          if (err) *err = "AABBAdaptiveBaseline::Sample: alias produced only zero-weight events (unexpected)";
-          return false;
-        }
+        const usize filtered_idx = alias.Sample(rng);
+        SJS_DASSERT(filtered_idx < eid_map.size());
+        const u32 eid = eid_map[filtered_idx];
+        SJS_DASSERT(w_total_[eid] > 0);  // Sanity check
         assign.push_back(Assignment{eid, j});
       }
       std::sort(assign.begin(), assign.end(), assign_less);
