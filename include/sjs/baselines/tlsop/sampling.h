@@ -2,7 +2,7 @@
 // sjs/baselines/tlsop/sampling.h
 //
 // TLSOP baseline (Two-layer SOP) from Tsitsigkos et al. (2023), summarized in
-// the uploaded note "Tsitsigkos’23.md".
+// docs/Baseline/Tsitsigkos’23 Baseline.md (this repo note), and the original Tsitsigkos et al. (2023) paper.
 //
 // What this header provides
 // -------------------------
@@ -16,7 +16,7 @@
 //
 //  2) Variant::Sampling baseline for TLSOP:
 //       - Count(): enumerates the join stream once to compute |J| exactly.
-//       - Sample(): draws t i.i.d. ranks in [0,|J|) and re-enumerates the same
+//       - Sample(): draws t i.i.d. ranks in [1,|J|] and re-enumerates the same
 //         deterministic stream to pick the requested pairs (uniform with replacement).
 //
 // Notes
@@ -38,6 +38,7 @@
 #include "sjs/join/join_types.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -152,7 +153,12 @@ struct TLSOPParams {
   // Sweep axis inside mini-joins (0 = x).
   int sweep_axis = 0;
 
-  // Sort lists by (x_l, id, idx) once during Build and reuse.
+  // Determinism requirement (Baseline.md §4.1.2, §4.7):
+  // Each per-tile class list is *stable-sorted once* during Build and reused
+  // across all enumerations/passes.
+  //
+  // NOTE: Older versions had an option to skip sorting; that is unsafe for
+  // two-pass sampling (the JoinStream must be identical across passes).
   bool reuse_sorted_lists = true;
 };
 
@@ -489,23 +495,37 @@ class TLSOPIndex {
       fill_side(ds.S, /*is_r_side=*/false);
     }
 
-    // Sort lists (optional but recommended for deterministic plane-sweep mini-join).
-    if (params_.reuse_sorted_lists) {
+    // Determinism requirement (Baseline.md §4.1.2, §4.7):
+    // Stable-sort each per-tile class list *once* and reuse across passes.
+    // Key = (x_l, y_l, x_u, y_u, id, idx) to avoid platform-dependent ties.
+    {
       auto _ = phases ? phases->Scoped("tlsop_sort_lists") : PhaseRecorder::ScopedPhase(nullptr, "");
 
       auto sort_rel_list = [&](std::vector<u32>& idxs, const Relation<Dim, T>& rel) {
-        std::sort(idxs.begin(), idxs.end(), [&](u32 a, u32 b) {
-          const auto& ba = rel.boxes[static_cast<usize>(a)];
-          const auto& bb = rel.boxes[static_cast<usize>(b)];
-          const T ax = ba.lo.v[0];
-          const T bx = bb.lo.v[0];
-          if (ax < bx) return true;
-          if (bx < ax) return false;
-          const Id ida = rel.GetId(static_cast<usize>(a));
-          const Id idb = rel.GetId(static_cast<usize>(b));
+        std::stable_sort(idxs.begin(), idxs.end(), [&](u32 ia, u32 ib) {
+          const auto& a = rel.boxes[static_cast<usize>(ia)];
+          const auto& b = rel.boxes[static_cast<usize>(ib)];
+          const T axl = a.lo.v[0];
+          const T bxl = b.lo.v[0];
+          if (axl < bxl) return true;
+          if (bxl < axl) return false;
+          const T ayl = a.lo.v[1];
+          const T byl = b.lo.v[1];
+          if (ayl < byl) return true;
+          if (byl < ayl) return false;
+          const T axu = a.hi.v[0];
+          const T bxu = b.hi.v[0];
+          if (axu < bxu) return true;
+          if (bxu < axu) return false;
+          const T ayu = a.hi.v[1];
+          const T byu = b.hi.v[1];
+          if (ayu < byu) return true;
+          if (byu < ayu) return false;
+          const Id ida = rel.GetId(static_cast<usize>(ia));
+          const Id idb = rel.GetId(static_cast<usize>(ib));
           if (ida < idb) return true;
           if (idb < ida) return false;
-          return a < b;
+          return ia < ib;
         });
       };
 
@@ -941,7 +961,7 @@ class TLSOPSamplingBaseline final : public IBaseline<Dim, T> {
     const u64 W = W_;
     if (W == 0) return true;
 
-    // Draw ranks in [0,W) with replacement and sort them.
+    // Draw ranks in [1,W] with replacement and sort them (Baseline.md §4.4).
     struct RankReq {
       u64 rank;
       u64 slot;
@@ -951,7 +971,7 @@ class TLSOPSamplingBaseline final : public IBaseline<Dim, T> {
     {
       auto scoped2 = phases ? phases->Scoped("tlsop_sample_draw_ranks") : PhaseRecorder::ScopedPhase(nullptr, "");
       for (u64 i = 0; i < t; ++i) {
-        req[static_cast<usize>(i)] = RankReq{rng->UniformU64(W), i};
+        req[static_cast<usize>(i)] = RankReq{rng->UniformU64(W) + 1, i};
       }
       std::sort(req.begin(), req.end(), [](const RankReq& a, const RankReq& b) {
         if (a.rank < b.rank) return true;
@@ -967,15 +987,15 @@ class TLSOPSamplingBaseline final : public IBaseline<Dim, T> {
       detail::TLSOPJoinEnumerator<Dim, T> stream(&index_);
       stream.Reset();
       PairId p;
-      u64 idx = 0;
+      u64 idx = 0;  // 1-based position in JoinStream
       usize j = 0;
       while (stream.Next(&p)) {
+        ++idx;
         while (j < req.size() && req[j].rank == idx) {
           out->pairs[static_cast<usize>(req[j].slot)] = p;
           ++j;
         }
         if (j >= req.size()) break;
-        ++idx;
       }
       if (j != req.size()) {
         if (err) *err = "TLSOPSamplingBaseline::Sample: stream ended early in pass2 (non-deterministic enumerate?)";

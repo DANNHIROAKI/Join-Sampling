@@ -3,14 +3,14 @@
 //
 // TLSOP baseline (Two-layer SOP) (Variant::Adaptive).
 //
-// This follows the adaptive strategy described in the uploaded "Tsitsigkos’23.md":
+// This follows TS23-TLSOP-Adaptive as described in docs/Baseline/Tsitsigkos’23 Baseline.md §4.6:
 //   - Pass 1: enumerate the TLSOP JoinStream once, counting |J| exactly.
 //     While the running count W stays <= J*, also materialize the pairs.
 //     Once W exceeds J*, immediately release the materialized buffer and continue
 //     counting only.
 //   - If |J| <= J*: sample directly from the materialized list (1 pass total).
 //   - Else: perform a second enumeration pass and select by sorted i.i.d. ranks in
-//     [0,|J|) (2 passes total).
+//     [1,|J|] (2 passes total).
 //
 // Compatibility: This baseline also provides Enumerate() so it can be used with the
 // project-wide adaptive runner (which may do its own pilot enumeration). Even if the
@@ -172,7 +172,7 @@ class TLSOPAdaptiveBaseline final : public IBaseline<Dim, T> {
     std::vector<RankReq> req;
     req.resize(static_cast<usize>(t));
     for (u64 i = 0; i < t; ++i) {
-      req[static_cast<usize>(i)] = RankReq{rng->UniformU64(W), i};
+      req[static_cast<usize>(i)] = RankReq{rng->UniformU64(W) + 1, i};
     }
     std::sort(req.begin(), req.end(), [](const RankReq& a, const RankReq& b) {
       if (a.rank < b.rank) return true;
@@ -186,15 +186,15 @@ class TLSOPAdaptiveBaseline final : public IBaseline<Dim, T> {
     stream.Reset();
 
     PairId p;
-    u64 cur = 0;
+    u64 idx = 0;  // 1-based position in JoinStream
     usize k = 0;
     while (stream.Next(&p)) {
-      while (k < req.size() && req[k].rank == cur) {
+      ++idx;
+      while (k < req.size() && req[k].rank == idx) {
         out->pairs[static_cast<usize>(req[k].slot)] = p;
         ++k;
       }
       if (k == req.size()) break;
-      ++cur;
     }
 
     if (k != req.size()) {

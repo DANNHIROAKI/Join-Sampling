@@ -3,18 +3,17 @@
 //
 // TLSOP baseline (Two-layer SOP) (Variant::EnumSampling).
 //
-// This variant exposes the deterministic TLSOP join enumerator (JoinStream)
-// defined in tlsop/sampling.h and performs uniform sampling WITH replacement
-// via generic two-pass rank sampling over that enumerator.
+// This header implements **TS23-TLSOP-EnumerateThenSample** as described in
+// docs/Baseline/Tsitsigkos’23 Baseline.md §4.5:
+//   1) BuildIndex (two-layer grid + multi-assignment + A/B/C/D)
+//   2) One pass JOIN_STREAM(Index) to materialize AllPairs = J (no duplicates)
+//   3) i.i.d. uniform sampling with replacement from AllPairs by array indexing
 //
-// In the experiment harness, EnumSampling variants are typically executed via
-// baselines::runners::RunEnumSamplingOnce(), which directly calls Enumerate()
-// and performs rank sampling itself. We still provide Count() and Sample()
-// here for completeness.
+// IMPORTANT: This variant intentionally uses \Theta(|J|) memory and may OOM for
+// very large joins. For memory-safe sampling, use Variant::Sampling (2-pass)
+// or Variant::Adaptive.
 
 #include "sjs/baselines/tlsop/sampling.h"  // TLSOPIndex + TLSOPJoinEnumerator
-
-#include "sjs/sampling/rank_sampling.h"
 
 #include <memory>
 #include <string>
@@ -33,6 +32,7 @@ class TLSOPEnumSamplingBaseline final : public IBaseline<Dim, T> {
 
   Method method() const noexcept override { return Method::TLSOP; }
   Variant variant() const noexcept override { return Variant::EnumSampling; }
+  // Kept for backward-compatibility with the harness naming.
   std::string_view Name() const noexcept override { return "tlsop_enum+sampling"; }
 
   void Reset() override {
@@ -54,7 +54,7 @@ class TLSOPEnumSamplingBaseline final : public IBaseline<Dim, T> {
              PhaseRecorder* phases,
              std::string* err) override {
     (void)cfg;
-    (void)rng;
+    (void)rng;  // deterministic
     if (!built_ || !index_.Built()) {
       if (err) *err = "TLSOPEnumSamplingBaseline::Count: call Build() first";
       return false;
@@ -99,18 +99,30 @@ class TLSOPEnumSamplingBaseline final : public IBaseline<Dim, T> {
     const u64 t = cfg.run.t;
     if (t == 0) return true;
 
-    auto scoped = phases ? phases->Scoped("rank_sampling") : PhaseRecorder::ScopedPhase(nullptr, "");
-
-    detail::TLSOPJoinEnumerator<Dim, T> stream(&index_);
-    std::vector<PairId> samples;
-    sampling::RankSamplingInfo info;
-
-    if (!sampling::RankSampleWithReplacement<detail::TLSOPJoinEnumerator<Dim, T>, PairId>(
-            &stream, t, rng, &samples, &info, err)) {
-      return false;
+    // 1) One pass materialization: AllPairs = JOIN_STREAM(Index)
+    std::vector<PairId> all_pairs;
+    {
+      auto scoped = phases ? phases->Scoped("tlsop_enum_materialize") : PhaseRecorder::ScopedPhase(nullptr, "");
+      detail::TLSOPJoinEnumerator<Dim, T> stream(&index_);
+      PairId p;
+      while (stream.Next(&p)) {
+        all_pairs.push_back(p);
+      }
     }
 
-    out->pairs = std::move(samples);
+    const u64 N = static_cast<u64>(all_pairs.size());
+    if (N == 0) return true;
+
+    // 2) i.i.d. uniform sampling with replacement from the array.
+    {
+      auto scoped = phases ? phases->Scoped("tlsop_enum_sample_array") : PhaseRecorder::ScopedPhase(nullptr, "");
+      out->pairs.resize(static_cast<usize>(t));
+      for (u64 i = 0; i < t; ++i) {
+        const u64 idx = rng->UniformU64(N);  // [0, N)
+        out->pairs[static_cast<usize>(i)] = all_pairs[static_cast<usize>(idx)];
+      }
+    }
+
     return true;
   }
 
