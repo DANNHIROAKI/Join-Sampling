@@ -21,6 +21,13 @@ cmake_minimum_required(VERSION 3.16)
 
 project(SpatialJoinSamplingCpp LANGUAGES CXX)
 
+# Default to a Release build to keep performance-focused experiments fast.
+if (NOT CMAKE_BUILD_TYPE)
+  message(STATUS "CMAKE_BUILD_TYPE not set; defaulting to Release")
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "RelWithDebInfo" "MinSizeRel")
+
 # --------------------------
 # Options
 # --------------------------
