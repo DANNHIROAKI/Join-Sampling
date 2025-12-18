@@ -1,34 +1,36 @@
 #pragma once
 // sjs/baselines/sirs/sampling.h
 //
-// SIRS baseline (Variant::Sampling).
+// SIRS-JS baseline (Variant::Sampling).
 //
-// This baseline implements the reduction described in "SIRS’21.md":
-//   - Choose one relation as OUTER and the other as INNER.
-//   - Embed each INNER rectangle b into a 2*Dim point phi(b).
-//   - For each OUTER rectangle a, construct a 2*Dim range Q(a) such that:
-//         b intersects a  <=>  phi(b) \in Q(a)
-//     under half-open rectangle semantics [lo,hi).
-//   - Phase 1 (Count): compute deg(a)=|{b in INNER : b intersects a}| for every
-//     a in OUTER using a point range-count index; W = sum_a deg(a) = |J|.
-//   - Phase 2/3 (Sample): sample OUTER a with probability deg(a)/W, then sample
-//     one b uniformly from INNER\cap Q(a) (using a range sampler). This yields
-//     uniform i.i.d. join samples with replacement.
+// This implementation is written to **strictly align** with:
+//   docs/Baseline/SIRS’21 Baseline.md
 //
-// Practical note:
-//   The original SIRS paper provides a specialized independent range sampler.
-//   For this SIGMOD-grade experimental harness we implement a deterministic
-//   KD-tree based range sampler that supports:
-//     Count(Q), Enumerate(Q), and Sample(Q,k) uniformly with replacement.
-//   This preserves the *algorithmic contract* used by the baseline.
+// Core design points implemented here:
+//   - Half-open intersection semantics for input rectangles: [L, R)
+//     (strict inequalities at the boundaries).
+//   - Reduction from rectangle intersection join to a 2d-dimensional
+//     dominance/range query via the embedding:
+//         phi(b) = ( L(b), -R(b) )
+//     and per-outer query box:
+//         Q(a) = [min L(b), R(a)) x [min(-R(b)), -L(a))
+//     so that:  a intersects b  <=>  phi(b) in Q(a).
+//   - Engineering-critical strictness handling via **rank compression**
+//     (scheme A in the baseline doc): we map each embedded axis to integer
+//     ranks and construct Q(a) using lower_bound for half-open upper bounds.
+//   - A deterministic static KD-tree SIRSIndex over ranked points that supports:
+//       Count(Q)  : exact |P ∩ Q|
+//       Report(Q) : streaming enumeration
+//       Sample(Q,k): exact i.i.d. uniform samples with replacement from P ∩ Q
+//     implemented without rejection by decomposing queries into disjoint pieces
+//     (fully-contained subtree segments + boundary points).
 
 #include "sjs/baselines/baseline_api.h"
 #include "sjs/core/assert.h"
-#include "sjs/geometry/embedding.h"
-#include "sjs/geometry/predicates.h"
 #include "sjs/sampling/alias_table.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdint>
 #include <limits>
@@ -36,6 +38,7 @@
 #include <numeric>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -47,7 +50,7 @@ namespace sirs {
 namespace detail {
 
 // --------------------------
-// Small helpers for cfg.run.extra
+// cfg.run.extra helpers
 // --------------------------
 
 inline bool ParseU32(std::string_view s, u32* out) {
@@ -111,7 +114,6 @@ inline std::string ExtraStringOr(const std::unordered_map<std::string, std::stri
 
 // Parse which relation should be treated as OUTER.
 // Supported values (case-insensitive): "R" or "S".
-// Returns true if parsed, false otherwise.
 inline bool ParseOuterSide(std::string_view s, bool* out_outer_is_r) {
   if (!out_outer_is_r) return false;
   if (s.empty()) return false;
@@ -140,27 +142,270 @@ inline bool ParseOuterSide(std::string_view s, bool* out_outer_is_r) {
 }
 
 // --------------------------
-// Deterministic KD-tree range sampler
+// Robust accessors for Box lower/upper coordinates.
+// We try common layouts (lo/hi, l/r, min/max). This keeps the baseline
+// independent of the exact Box field naming.
 // --------------------------
 
-// A KD-tree over points with:
-//   - RangeCount(Q)
-//   - RangeSample(Q,k) : i.i.d uniform samples with replacement from points in Q
-//   - A streaming Cursor to enumerate points in Q without materializing all.
-//
-// The implementation is *static*: all points are present; node weights are
-// subtree sizes.
+template <class BoxT, class = void>
+struct HasMember_lo : std::false_type {};
+template <class BoxT>
+struct HasMember_lo<BoxT, std::void_t<decltype(std::declval<BoxT>().lo[0])>> : std::true_type {};
 
-template <int K, class T>
+template <class BoxT, class = void>
+struct HasMember_hi : std::false_type {};
+template <class BoxT>
+struct HasMember_hi<BoxT, std::void_t<decltype(std::declval<BoxT>().hi[0])>> : std::true_type {};
+
+template <class BoxT, class = void>
+struct HasMember_l : std::false_type {};
+template <class BoxT>
+struct HasMember_l<BoxT, std::void_t<decltype(std::declval<BoxT>().l[0])>> : std::true_type {};
+
+template <class BoxT, class = void>
+struct HasMember_r : std::false_type {};
+template <class BoxT>
+struct HasMember_r<BoxT, std::void_t<decltype(std::declval<BoxT>().r[0])>> : std::true_type {};
+
+template <class BoxT, class = void>
+struct HasMember_min : std::false_type {};
+template <class BoxT>
+struct HasMember_min<BoxT, std::void_t<decltype(std::declval<BoxT>().min[0])>> : std::true_type {};
+
+template <class BoxT, class = void>
+struct HasMember_max : std::false_type {};
+template <class BoxT>
+struct HasMember_max<BoxT, std::void_t<decltype(std::declval<BoxT>().max[0])>> : std::true_type {};
+
+// Read-only accessors.
+template <class BoxT>
+inline auto BoxLowerAt(const BoxT& b, int i) -> decltype(auto) {
+  if constexpr (HasMember_lo<BoxT>::value) {
+    return b.lo[static_cast<usize>(i)];
+  } else if constexpr (HasMember_l<BoxT>::value) {
+    return b.l[static_cast<usize>(i)];
+  } else if constexpr (HasMember_min<BoxT>::value) {
+    return b.min[static_cast<usize>(i)];
+  } else {
+    static_assert(HasMember_lo<BoxT>::value || HasMember_l<BoxT>::value || HasMember_min<BoxT>::value,
+                  "Unsupported Box layout: expected member lo/l/min");
+  }
+}
+
+template <class BoxT>
+inline auto BoxUpperAt(const BoxT& b, int i) -> decltype(auto) {
+  if constexpr (HasMember_hi<BoxT>::value) {
+    return b.hi[static_cast<usize>(i)];
+  } else if constexpr (HasMember_r<BoxT>::value) {
+    return b.r[static_cast<usize>(i)];
+  } else if constexpr (HasMember_max<BoxT>::value) {
+    return b.max[static_cast<usize>(i)];
+  } else {
+    static_assert(HasMember_hi<BoxT>::value || HasMember_r<BoxT>::value || HasMember_max<BoxT>::value,
+                  "Unsupported Box layout: expected member hi/r/max");
+  }
+}
+
+// --------------------------
+// Rank-space point/box and half-open predicates.
+// Coordinates are u32 ranks per axis.
+// BBoxes are half-open and are guaranteed to contain their subtree points.
+// --------------------------
+
+template <int K>
+struct RankPoint {
+  static_assert(K >= 1, "RankPoint requires K>=1");
+  std::array<u32, static_cast<usize>(K)> v{};
+};
+
+template <int K>
+struct RankBox {
+  static_assert(K >= 1, "RankBox requires K>=1");
+  std::array<u32, static_cast<usize>(K)> lo{};
+  std::array<u32, static_cast<usize>(K)> hi{};
+
+  bool IsEmpty() const noexcept {
+    for (int d = 0; d < K; ++d) {
+      if (lo[static_cast<usize>(d)] >= hi[static_cast<usize>(d)]) return true;
+    }
+    return false;
+  }
+
+  static RankBox Empty() noexcept {
+    RankBox b;
+    for (int d = 0; d < K; ++d) {
+      b.lo[static_cast<usize>(d)] = 1;
+      b.hi[static_cast<usize>(d)] = 0;
+    }
+    return b;
+  }
+};
+
+template <int K>
+inline bool IntersectsHalfOpen(const RankBox<K>& a, const RankBox<K>& b) noexcept {
+  if (a.IsEmpty() || b.IsEmpty()) return false;
+  for (int d = 0; d < K; ++d) {
+    const u32 alo = a.lo[static_cast<usize>(d)];
+    const u32 ahi = a.hi[static_cast<usize>(d)];
+    const u32 blo = b.lo[static_cast<usize>(d)];
+    const u32 bhi = b.hi[static_cast<usize>(d)];
+    if (!(alo < bhi && blo < ahi)) return false;
+  }
+  return true;
+}
+
+template <int K>
+inline bool ContainsBoxHalfOpen(const RankBox<K>& outer, const RankBox<K>& inner) noexcept {
+  if (outer.IsEmpty() || inner.IsEmpty()) return false;
+  for (int d = 0; d < K; ++d) {
+    if (inner.lo[static_cast<usize>(d)] < outer.lo[static_cast<usize>(d)]) return false;
+    if (inner.hi[static_cast<usize>(d)] > outer.hi[static_cast<usize>(d)]) return false;
+  }
+  return true;
+}
+
+template <int K>
+inline bool ContainsPointHalfOpen(const RankBox<K>& b, const RankPoint<K>& p) noexcept {
+  if (b.IsEmpty()) return false;
+  for (int d = 0; d < K; ++d) {
+    const u32 x = p.v[static_cast<usize>(d)];
+    if (x < b.lo[static_cast<usize>(d)]) return false;
+    if (x >= b.hi[static_cast<usize>(d)]) return false;
+  }
+  return true;
+}
+
+// --------------------------
+// Rank compression (scheme A) for strict half-open semantics.
+// --------------------------
+
+template <int Dim, class ScalarT>
+class RankEmbedding {
+ public:
+  static_assert(Dim >= 1, "RankEmbedding requires Dim>=1");
+
+  using BoxT = Box<Dim, ScalarT>;
+  static constexpr int K = 2 * Dim;
+
+  using RPoint = RankPoint<K>;
+  using RBox = RankBox<K>;
+
+  bool Built() const noexcept { return built_; }
+
+  void Reset() {
+    for (auto& v : axes_) v.clear();
+    built_ = false;
+  }
+
+  // Build per-axis sorted unique coordinate lists.
+  // Following the baseline doc (Sec. 3.3, scheme A):
+  //   axis i (0..d-1): collect inner L_i(b) and outer R_i(a)
+  //   axis d+i:        collect inner (-R_i(b)) and outer (-L_i(a))
+  template <class RelT>
+  bool BuildAxes(const RelT& outer, const RelT& inner, std::string* err) {
+    Reset();
+
+    // Collect.
+    for (usize bi = 0; bi < inner.Size(); ++bi) {
+      const BoxT& b = inner.boxes[bi];
+      for (int i = 0; i < Dim; ++i) {
+        axes_[static_cast<usize>(i)].push_back(BoxLowerAt(b, i));
+        axes_[static_cast<usize>(Dim + i)].push_back(-BoxUpperAt(b, i));
+      }
+    }
+    for (usize ai = 0; ai < outer.Size(); ++ai) {
+      const BoxT& a = outer.boxes[ai];
+      for (int i = 0; i < Dim; ++i) {
+        axes_[static_cast<usize>(i)].push_back(BoxUpperAt(a, i));
+        axes_[static_cast<usize>(Dim + i)].push_back(-BoxLowerAt(a, i));
+      }
+    }
+
+    // Sort unique.
+    for (int ax = 0; ax < K; ++ax) {
+      auto& v = axes_[static_cast<usize>(ax)];
+      std::sort(v.begin(), v.end());
+      v.erase(std::unique(v.begin(), v.end()), v.end());
+      if (v.size() > static_cast<usize>(std::numeric_limits<u32>::max())) {
+        if (err) *err = "RankEmbedding::BuildAxes: axis cardinality exceeds u32";
+        return false;
+      }
+    }
+
+    built_ = true;
+    return true;
+  }
+
+  // Rank for a point coordinate; expects value exists in the axis list.
+  u32 RankExact(int axis, const ScalarT& value) const {
+    const auto& v = axes_[static_cast<usize>(axis)];
+    auto it = std::lower_bound(v.begin(), v.end(), value);
+    SJS_DASSERT(it != v.end());
+    // Equality check in strict weak ordering sense.
+    SJS_DASSERT(!(value < *it) && !(*it < value));
+    return static_cast<u32>(it - v.begin());
+  }
+
+  // Rank for a query upper bound: hi = lower_bound(axis_values, upper).
+  // This makes the half-open condition x < upper equivalent to rank(x) < hi.
+  u32 UpperRank(int axis, const ScalarT& upper) const {
+    const auto& v = axes_[static_cast<usize>(axis)];
+    auto it = std::lower_bound(v.begin(), v.end(), upper);
+    return static_cast<u32>(it - v.begin());
+  }
+
+  // Embed an INNER box b into a ranked 2d point phi(b) = (L(b), -R(b)).
+  template <class AnyBoxT>
+  RPoint EmbedInner(const AnyBoxT& b) const {
+    SJS_DASSERT(built_);
+    RPoint p;
+    for (int i = 0; i < Dim; ++i) {
+      p.v[static_cast<usize>(i)] = RankExact(i, BoxLowerAt(b, i));
+      p.v[static_cast<usize>(Dim + i)] = RankExact(Dim + i, -BoxUpperAt(b, i));
+    }
+    return p;
+  }
+
+  // Build ranked query for an OUTER box a:
+  //   lo = 0 for every axis (since min inner values map to >=0),
+  //   hi = lower_bound(axis_values, R_i(a)) for the L axes,
+  //        lower_bound(axis_values, -L_i(a)) for the -R axes.
+  template <class AnyBoxT>
+  RBox QueryForOuter(const AnyBoxT& a) const {
+    SJS_DASSERT(built_);
+    RBox q;
+    for (int i = 0; i < K; ++i) {
+      q.lo[static_cast<usize>(i)] = 0;
+      if (i < Dim) {
+        q.hi[static_cast<usize>(i)] = UpperRank(i, BoxUpperAt(a, i));
+      } else {
+        const int j = i - Dim;
+        q.hi[static_cast<usize>(i)] = UpperRank(i, -BoxLowerAt(a, j));
+      }
+    }
+    return q;
+  }
+
+ private:
+  std::array<std::vector<ScalarT>, static_cast<usize>(K)> axes_{};
+  bool built_{false};
+};
+
+// --------------------------
+// Deterministic KD-tree range sampler over ranked points (SIRSIndex).
+// --------------------------
+
+template <int K>
 class KDRangeSampler {
  public:
   static_assert(K >= 1, "KDRangeSampler requires K>=1");
-  using PointT = Point<K, T>;
-  using BoxT = Box<K, T>;
+
+  using PointT = RankPoint<K>;
+  using BoxT = RankBox<K>;
 
   struct Options {
-    // Leaf threshold (scan points directly).
-    u32 leaf_size = 32;
+    // Leaf capacity (baseline doc suggests e.g. 256).
+    u32 leaf_size = 256;
   };
 
   KDRangeSampler() = default;
@@ -186,11 +431,14 @@ class KDRangeSampler {
       if (err) *err = "KDRangeSampler::Build: too many points for u32 indexing";
       return false;
     }
+
     n_ = static_cast<u32>(pts.size());
     pts_ = pts.data();
 
     indices_.resize(static_cast<usize>(n_));
     std::iota(indices_.begin(), indices_.end(), 0u);
+
+    nodes_.clear();
     nodes_.reserve(static_cast<usize>(n_ == 0 ? 0 : (2 * n_)));
 
     if (n_ == 0) {
@@ -217,8 +465,9 @@ class KDRangeSampler {
       stack.pop_back();
       const Node& node = nodes_[static_cast<usize>(v)];
 
-      if (!IntersectsHalfOpen<K, T>(node.bbox, q)) continue;
-      if (ContainsBoxHalfOpen<K, T>(q, node.bbox)) {
+      if (!IntersectsHalfOpen<K>(node.bbox, q)) continue;
+
+      if (ContainsBoxHalfOpen<K>(q, node.bbox)) {
         total += static_cast<u64>(node.end - node.begin);
         continue;
       }
@@ -226,9 +475,7 @@ class KDRangeSampler {
       if (node.IsLeaf()) {
         for (u32 i = node.begin; i < node.end; ++i) {
           const u32 h = indices_[static_cast<usize>(i)];
-          if (ContainsHalfOpen<K, T>(q, pts_[static_cast<usize>(h)])) {
-            ++total;
-          }
+          if (ContainsPointHalfOpen<K>(q, pts_[static_cast<usize>(h)])) ++total;
         }
         continue;
       }
@@ -236,7 +483,7 @@ class KDRangeSampler {
       // Internal: test pivot + traverse children.
       const u32 mid = Mid(node);
       const u32 h = indices_[static_cast<usize>(mid)];
-      if (ContainsHalfOpen<K, T>(q, pts_[static_cast<usize>(h)])) ++total;
+      if (ContainsPointHalfOpen<K>(q, pts_[static_cast<usize>(h)])) ++total;
 
       if (node.right != kNull) stack.push_back(node.right);
       if (node.left != kNull) stack.push_back(node.left);
@@ -250,10 +497,7 @@ class KDRangeSampler {
    public:
     Cursor() = default;
 
-    Cursor(const KDRangeSampler* tree, const BoxT& q)
-        : tree_(tree), q_(q) {
-      Reset();
-    }
+    Cursor(const KDRangeSampler* tree, const BoxT& q) : tree_(tree), q_(q) { Reset(); }
 
     void Reset() {
       stack_.clear();
@@ -269,8 +513,7 @@ class KDRangeSampler {
     }
 
     // Produce next handle in Q. Returns false at end.
-    // If candidate_checks != nullptr, we increment it for each point predicate
-    // evaluation (ContainsHalfOpen) performed on boundary nodes.
+    // If candidate_checks != nullptr, increment it for each point-in-box test.
     bool Next(u32* out_handle, u64* candidate_checks = nullptr) {
       if (!out_handle || done_) return false;
 
@@ -286,7 +529,7 @@ class KDRangeSampler {
         while (leaf_pos_ < leaf_end_) {
           const u32 h = tree_->indices_[static_cast<usize>(leaf_pos_++)];
           if (candidate_checks) ++(*candidate_checks);
-          if (ContainsHalfOpen<K, T>(q_, tree_->pts_[static_cast<usize>(h)])) {
+          if (ContainsPointHalfOpen<K>(q_, tree_->pts_[static_cast<usize>(h)])) {
             *out_handle = h;
             return true;
           }
@@ -302,10 +545,9 @@ class KDRangeSampler {
         stack_.pop_back();
         const Node& node = tree_->nodes_[static_cast<usize>(v)];
 
-        if (!IntersectsHalfOpen<K, T>(node.bbox, q_)) continue;
+        if (!IntersectsHalfOpen<K>(node.bbox, q_)) continue;
 
-        if (ContainsBoxHalfOpen<K, T>(q_, node.bbox)) {
-          // Whole subtree is inside: scan the contiguous index segment.
+        if (ContainsBoxHalfOpen<K>(q_, node.bbox)) {
           seg_pos_ = node.begin;
           seg_end_ = node.end;
           continue;
@@ -317,14 +559,13 @@ class KDRangeSampler {
           continue;
         }
 
-        // Internal node: pivot is a single point that is not included in children.
+        // Internal node: pivot is a single point not included in children.
         const u32 mid = tree_->Mid(node);
         const u32 h = tree_->indices_[static_cast<usize>(mid)];
         if (candidate_checks) ++(*candidate_checks);
-        if (ContainsHalfOpen<K, T>(q_, tree_->pts_[static_cast<usize>(h)])) {
+        if (ContainsPointHalfOpen<K>(q_, tree_->pts_[static_cast<usize>(h)])) {
           *out_handle = h;
           // Keep traversing children on future calls.
-          // Push right then left for deterministic left-first DFS.
           if (node.right != kNull) stack_.push_back(node.right);
           if (node.left != kNull) stack_.push_back(node.left);
           return true;
@@ -372,9 +613,7 @@ class KDRangeSampler {
     u64 total_pts = 0;
     CollectPieces(q, &pieces, &weights, &total_pts);
 
-    if (total_pts == 0) {
-      return true;
-    }
+    if (total_pts == 0) return true;
 
     sampling::AliasTable alias;
     if (!alias.BuildFromU64(Span<const u64>(weights), err)) return false;
@@ -450,15 +689,31 @@ class KDRangeSampler {
   };
 
   u32 Mid(const Node& n) const noexcept {
-    // BuildRec uses this exact mid definition for pivot placement.
     const u32 sz = n.end - n.begin;
     return n.begin + (sz / 2);
   }
 
-  BoxT BoxOfPoint(const PointT& p) const noexcept {
-    BoxT b = BoxT::Empty();
-    b.ExpandToIncludePoint(p);
+  static BoxT BoxOfPoint(const PointT& p) noexcept {
+    BoxT b;
+    for (int d = 0; d < K; ++d) {
+      const u32 x = p.v[static_cast<usize>(d)];
+      b.lo[static_cast<usize>(d)] = x;
+      b.hi[static_cast<usize>(d)] = x + 1u;  // half-open bbox that contains the point
+    }
     return b;
+  }
+
+  static void ExpandToIncludeBox(BoxT* dst, const BoxT& src) noexcept {
+    SJS_DASSERT(dst != nullptr);
+    if (src.IsEmpty()) return;
+    if (dst->IsEmpty()) {
+      *dst = src;
+      return;
+    }
+    for (int d = 0; d < K; ++d) {
+      dst->lo[static_cast<usize>(d)] = std::min(dst->lo[static_cast<usize>(d)], src.lo[static_cast<usize>(d)]);
+      dst->hi[static_cast<usize>(d)] = std::max(dst->hi[static_cast<usize>(d)], src.hi[static_cast<usize>(d)]);
+    }
   }
 
   u32 BuildRec(u32 begin, u32 end, int depth) {
@@ -470,11 +725,11 @@ class KDRangeSampler {
 
     const u32 sz = end - begin;
     if (sz <= opt_.leaf_size) {
-      // Leaf: compute bbox by scanning points.
       BoxT bb = BoxT::Empty();
       for (u32 i = begin; i < end; ++i) {
         const u32 h = indices_[static_cast<usize>(i)];
-        bb.ExpandToIncludePoint(pts_[static_cast<usize>(h)]);
+        BoxT pb = BoxOfPoint(pts_[static_cast<usize>(h)]);
+        ExpandToIncludeBox(&bb, pb);
       }
       node.bbox = bb;
       node.left = kNull;
@@ -486,8 +741,8 @@ class KDRangeSampler {
     const u32 mid = begin + (sz / 2);
 
     auto comp = [&](u32 a, u32 b) {
-      const T va = pts_[static_cast<usize>(a)].v[static_cast<usize>(axis)];
-      const T vb = pts_[static_cast<usize>(b)].v[static_cast<usize>(axis)];
+      const u32 va = pts_[static_cast<usize>(a)].v[static_cast<usize>(axis)];
+      const u32 vb = pts_[static_cast<usize>(b)].v[static_cast<usize>(axis)];
       if (va < vb) return true;
       if (vb < va) return false;
       return a < b;
@@ -502,10 +757,10 @@ class KDRangeSampler {
     if (mid > begin) node.left = BuildRec(begin, mid, depth + 1);
     if (mid + 1 < end) node.right = BuildRec(mid + 1, end, depth + 1);
 
-    // bbox = union(children bbox, pivot point)
+    // bbox = union(children bbox, pivot point bbox)
     BoxT bb = BoxOfPoint(pts_[static_cast<usize>(indices_[static_cast<usize>(mid)])]);
-    if (node.left != kNull) bb.ExpandToIncludeBox(nodes_[static_cast<usize>(node.left)].bbox);
-    if (node.right != kNull) bb.ExpandToIncludeBox(nodes_[static_cast<usize>(node.right)].bbox);
+    if (node.left != kNull) ExpandToIncludeBox(&bb, nodes_[static_cast<usize>(node.left)].bbox);
+    if (node.right != kNull) ExpandToIncludeBox(&bb, nodes_[static_cast<usize>(node.right)].bbox);
     node.bbox = bb;
 
     return node_id;
@@ -534,9 +789,9 @@ class KDRangeSampler {
       stack.pop_back();
       const Node& node = nodes_[static_cast<usize>(v)];
 
-      if (!IntersectsHalfOpen<K, T>(node.bbox, q)) continue;
+      if (!IntersectsHalfOpen<K>(node.bbox, q)) continue;
 
-      if (ContainsBoxHalfOpen<K, T>(q, node.bbox)) {
+      if (ContainsBoxHalfOpen<K>(q, node.bbox)) {
         const u32 len = node.end - node.begin;
         if (len > 0) {
           out_pieces->push_back(Piece{Piece::Kind::Segment, node.begin, node.end, /*handle=*/0u, /*weight=*/len});
@@ -549,7 +804,7 @@ class KDRangeSampler {
       if (node.IsLeaf()) {
         for (u32 i = node.begin; i < node.end; ++i) {
           const u32 h = indices_[static_cast<usize>(i)];
-          if (ContainsHalfOpen<K, T>(q, pts_[static_cast<usize>(h)])) {
+          if (ContainsPointHalfOpen<K>(q, pts_[static_cast<usize>(h)])) {
             out_pieces->push_back(Piece{Piece::Kind::Point, 0u, 0u, h, 1u});
             out_weights->push_back(1ULL);
             *out_total_pts += 1ULL;
@@ -558,10 +813,10 @@ class KDRangeSampler {
         continue;
       }
 
-      // Internal node: add pivot point if it falls in Q, then explore children.
+      // Internal node: add pivot if inside; then explore children.
       const u32 mid = Mid(node);
       const u32 h = indices_[static_cast<usize>(mid)];
-      if (ContainsHalfOpen<K, T>(q, pts_[static_cast<usize>(h)])) {
+      if (ContainsPointHalfOpen<K>(q, pts_[static_cast<usize>(h)])) {
         out_pieces->push_back(Piece{Piece::Kind::Point, 0u, 0u, h, 1u});
         out_weights->push_back(1ULL);
         *out_total_pts += 1ULL;
@@ -594,26 +849,29 @@ struct SIRSState {
   using BoxT = Box<Dim, T>;
 
   static constexpr int K = 2 * Dim;
-  using EmbPointT = EmbeddedPoint<Dim, T>;
-  using EmbBoxT = EmbeddedBox<Dim, T>;
-  using KD = KDRangeSampler<K, T>;
+  using EmbedT = RankEmbedding<Dim, T>;
+  using RPoint = typename EmbedT::RPoint;
+  using RBox = typename EmbedT::RBox;
+  using KD = KDRangeSampler<K>;
 
   const DatasetT* ds = nullptr;
   const RelT* outer = nullptr;
   const RelT* inner = nullptr;
   bool outer_is_r = true;
 
-  DomainBounds<Dim, T> inner_domain;
+  bool use_rank = true;
+  EmbedT embed;
 
+  // KD-tree over ranked inner points. Handle == inner index.
   KD kd;
   typename KD::Options kd_opt;
+  std::vector<RPoint> inner_points;
 
-  std::vector<EmbPointT> inner_points;  // phi(b) in original order (handle = inner index)
-
-  // Phase-1 weights (deg per OUTER)
+  // Phase-1 weights (deg per OUTER).
   std::vector<u64> deg;
   sampling::AliasTable outer_alias;
   u64 W = 0;
+
   bool built = false;
   bool weights_valid = false;
 
@@ -623,7 +881,8 @@ struct SIRSState {
     inner = nullptr;
     outer_is_r = true;
 
-    inner_domain = DomainBounds<Dim, T>{};
+    use_rank = true;
+    embed.Reset();
 
     kd.Reset();
     kd_opt = typename KD::Options{};
@@ -636,17 +895,16 @@ struct SIRSState {
     weights_valid = false;
   }
 
-  // Build the embedding and the point index for the chosen INNER relation.
   bool BuildIndex(const DatasetT& dataset, const Config& cfg, PhaseRecorder* phases, std::string* err) {
     auto scoped = phases ? phases->Scoped("sirs_build_index") : PhaseRecorder::ScopedPhase(nullptr, "");
 
     Reset();
     ds = &dataset;
 
-    // Determine OUTER side.
+    // Step 0: choose OUTER/INNER.
     // Priority:
     //   1) cfg.run.extra["sirs_outer"] = "R" or "S".
-    //   2) otherwise choose the smaller relation as OUTER (reduces number of range-count queries).
+    //   2) otherwise choose the smaller relation as OUTER.
     bool outer_r = (dataset.R.Size() <= dataset.S.Size());
     {
       const std::string v = ExtraStringOr(cfg.run.extra, "sirs_outer", "");
@@ -659,26 +917,37 @@ struct SIRSState {
     outer = outer_is_r ? &dataset.R : &dataset.S;
     inner = outer_is_r ? &dataset.S : &dataset.R;
 
-    // KD-tree leaf size.
+    // Leaf size for KD-tree SIRSIndex.
     kd_opt.leaf_size = ExtraU32Or(cfg.run.extra, "sirs_leaf_size", kd_opt.leaf_size);
     if (kd_opt.leaf_size == 0) kd_opt.leaf_size = 1;
 
-    // Domain bounds from INNER only (sufficient for the reduction).
-    inner_domain = DomainBounds<Dim, T>::FromBoxes(Span<const BoxT>(inner->boxes));
+    // Rank compression toggle (baseline doc scheme A). Default = true.
+    use_rank = ExtraBoolOr(cfg.run.extra, "sirs_rank", true);
+    if (!use_rank) {
+      // The baseline design recommends rank compression; in strict mode we disallow disabling.
+      if (err) *err = "SIRSState::BuildIndex: sirs_rank=false is not supported in the strict baseline implementation";
+      return false;
+    }
 
-    // Build embedded points for INNER in original order.
+    // Step 1+2: build embedding + rank axes.
+    {
+      auto _ = phases ? phases->Scoped("sirs_rank_axes") : PhaseRecorder::ScopedPhase(nullptr, "");
+      if (!embed.BuildAxes(*outer, *inner, err)) return false;
+    }
+
+    // Step 1: embed INNER boxes as ranked points phi(b).
     {
       auto _ = phases ? phases->Scoped("sirs_embed_inner") : PhaseRecorder::ScopedPhase(nullptr, "");
       inner_points.resize(inner->Size());
       for (usize i = 0; i < inner->Size(); ++i) {
-        inner_points[i] = EmbedLowerUpper<Dim, T>(inner->boxes[i]);
+        inner_points[i] = embed.EmbedInner(inner->boxes[i]);
       }
     }
 
-    // Build KD-tree over embedded points.
+    // Step 3: build KD-tree SIRSIndex.
     {
       auto _ = phases ? phases->Scoped("sirs_build_kd") : PhaseRecorder::ScopedPhase(nullptr, "");
-      if (!kd.Build(Span<const EmbPointT>(inner_points), kd_opt, err)) return false;
+      if (!kd.Build(Span<const RPoint>(inner_points), kd_opt, err)) return false;
     }
 
     built = true;
@@ -689,24 +958,18 @@ struct SIRSState {
     return true;
   }
 
-  // Convert an OUTER rectangle a to the embedded query range Q(a).
-  EmbBoxT QueryForOuter(const BoxT& a) const noexcept {
-    return MakeIntersectQueryRange<Dim, T>(a, inner_domain);
-  }
+  // Convert an OUTER rectangle a to the ranked query range Q(a).
+  RBox QueryForOuter(const BoxT& a) const noexcept { return embed.QueryForOuter(a); }
 
   // Map (outer index, inner handle) to (R,S) ids.
   PairId MakePair(u32 outer_idx, u32 inner_handle) const noexcept {
     const Id out_id = outer->GetId(static_cast<usize>(outer_idx));
     const Id in_id = inner->GetId(static_cast<usize>(inner_handle));
-    if (outer_is_r) {
-      // OUTER is R, INNER is S.
-      return PairId{out_id, in_id};
-    }
-    // OUTER is S, INNER is R.
+    if (outer_is_r) return PairId{out_id, in_id};
     return PairId{in_id, out_id};
   }
 
-  // Phase 1: compute deg for each OUTER and build alias table.
+  // Phase A of SIRS-JS-Sampling: exact degrees + alias over OUTER.
   bool ComputeDegreesAndAlias(const Config& cfg, PhaseRecorder* phases, std::string* err) {
     (void)cfg;
     auto scoped = phases ? phases->Scoped("sirs_phase1_degrees") : PhaseRecorder::ScopedPhase(nullptr, "");
@@ -728,7 +991,7 @@ struct SIRSState {
 
     for (usize i = 0; i < n_outer; ++i) {
       const BoxT& a = outer->boxes[i];
-      const EmbBoxT q = QueryForOuter(a);
+      const RBox q = QueryForOuter(a);
       const u64 w = q.IsEmpty() ? 0ULL : kd.Count(q);
       deg[i] = w;
 
@@ -741,9 +1004,11 @@ struct SIRSState {
       }
     }
 
-    // Alias table over OUTER indices.
+    // Build alias only when |J|>0. If |J|==0, keep alias empty and Sampling() will early-return.
     outer_alias.Clear();
-    if (!outer_alias.BuildFromU64(Span<const u64>(deg), err)) return false;
+    if (W > 0) {
+      if (!outer_alias.BuildFromU64(Span<const u64>(deg), err)) return false;
+    }
 
     weights_valid = true;
     return true;
@@ -751,7 +1016,8 @@ struct SIRSState {
 };
 
 // --------------------------
-// Deterministic join enumerator for SIRS (outer-loop over OUTER, range-scan INNER)
+// Deterministic join enumerator for SIRS:
+// outer-loop over OUTER, range-scan INNER via KD cursor.
 // --------------------------
 
 template <int Dim, class T>
@@ -759,12 +1025,10 @@ class SIRSJoinEnumerator final : public IJoinEnumerator {
  public:
   using State = SIRSState<Dim, T>;
   using BoxT = typename State::BoxT;
-  using EmbBoxT = typename State::EmbBoxT;
+  using RBox = typename State::RBox;
   using KD = typename State::KD;
 
-  explicit SIRSJoinEnumerator(const State* st) : st_(st) {
-    Reset();
-  }
+  explicit SIRSJoinEnumerator(const State* st) : st_(st) { Reset(); }
 
   void Reset() override {
     stats_.Reset();
@@ -789,9 +1053,8 @@ class SIRSJoinEnumerator final : public IJoinEnumerator {
       if (!cursor_valid_) {
         if (outer_i_ >= n_outer) return false;
 
-        // Initialize cursor for current OUTER rectangle.
         const BoxT& a = st_->outer->boxes[outer_i_];
-        const EmbBoxT q = st_->QueryForOuter(a);
+        const RBox q = st_->QueryForOuter(a);
         cursor_ = st_->kd.MakeCursor(q);
         cursor_valid_ = true;
       }
@@ -803,7 +1066,6 @@ class SIRSJoinEnumerator final : public IJoinEnumerator {
         return true;
       }
 
-      // Current OUTER exhausted.
       cursor_valid_ = false;
       ++outer_i_;
     }
@@ -822,7 +1084,7 @@ class SIRSJoinEnumerator final : public IJoinEnumerator {
 }  // namespace detail
 
 // --------------------------
-// Baseline: Sampling variant
+// Baseline: Sampling variant (Sec. 4.1 in the baseline doc)
 // --------------------------
 
 template <int Dim, class T = Scalar>
@@ -847,6 +1109,7 @@ class SIRSSamplingBaseline final : public IBaseline<Dim, T> {
              PhaseRecorder* phases,
              std::string* err) override {
     (void)rng;  // deterministic
+
     if (!out) {
       if (err) *err = "SIRSSamplingBaseline::Count: out is null";
       return false;
@@ -859,7 +1122,6 @@ class SIRSSamplingBaseline final : public IBaseline<Dim, T> {
     auto scoped = phases ? phases->Scoped("count") : PhaseRecorder::ScopedPhase(nullptr, "");
 
     if (!st_.ComputeDegreesAndAlias(cfg, phases, err)) return false;
-
     *out = MakeExactCount(st_.W);
     return true;
   }
@@ -886,30 +1148,30 @@ class SIRSSamplingBaseline final : public IBaseline<Dim, T> {
       return false;
     }
 
+    auto scoped = phases ? phases->Scoped("sample") : PhaseRecorder::ScopedPhase(nullptr, "");
+
     out->Clear();
     out->with_replacement = true;
     out->weighted = false;
 
-    const u64 t = cfg.run.t;
-    if (t == 0 || st_.W == 0) return true;
+    const u64 t64 = cfg.run.t;
+    if (t64 == 0 || st_.W == 0) return true;
 
-    if (t > static_cast<u64>(std::numeric_limits<u32>::max())) {
+    if (t64 > static_cast<u64>(std::numeric_limits<u32>::max())) {
       if (err) *err = "SIRSSamplingBaseline::Sample: t exceeds u32 limit";
       return false;
     }
-    const u32 t32 = static_cast<u32>(t);
+    const u32 t = static_cast<u32>(t64);
 
-    auto scoped = phases ? phases->Scoped("sample") : PhaseRecorder::ScopedPhase(nullptr, "");
-
-    // Phase 2: assign each sample slot to an OUTER index by alias.
+    // Phase B: sample OUTER indices i.i.d. by AliasOuter.
     struct Assign {
       u32 outer;
       u32 slot;
     };
 
     std::vector<Assign> asg;
-    asg.resize(static_cast<usize>(t32));
-    for (u32 i = 0; i < t32; ++i) {
+    asg.resize(static_cast<usize>(t));
+    for (u32 i = 0; i < t; ++i) {
       const usize oi = st_.outer_alias.Sample(rng);
       asg[static_cast<usize>(i)] = Assign{static_cast<u32>(oi), i};
     }
@@ -920,9 +1182,9 @@ class SIRSSamplingBaseline final : public IBaseline<Dim, T> {
       return a.slot < b.slot;
     });
 
-    out->pairs.resize(static_cast<usize>(t32));
+    out->pairs.resize(static_cast<usize>(t));
 
-    // Phase 3: for each OUTER group, sample INNER within its query range.
+    // Phase C: for each OUTER group, call SIRSIndex.Sample(Q(a), k_a).
     std::vector<u32> inner_handles;
     inner_handles.reserve(256);
 
@@ -934,9 +1196,9 @@ class SIRSSamplingBaseline final : public IBaseline<Dim, T> {
 
       const u32 k = static_cast<u32>(j - i);
 
-      // Defensive: alias should never pick a zero-degree OUTER unless W==0.
+      // Defensive: alias should never pick a zero-degree outer when |J|>0.
       if (outer_idx >= st_.deg.size() || st_.deg[static_cast<usize>(outer_idx)] == 0) {
-        if (err) *err = "SIRSSamplingBaseline::Sample: selected an outer with deg=0 (alias table bug?)";
+        if (err) *err = "SIRSSamplingBaseline::Sample: selected an outer with deg=0 (alias bug?)";
         return false;
       }
 
@@ -946,7 +1208,7 @@ class SIRSSamplingBaseline final : public IBaseline<Dim, T> {
       inner_handles.clear();
       if (!st_.kd.Sample(q, k, rng, &inner_handles, err)) return false;
       if (inner_handles.size() != k) {
-        if (err) *err = "SIRSSamplingBaseline::Sample: kd.Sample produced wrong number of samples";
+        if (err) *err = "SIRSSamplingBaseline::Sample: SIRSIndex.Sample produced wrong number of samples";
         return false;
       }
 

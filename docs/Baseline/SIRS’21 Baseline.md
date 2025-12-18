@@ -1,8 +1,20 @@
-# 1. 问题定义与分析 + 引用文章内容
+# SIRS‑JS Baseline 设计报告
 
-## 1.1 Spatial Join Sampling 任务定义（与你们整体论文对齐）
+**目标**：用 SIGMOD’21 SIRS 作为“range i.i.d. sampling 黑盒”，构造 Spatial Join Sampling 的三个 baseline：
 
-在 $d\ge 2$ 维欧氏空间 $\mathbb{R}^d$ 中，给定两类**轴对齐半开盒（half-open boxes）**集合：
+- Sampling（SIRS‑JS‑Sampling）
+- Enumerate+Sampling（SIRS‑JS‑Enumerate）
+- Adaptive+Sampling（SIRS‑JS‑Adaptive）
+
+并保证：输出 $t$ 个样本 **i.i.d. 且在真实 join 结果集合 $J$ 上均匀**（with replacement）。
+
+------
+
+## 1. 问题定义与分析
+
+### 1.1 输入对象：两类半开盒（half-open boxes）
+
+在 $d\ge 2$ 维欧氏空间 $\mathbb{R}^d$ 中，给定两类**轴对齐半开盒**集合：
 $$
 R_c=\{r_{c1},\dots,r_{c n_1}\},\quad
 R_{\bar c}=\{r_{\bar c1},\dots,r_{\bar c n_2}\}.
@@ -11,338 +23,484 @@ $$
 $$
 r=\prod_{i=1}^{d}[L_i(r),R_i(r)),\qquad L_i(r)<R_i(r).
 $$
-只关心**跨集合相交对**（cross-set intersection pairs）：
+我们只关心**跨集合相交对**（cross-set intersection pairs）：
 $$
 J=\{(r_c,r_{\bar c})\mid r_c\in R_c,\ r_{\bar c}\in R_{\bar c},\ r_c\cap r_{\bar c}\neq\varnothing\}.
 $$
+
+### 1.2 输出目标：在 $J$ 上 i.i.d. 均匀有放回采样
+
 输出 $t$ 个样本 $Z_1,\dots,Z_t\in J$，要求：
 
 - **均匀性（uniform）**：$\Pr(Z_j=P)=1/|J|$，$\forall P\in J$
 - **独立性（i.i.d. with replacement）**：$Z_1,\dots,Z_t$ 相互独立，允许重复
 
-------
+> 这对应你们整体论文对 Sampling/Adaptive baseline 的要求。
 
-## 1.2 引用文章：SIRS’21 的核心定义与“我们复用的能力”
+### 1.3 半开相交语义（严格不等号必须写清楚）
 
-**文章信息（baseline 依赖的“黑盒能力”来源）**
-
-- 标题：*Spatial Independent Range Sampling*
-- 作者：Dong Xie, Jeff M. Phillips, Michael Matheny, Feifei Li
-- 会议：SIGMOD 2021
-- DOI：10.1145/3448016.3452806 [Pure at Penn State+1](https://pure.psu.edu/en/publications/spatial-independent-range-sampling?utm_source=chatgpt.com)
-
-**SIRS 定义（Uniform SIRS）**
- SIRS 将问题形式化为：给定点集 $P\subset\mathbb{R}^d$、查询 MBR $R$、整数 $k$，返回 $k$ 个来自 $R\cap P$ 的**独立**均匀样本，每个点的概率为 $1/|R\cap P|$。这对应论文 Definition 1。 [users.cs.utah.edu](https://users.cs.utah.edu/~jeffp/papers/sirs-sigmod.pdf)
-
-**SIRS 对独立性的关键强调：跨 query 也必须独立**
- 你草稿里写的“跨 query 独立性”并不是你们额外加的假设——SIRS 论文明确写道独立性不仅针对同一 query 内样本，也应对不同 queries 返回的样本成立。 [users.cs.utah.edu](https://users.cs.utah.edu/~jeffp/papers/sirs-sigmod.pdf)
- （这点对 join sampling 非常关键，因为每个样本可能来自不同的 outer 盒子 $a$，即不同的 $Q(a)$。）
-
-**SIRS 的通用框架 Lemma 1（复杂度抽象）**
- 只要能把查询 MBR $R$ 映射成 $I(n,R)$ 个“连续索引区间”，且映射耗时 $M(n,R)$，就能在
-$$
-O(M(n,R)+I(n,R)+k)
-$$
-时间内返回 $k$ 个独立均匀样本。 [users.cs.utah.edu](https://users.cs.utah.edu/~jeffp/papers/sirs-sigmod.pdf)
- 这也是你们 baseline 分析里最“可引用且审稿友好”的复杂度刻画方式。
-
-**SIRS 中的 Walker alias（离散按权采样的 O(1) 查询组件）**
- SIRS 论文在 Background 里专门回顾了 Walker alias 方法：线性预处理 + $O(1)$ 抽样，用于按权重选择离散对象（例如区间、节点等）。 [users.cs.utah.edu](https://users.cs.utah.edu/~jeffp/papers/sirs-sigmod.pdf)
- 我们在 join sampling 外层“按 $deg(a)$ 加权选 $a$”也正好复用这一组件。
-
-> 一句话总结：SIRS 给我们一个可以当黑盒调用的能力：
->  **对点集 $P$ 的任意 MBR 查询 $R$，返回 $k$ 个独立均匀样本（且跨 query 独立）。** [users.cs.utah.edu+1](https://users.cs.utah.edu/~jeffp/papers/sirs-sigmod.pdf)
-
-------
-
-## 1.3 核心对齐：把“盒子相交 join”转成“点集 MBR 查询 + range sampling”
-
-SIRS 的输入是点集，但 join 的 inner 侧是盒子。我们采用标准等价嵌入，把 **“盒子相交”** 转成 **“点落入 MBR”**：
-
-### 1.3.1 半开盒相交的严格条件（必须说清楚）
-
-对半开盒 $a,b$，有：
+对半开盒 $a,b$：
 $$
 a\cap b\neq\varnothing
-\quad\Longleftrightarrow\quad
+\iff
 \forall i\in[d]:
-\big(L_i(a)<R_i(b)\big)\ \wedge\ \big(L_i(b)<R_i(a)\big).
+\big(L_i(a)<R_i(b)\big)\wedge \big(L_i(b)<R_i(a)\big).
 $$
-等价写法（你草稿里用的形式）：
+等价改写（更贴合后续嵌入）：
 $$
 \forall i:
-\big(L_i(b)<R_i(a)\big)\ \wedge\ \big(R_i(b)>L_i(a)\big).
+\big(L_i(b)<R_i(a)\big)\wedge \big(R_i(b)>L_i(a)\big).
 $$
-两种写法完全等价（都是严格不等号），并且与半开语义一致：**贴边（如 $R_i(b)=L_i(a)$）不算相交**。
+**贴边不算相交**：例如 $R_i(b)=L_i(a)$ 时在该维没有交叠，因此整体不相交。
 
-### 1.3.2 2d 维嵌入：inner 盒子 → 点
+### 1.4 baseline 的核心采样分解：两层采样 = 全局均匀
 
-对每个 inner 盒子 $b\in R_{\bar c}$，定义点：
+对任意 outer 盒子 $a$ 定义其 join 度数：
 $$
-\phi(b)=\big(L_1(b),\dots,L_d(b),\ -R_1(b),\dots,-R_d(b)\big)\in\mathbb{R}^{2d}.
-$$
-
-### 1.3.3 outer 盒子 → 查询 MBR $Q(a)$
-
-对 outer 盒子 $a\in R_c$，构造 $2d$ 维查询 MBR：
-$$
-Q(a)= \prod_{i=1}^d [\underline{L}_i,\ R_i(a)) \ \times\ \prod_{i=1}^d [\underline{U}_i,\ -L_i(a)),
-$$
-其中下界常量只需保证“足够小”覆盖所有 $\phi(b)$ 的坐标，例如：
-$$
-\underline{L}_i := \min_{b\in R_{\bar c}} L_i(b),\qquad
-\underline{U}_i := \min_{b\in R_{\bar c}} (-R_i(b)) = -\max_{b\in R_{\bar c}} R_i(b).
-$$
-
-### 1.3.4 等价性（join ↔ range query）：正确性关键性质
-
-对任意 $a\in R_c, b\in R_{\bar c}$：
-$$
-a\cap b\neq\varnothing
-\quad\Longleftrightarrow\quad
-\phi(b)\in Q(a).
-$$
-理由：
-
-- $\phi(b)$ 前 $d$ 维落入 $[-\infty, R_i(a))$ 等价于 $L_i(b)
-- $\phi(b)$ 后 $d$ 维落入 $[-\infty, -L_i(a))$ 等价于 $-R_i(b)<-L_i(a)\iff R_i(b)>L_i(a)$
-
-因此：
-
-- $deg(a):=|\{b:(a,b)\in J\}| = |P\cap Q(a)|$，其中 $P=\{\phi(b)\}$
-- 在 $P\cap Q(a)$ 上均匀采一个点，就等价于在与 $a$ 相交的 $b$ 上均匀采一个
-
-------
-
-# 2. 核心数据结构
-
-本节把 baseline 落地所需结构写成“可复现 API”，避免停留在概念层。
-
-## 2.1 数据对象与基本映射
-
-- **Box**
-  - `id`：全局唯一
-  - `L[1..d], R[1..d]`：半开盒坐标
-- **EmbeddedPoint**（inner 盒子的 2d 维嵌入点）
-  - `coord[1..2d]`：即 $\phi(b)$
-  - `inner_id`：指回原盒子 $b$ 的 id
-- 映射表：
-  - `inner_id -> Box b`
-  - `outer_id -> Box a`
-
-------
-
-## 2.2 严格不等号/半开语义的工程化处理（必须写进可复现细节）
-
-你的草稿已经意识到这点，我这里把它提升为“baseline 的硬性实现要求”：
-
-> 必须严格实现
->  $\;L_i(b)<R_i(a)$ 与 $\;R_i(b)>L_i(a)\;$
->  否则会把“贴边不相交”的 pair 错当成相交，进而 **改变 $J$**，破坏“uniform over true $J$”的定义。
-
-推荐两种等价方案（二选一）：
-
-### 方案 A：坐标压缩（rank）+ 半开区间（推荐，最干净）
-
-对每个维度分别构建排序数组：
-
-- 对前半部分维度 $i\in[1..d]$：压缩所有 $L_i(b)$ 与所有 $R_i(a)$
-- 对后半部分维度 $i\in[1..d]$：压缩所有 $-R_i(b)$ 与所有 $-L_i(a)$
-
-实现时：
-
-- 点坐标用 `rank(x)` 映射到整数
-- 查询上界用 `lower_bound` 找到第一个 $\ge$ 上界的位置作为 `hi`
-   则 “< upper” 等价于 rank in `[0, hi)`
-
-这样天然保留严格不等号（因为上界是半开）。
-
-### 方案 B：浮点转整数 + 边界单位化
-
-若输入为浮点：
-
-- 乘 $10^k$ 并四舍五入成 int
-- 用整数域表示严格不等号
-  - “$x” 可实现为 “$x\le y-1$”
-  - “$x>y$” 可实现为 “$x\ge y+1$”
-
-> 方案 A 更推荐：不需要拍 epsilon，行为最稳定。
-
-------
-
-## 2.3 SIRSIndex：我们把 SIRS 当“可调用黑盒”
-
-建立在 $P=\{\phi(b)\}$ 上的结构 `SIRSIndex`，提供：
-
-- `Build(P)`：构建 SIRS 索引（SIRS 论文给出多种 instantiation，如 KD-tree / z-order 等；论文固定 $d=2$ 讲解，并预计适用于低维 $d<10$ 的场景，评估到 $d=7$。 [users.cs.utah.edu](https://users.cs.utah.edu/~jeffp/papers/sirs-sigmod.pdf)）
-- `Sample(Q, k)`：返回 $k$ 个来自 $P\cap Q$ 的**i.i.d. uniform**样本（with replacement），并且跨 query 仍保持独立性（SIRS 要求）。 [users.cs.utah.edu+1](https://users.cs.utah.edu/~jeffp/papers/sirs-sigmod.pdf)
-
-为了让 join baseline 自洽，我们还需要 **精确度数**：
-
-- `Count(Q)`：精确返回 $|P\cap Q|$
-- （Enumerate/Adaptive 分支需要）`Report(Q)`：枚举所有 $P\cap Q$
-
-> 重要：SIRS 本身解决的是“采样”。你们 baseline 额外要求 Count/Report，是为了保证 join 上的严格均匀性（外层必须按精确 $deg(a)$ 加权）。
->  这可以通过**同一棵 KD-tree / R-tree**实现范围计数与报告（bbox containment → 加子树规模；边界 → 递归或逐点检查）。
-
-------
-
-## 2.4 Outer alias：按 join 度加权选择 outer 盒子
-
-定义 outer 侧每个盒子 $a$ 的 join 度：
-$$
-deg(a):=|P\cap Q(a)|.
+\deg(a)=|\{b\in \text{inner}:(a,b)\in J\}|.
 $$
 则：
 $$
-|J|=\sum_{a\in R_c}deg(a).
+|J|=\sum_{a\in \text{outer}} \deg(a).
 $$
-构建 Walker alias 结构 `AliasOuter`，只对 $deg(a)>0$ 的 $a$ 建表：
+如果我们能做到：
+
+1. 按 $\Pr(\text{pick }a)=\deg(a)/|J|$ 抽 outer；
+2. 在给定 $a$ 的条件下，按 $\Pr(\text{pick }b\mid a)=1/\deg(a)$ 在匹配的 inner 中均匀抽 $b$；
+
+则对任意 $(a,b)\in J$：
 $$
-\Pr(\text{AliasOuter.sample()}=a)=\frac{deg(a)}{|J|}.
+\Pr((a,b))=\frac{\deg(a)}{|J|}\cdot \frac1{\deg(a)}=\frac1{|J|},
 $$
-alias 的 $O(1)$ 抽样、$O(n)$ 建表特性是 SIRS 论文 Background 中明确回顾的组件。 [users.cs.utah.edu](https://users.cs.utah.edu/~jeffp/papers/sirs-sigmod.pdf)
+从而得到**单次样本全局均匀**；若两层抽样都独立重复，则得到 **i.i.d.**。
+
+baseline 的全部工作，就是让这两层抽样“可实现且可复现”，其中第二层由 SIRS 提供。
 
 ------
 
-## 2.5 Enumerate/Adaptive 用的结果容器
+## 2. 引用文章内容：SIRS’21 的核心定义与我们复用的能力
 
-- `AllPairs`：动态数组，存储所有 join pair $(a.id, b.id)$
-- `sizeof(Pair)`：通常是两个 32/64-bit id（工程上建议明确）
-- 枚举版的空间是 $\Theta(|J|)$，Adaptive 用阈值 $J_\star$ 控制
+### 2.1 文章信息（baseline 依赖的来源）
+
+- 标题：**Spatial Independent Range Sampling**
+- 作者：Dong Xie, Jeff M. Phillips, Michael Matheny, Feifei Li
+- 会议：SIGMOD 2021
+- DOI：**10.1145/3448016.3452806**（论文首页）
+
+### 2.2 SIRS 的问题定义：Uniform SIRS（Definition 1）
+
+SIRS 将问题形式化为：给定点集 $P\subset\mathbb{R}^d$、查询 MBR $R$、整数 $k$，返回 $k$ 个来自 $R\cap P$ 的**独立**均匀样本，每个点的概率为 $1/|R\cap P|$。
+
+> baseline 复用的“黑盒能力”就是：
+>  **对点集 $P$ 的任意 MBR 查询 $R$，返回 $k$ 个 i.i.d. uniform samples（with replacement）。**
+
+### 2.3 SIRS 对“跨 query 独立性”的明确强调（对 join baseline 非常关键）
+
+SIRS 论文在介绍中明确指出：独立性不仅要求同一 query 内的样本彼此独立，也要对**不同 queries 返回的样本**仍然独立。
+
+这点对 join baseline 很关键，因为 join 的每个样本可能来自不同的 outer 盒子 $a$，也就是不同的查询 $Q(a)$。
+
+### 2.4 SIRS 的通用采样框架与 Lemma 1（复杂度抽象）
+
+SIRS 的核心思想是：把“在 MBR 内抽样”转化为“在一维线性布局上的若干连续索引区间里抽样”，对这些区间建一个 top-level alias，然后按 alias 选区间、再在区间内均匀抽点。
+
+**Lemma 1（SIRS 论文）**给出抽象复杂度：
+ 如果能把查询 MBR $R$ 映射成 $I(n,R)$ 个“连续索引区间”，映射耗时 $M(n,R)$，则可在
+$$
+O(M(n,R)+I(n,R)+k)
+$$
+时间内返回 $k$ 个独立均匀样本。
+
+baseline 在复杂度分析里引用 Lemma 1 的这种“抽象符号”写法最审稿友好。
+
+### 2.5 Walker alias 方法（Background）：离散按权采样的 $O(1)$ 组件
+
+SIRS 在 Background 部分回顾：对离散对象集合按权采样，Walker alias 能做到**线性建表 $O(n)$**、**单次采样 $O(1)$**，且每次采样独立。
+
+baseline 里我们用 alias 来实现外层按 $\deg(a)$ 加权抽 outer（以及 SIRS 内部也用 alias 抽区间）。
+
+### 2.6 SIRS 的具体 instantiation（你可选，但 baseline 建议默认 KD-tree）
+
+SIRS 给出多种 instantiation，例如：
+
+- **Z-order / ZV-tree**：查询映射到若干 z-value 连续区间；论文给出相应的复杂度讨论（Corollary 1）。
+- **KD-tree (KDS)**：把查询映射到 $O(\sqrt{n})$ 个节点/区间，并给出 $O(\sqrt{n}+k)$ 的期望复杂度结论（Corollary 2，固定展示 $d=2$）。
+- 也讨论了可推广到 R-tree 等层次索引（Sec. 3.4）。
+
+同时 SIRS 论文说明：文中固定 $d=2$ 讲解，但预期可用于低维（文中提到 $d<10$，评估到 $d=7$）。
+
+> **baseline 需要诚实写清楚的点**：我们做 box→point 嵌入后，维度变为 **$2d$**。因此当原始 $d$ 较大时，SIRS 的实际性能可能显著下降；这不是 correctness 问题，但会影响 baseline 的可扩展性解释。
 
 ------
 
-# 3. 算法详细流程（三个版本）
+## 3. 核心数据结构（可复现 API + 工程细节）
 
-## 3.0 共同预处理（所有版本共享）
+本节给出 baseline 的“实现接口”和“实现要点”。你可以把它当作一个独立模块来实现。
+
+### 3.1 数据对象与映射
+
+**Box**
+
+- `id`: 全局唯一（建议 64-bit）
+- `L[1..d], R[1..d]`：半开盒坐标（保证 $L_i）
+
+**EmbeddedPoint（inner 盒子的 $2d$ 维嵌入点）**
+
+- `coord[1..2d]`：$\phi(b)$
+- `inner_id`：指回原盒子 $b$
+
+**映射表**
+
+- `inner_id -> Box`
+- `outer_id -> Box`
+
+### 3.2 关键对齐：把 box 相交 join 转成点集 MBR 查询
+
+#### 3.2.1 嵌入：inner 盒子 $\to$ 点
+
+对每个 inner 盒子 $b$，定义：
+$$
+\phi(b)=\big(L_1(b),\dots,L_d(b),\ -R_1(b),\dots,-R_d(b)\big)\in\mathbb{R}^{2d}.
+$$
+令点集：
+$$
+P=\{\phi(b)\mid b\in \text{InnerSet}\}.
+$$
+
+#### 3.2.2 查询：outer 盒子 $\to$ $2d$ 维 MBR
+
+对 outer 盒子 $a$，构造：
+$$
+Q(a)= \prod_{i=1}^d [\underline{L}_i,\ R_i(a)) \ \times\ \prod_{i=1}^d [\underline{U}_i,\ -L_i(a)).
+$$
+其中下界只要“足够小”覆盖所有点即可，例如：
+$$
+\underline{L}_i := \min_{b\in \text{Inner}} L_i(b),\qquad
+\underline{U}_i := -\max_{b\in \text{Inner}} R_i(b).
+$$
+
+#### 3.2.3 等价性（核心引理）
+
+对任意 outer $a$ 和 inner $b$：
+$$
+a\cap b\neq\varnothing\quad\Longleftrightarrow\quad \phi(b)\in Q(a).
+$$
+解释（逐维）：
+
+- $\phi(b)$ 的第 $i$ 维是 $L_i(b)$，落入 $[\,\underline L_i, R_i(a)\,)$ 等价于 $L_i(b)；
+- $\phi(b)$ 的第 $d+i$ 维是 $-R_i(b)$，落入 $[\,\underline U_i, -L_i(a)\,)$ 等价于 $-R_i(b)<-L_i(a)\iff R_i(b)>L_i(a)$。
+
+因此：
+$$
+\deg(a)=|P\cap Q(a)|,
+$$
+并且在 $P\cap Q(a)$ 上均匀采样一个点，就等价于在与 $a$ 相交的 $b$ 上均匀采样一个。
+
+> 这部分是 baseline 正确性的“硬基石”。
+
+------
+
+### 3.3 严格不等号/半开语义的工程化处理（必须写进 baseline）
+
+如果边界语义处理错（比如把 “$<$” 实现成 “$\le$”），你采样的就不是“真实的 $J$”了，直接破坏定义。
+
+推荐两种方案（**优先方案 A**）：
+
+#### 方案 A：坐标压缩（rank） + 半开上界（最干净）
+
+对每个维度分别压缩坐标，使查询天然用半开上界表达严格不等号。
+
+- 对前半部分维度 $i\in[1..d]$：
+   收集所有 inner 的 $L_i(b)$ 与 outer 的 $R_i(a)$，排序去重得数组 `V_i`。
+- 对后半部分维度 $i\in[1..d]$：
+   收集所有 inner 的 $-R_i(b)$ 与 outer 的 $-L_i(a)$，排序去重得数组 `W_i`。
+
+定义 `rank(x)` 为其在对应数组中的下标（或稳定映射）。
+ 对查询上界 `upper`，用 `hi = lower_bound(array, upper)`，则 “$x” 等价于 “rank(x) ∈ [0, hi)”。
+
+这样你在嵌入空间中的查询区间全部是标准的半开 MBR：
+$$
+[0, hi_1)\times\cdots\times[0, hi_{2d}).
+$$
+
+#### 方案 B：浮点转整数 + 单位化边界
+
+若输入为浮点且你不想做 rank：
+
+- 统一放大 $10^k$ 并取整，转成 int
+- 用整数严格不等号实现：
+  - $x 等价于 $x\le y-1$
+  - $x>y$ 等价于 $x\ge y+1$
+
+> baseline 建议明确写：**默认使用方案 A**，因为更稳定、无 epsilon、实现更一致。
+
+------
+
+### 3.4 SIRSIndex：作为“range i.i.d. sampling 黑盒”，但要补齐 Count/Report
+
+我们在点集 $P$ 上建立 `SIRSIndex`，其核心承诺来自 SIRS Definition 1：
+
+- `Sample(Q, k)`：返回 $k$ 个来自 $P\cap Q$ 的 i.i.d. uniform 样本，并且跨 query 独立。
+
+为了让 join baseline **严格无偏**，我们额外要求：
+
+- `Count(Q)`：精确返回 $|P\cap Q|$
+- `Report(Q)`：枚举 $P\cap Q$（Enumerate/Adaptive 分支需要）
+
+> 重要澄清：SIRS 论文主目标是“采样”，baseline 要求 Count/Report 是为了 join 的外层权重 $\deg(a)$ 必须精确，否则就会引入系统性偏差。
+
+下面给一个**可落地的实现建议**：
+ 选择 SIRS 的 **KD-tree instantiation (KDS)** 作为默认（论文 Sec. 3.3）。
+
+------
+
+### 3.5 推荐的可复现实现：KD-tree SIRSIndex（KDS 风格）+ 精确 Count/Report
+
+> 你们论文里 baseline 可以写：
+>  “我们用 SIRS’21 的 KD-tree sampling instantiation 建索引，并在同一棵 KD-tree 上实现精确 Count/Report。”
+
+#### 3.5.1 结点结构（Node）
+
+每个结点 `u` 存：
+
+- `bbox_u`: 该节点子树点集的 MBR（在 $2d$ 维嵌入空间）
+- `start_u, end_u`: 该子树点在存储数组中的连续区间（闭区间或半开均可，建议半开 `[start,end)`）
+- `size_u = end_u - start_u`
+- `left_u, right_u`（二叉 KD-tree）
+
+并设置叶子容量 `B`（例如 256，SIRS 实验也常用类似叶子大小）。
+
+> SIRS 的 KDS 核心要求是：每个节点对应一个连续存储区间，子节点区间被父节点区间覆盖。
+
+#### 3.5.2 Build：构建 KD-tree 与连续布局（离线构建）
+
+伪代码（示意）：
+
+```
+BuildKD(points array A, dim D=2d, leaf_size B):
+    return BuildRec(A, l=0, r=|A|, depth=0)
+
+BuildRec(A, l, r, depth):
+    u = new Node()
+    u.start = l; u.end = r
+    u.bbox = MBR(A[l:r])
+    if r-l <= B: u.is_leaf = true; return u
+    split_dim = depth mod D
+    mid = (l+r)/2  # median
+    nth_element(A[l:r], mid, key=A[*].coord[split_dim])  # 使 A[l:mid) <= A[mid:r)
+    u.left  = BuildRec(A, l, mid, depth+1)
+    u.right = BuildRec(A, mid, r, depth+1)
+    return u
+```
+
+> 这样建出来的树，天然满足“每个节点在数组上对应连续区间”的性质，从而可按 SIRS 的 Lemma 1 走“区间分解 + alias”的采样框架。
+
+#### 3.5.3 QueryDecompose：把查询 MBR 分解为“完全包含结点 + 边界叶子”
+
+我们需要一个统一的分解过程，供 Sample / Count / Report 复用：
+
+```
+Decompose(u, Q, full_nodes, boundary_leaves):
+    if bbox_u ∩ Q == ∅: return
+    if bbox_u ⊆ Q:
+        full_nodes.append(u)
+        return
+    if u.is_leaf:
+        boundary_leaves.append(u)
+        return
+    Decompose(u.left, Q, full_nodes, boundary_leaves)
+    Decompose(u.right, Q, full_nodes, boundary_leaves)
+```
+
+- `full_nodes`：bbox 完全被 Q 包含的节点，节点区间 `[start,end)` 可直接用；
+- `boundary_leaves`：与 Q 相交但不完全包含的叶子节点，需要扫描叶子点来做精确判断（用于精确 Count/Report，也可用于“无拒绝采样”的增强版 Sample）。
+
+#### 3.5.4 Sample(Q,k)：SIRS 采样（黑盒语义 + 可复现实现轮廓）
+
+SIRS 的一般框架是：
+
+1. 用 `Decompose` 得到若干候选区间（来自 full_nodes，以及必要时的 boundary leaves）；
+2. 对候选区间建立 top-level alias（权重是“该区间内属于 Q 的点数”）；
+3. 重复 $k$ 次：alias 选区间 + 区间内均匀选点（必要时拒绝/或扫描后无拒绝）。
+
+- SIRS 论文讨论了“边界叶子导致的 rejection”，以及“扫描边界叶子避免 rejection”的折中与开销。
+- 对 baseline 而言，只要 `Sample` 满足 Definition 1（uniform + independence），我们即可把它当黑盒调用；但为了“可复现”，你可以在附录写上述轮廓与伪代码。
+
+#### 3.5.5 Count(Q)：精确范围计数（baseline 必须补强的关键）
+
+对 join 的正确性而言，`Count(Q(a))` 必须等于 $|P\cap Q(a)|$ 的**精确值**，不能是估计。
+
+实现：
+
+```
+Count(Q):
+    full_nodes, boundary_leaves = Decompose(root, Q)
+    cnt = sum(u.size for u in full_nodes)  # full nodes 全部在 Q 内，直接加
+    for leaf in boundary_leaves:
+        for p in A[leaf.start:leaf.end]:
+            if p.coord ∈ Q: cnt += 1
+    return cnt
+```
+
+- 为什么精确：
+  - full_nodes 的 bbox ⊆ Q ⇒ 该子树所有点都在 Q 内；
+  - boundary_leaves 必须逐点检查，避免把“bbox 相交但点不在 Q 内”的点误计。
+
+> 这一步就是你们 baseline 之前“需要补强但没写到可落地”的点：**精确 Count 不是 SIRS Lemma 1 的采样复杂度能自动替代的，而是一个明确的范围计数过程**。
+
+#### 3.5.6 Report(Q)：精确范围报告（Enumerate/Adaptive 分支需要）
+
+实现同理：
+
+```
+Report(Q):
+    full_nodes, boundary_leaves = Decompose(root, Q)
+    out = []
+    for u in full_nodes:
+        for p in A[u.start:u.end]:
+            out.append(p)
+    for leaf in boundary_leaves:
+        for p in A[leaf.start:leaf.end]:
+            if p.coord ∈ Q: out.append(p)
+    return out
+```
+
+若考虑内存与流式输出，可提供 `ReportStream(Q)` 迭代器：逐点 yield。
+
+------
+
+### 3.6 AliasOuter：按 $\deg(a)$ 加权选择 outer
+
+构建离散分布：
+$$
+\Pr(\text{AliasOuter.sample()}=a)=\frac{\deg(a)}{|J|},
+$$
+只对 $\deg(a)>0$ 的 $a$ 建表。
+
+alias 的理论性质（线性建表、常数采样、独立）来自 SIRS Background 对 Walker alias 的回顾。
+
+------
+
+### 3.7 Enumerate/Adaptive 的结果容器
+
+- `AllPairs`: 动态数组（vector）存储所有 join 对 $(a.id,b.id)$
+- `sizeof(Pair)`：建议在报告里写出工程估计（例如两 64-bit id 最少 16B，但 vector/对齐常会到 16~24B+）
+- `deg[a]`: 存储每个 outer 的精确度数（至少 64-bit）
+
+------
+
+## 4. 算法详细流程（三个版本）
+
+为方便表述，定义：
+
+- `OuterSet`, `InnerSet`：执行 baseline 时选定的 outer/inner（可交换，见 4.0）
+- $P=\{\phi(b)\mid b\in \text{InnerSet}\}$
+- `BuildQueryMBR(a)`：返回 $Q(a)$
+
+### 4.0 所有版本共享的预处理
 
 输入：$R_c, R_{\bar c}, t$
 
-### Step 0：可选的 outer/inner 交换（只影响性能，不影响正确性）
+#### Step 0：可选 outer/inner 交换（只影响性能，不影响正确性）
 
-默认 outer=$R_c$，inner=$R_{\bar c}$。你可以加入一个简单 heuristic：
+可用简单 heuristic：
 
-- 若 $n_1\gg n_2$，把 outer 设为更小的一侧，以减少要做多少次 `Count(Q(a))`
-- 交换后，所有定义保持一致：outer 变成 $R_{\bar c}$，inner 变成 $R_{c}$，只要统一使用 $\phi(\cdot)$ 嵌入 inner 即可
+- 若 $n_1\gg n_2$，选更小的一侧做 outer，以减少 `Count(Q(a))` 的次数
+   交换后要保证输出仍是 $(r_c,r_{\bar c})$ 的顺序。
 
-**正确性不受影响**：因为 join 是对称关系，外层只是“抽样的组织方式”。
+#### Step 1：构建 inner 点集 $P$
 
-### Step 1：构建 inner 点集 $P$
-
-对每个 $b\in$ inner：
+对每个 inner 盒子 $b$：
 
 - 计算嵌入点 $\phi(b)$
-- 写入 `EmbeddedPoint(coord=phi(b), inner_id=b.id)` 到 $P$
+- 存入 `EmbeddedPoint(coord=phi(b), inner_id=b.id)`
 
-### Step 2：准备查询构造所需常量（可用 rank 压缩替代）
+#### Step 2：严格不等号处理（推荐 rank）
 
-计算每维的 $\underline{L}_i, \underline{U}_i$（或使用 rank 后下界就是 0）。
+按 3.3 的方案 A 做 rank 压缩，得到整数域的点与查询。
 
-### Step 3：构建 SIRSIndex
+#### Step 3：构建 `SIRSIndex`（KD-tree instantiation）
 
 `SIRSIndex.Build(P)`
- （你可以在实现里选择 SIRS 的 KD-tree instantiation 或其它；baseline 文稿只需要把它当满足 Definition 1 的黑盒即可。 [users.cs.utah.edu+1](https://users.cs.utah.edu/~jeffp/papers/sirs-sigmod.pdf)）
+ SIRS 论文中 KD-tree instantiation 的整体构造与采样框架在 Sec. 3.3。
 
 ------
 
-## 3.1 版本 A：Sampling（SIRS‑JS‑Sampling）
+### 4.1 版本 A：Sampling（SIRS‑JS‑Sampling）
 
-### 3.1.1 思想
+#### 4.1.1 思路
 
-- 外层：按 $deg(a)$ 加权选 $a$
-- 内层：在 $P\cap Q(a)$ 上调用 SIRS 采 1 个点，对应 $b$
-- 输出 $(a,b)$
+- Phase A：对每个 outer $a$ 做精确 `Count(Q(a))` 得 $\deg(a)$，建 `AliasOuter`
+- Phase B：重复 $t$ 次：
+   outer 用 alias 抽 $a$，inner 用 `SIRSIndex.Sample(Q(a),1)` 抽一个 $b$，输出 $(a,b)$
 
-### 3.1.2 详细流程
-
-**Phase A：计算 join 度 & 建 alias**
-
-1. 对每个 outer 盒子 $a$：
-   - 构造 $Q(a)$
-   - $deg(a)\leftarrow \texttt{SIRSIndex.Count}(Q(a))$（必须精确）
-2. 计算 $|J|=\sum_a deg(a)$。若 $|J|=0$ 返回空。
-3. 建 alias：`AliasOuter.Build({a:deg(a) | deg(a)>0})`
-
-**Phase B：采样 $t$ 次**
-
-重复 $t$ 次：
-
-1. `a ← AliasOuter.sample()`
-2. 构造 $Q(a)$
-3. `p ← SIRSIndex.Sample(Q(a), 1)`（返回一个点）
-4. `b ← p.inner_id`
-5. 输出 pair $(a.id, b)$
-
-### 3.1.3 伪代码
+#### 4.1.2 伪代码（基础版：每次 Sample 1 个）
 
 ```
 Algorithm SIRS-JS-Sampling(OuterSet, InnerSet, t):
 
-# Preprocess: build P={phi(b)} and SIRSIndex on P
+# Preprocess: build P={phi(b)}, rank compress, build SIRSIndex
 
 # Phase A: exact degrees
 for each a in OuterSet:
     Qa = BuildQueryMBR(a)
-    deg[a] = SIRSIndex.Count(Qa)   # exact
+    deg[a] = SIRSIndex.Count(Qa)      # MUST be exact
 
 J = sum_a deg[a]
 if J == 0: return []
 
-AliasOuter = BuildAlias({a: deg[a] | deg[a] > 0})
+AliasOuter = BuildAlias({a:deg[a] | deg[a] > 0})
 
 # Phase B: i.i.d. samples
 Ans = []
-for j = 1..t:
+for j in 1..t:
     a = AliasOuter.sample()
     Qa = BuildQueryMBR(a)
-    p = SIRSIndex.Sample(Qa, 1)[1]
+    p = SIRSIndex.Sample(Qa, 1)[1]    # 1 uniform point in P∩Qa
     b = p.inner_id
-    Ans.append((a.id, b))
+    Ans.append(OutputAsCrossSetPair(a.id, b))
 
 return Ans
 ```
 
+#### 4.1.3 可选但推荐的工程优化：按 outer 分组批量 Sample
+
+为了减少 “每次 Sample(Q,1) 都要构建 top-level alias” 的开销（SIRS Lemma 1 里的 $M+I$ 部分），可以：
+
+1. 先抽 $t$ 次 outer：得到序列 $a_1,\dots,a_t$
+2. 统计每个 outer 的出现次数 $k_a$
+3. 对每个 $k_a>0$ 的 outer，只调用一次 `Sample(Q(a), k_a)` 返回 $k_a$ 个 i.i.d. 样本
+
+由于 SIRS Definition 1 本身就要求同一 query 内返回 $k$ 个样本相互独立，并且跨 query 独立性也被强调，因此这种“批量调用”不改变分布，只提升性能。
+
 ------
 
-## 3.2 版本 B：Enumerate + Sampling（SIRS‑JS‑Enumerate）
+### 4.2 版本 B：Enumerate+Sampling（SIRS‑JS‑Enumerate）
 
-### 3.2.1 思想
+#### 4.2.1 思路
 
-先把全部 $J$ 枚举进数组 `AllPairs`，再在数组上做 i.i.d. 均匀下标采样。
+先枚举全部 $J$ 到数组 `AllPairs`，再对数组做独立均匀下标采样。
 
-- 优点：当 $|J|$ 小且 $t$ 很大，采样阶段极快
-- 缺点：空间 $\Theta(|J|)$
-
-### 3.2.2 流程
-
-1. `AllPairs ← []`
-2. 对每个 outer 盒子 $a$：
-   - 构造 $Q(a)$
-   - `List ← SIRSIndex.Report(Q(a))`（枚举全部命中点）
-   - 对每个点 $p\in List$：`AllPairs.append((a.id, p.inner_id))`
-3. $W=|AllPairs|$。若 $W=0$ 返回空
-4. 对 $j=1..t$：采样 `idx ~ Uniform{0..W-1}`，输出 `AllPairs[idx]`
-
-### 3.2.3 伪代码
+#### 4.2.2 伪代码
 
 ```
 Algorithm SIRS-JS-Enumerate(OuterSet, InnerSet, t):
 
-# Preprocess: build P and SIRSIndex
+# Preprocess: build P, rank compress, build SIRSIndex
 
 AllPairs = []
 for each a in OuterSet:
     Qa = BuildQueryMBR(a)
-    List = SIRSIndex.Report(Qa)
+    List = SIRSIndex.Report(Qa)     # exact report of P∩Qa
     for p in List:
-        AllPairs.append((a.id, p.inner_id))
+        b = p.inner_id
+        AllPairs.append(OutputAsCrossSetPair(a.id, b))
 
 W = |AllPairs|
 if W == 0: return []
 
 Ans = []
-for j = 1..t:
+for j in 1..t:
     idx = UniformInt(0, W-1)
     Ans.append(AllPairs[idx])
 
@@ -351,135 +509,91 @@ return Ans
 
 ------
 
-## 3.3 版本 C：Adaptive + Sampling（SIRS‑JS‑Adaptive）
+### 4.3 版本 C：Adaptive+Sampling（SIRS‑JS‑Adaptive）
 
-### 3.3.1 目标与无偏切换原则
+#### 4.3.1 设计目标
 
 给定阈值 $J_\star$：
 
-- 若 $|J|\le J_\star$：走 Enumerate+Sampling
-- 若 $|J|>J_\star$：走 Sampling
+- 若 $|J|\le J_\star$：走 Enumerate+Sampling（快）
+- 若 $|J|> J_\star$：走 Sampling（省内存/省枚举）
 
-**无偏的关键原则**：
+#### 4.3.2 无偏切换原则（必须强调）
 
-1. **不能混合**“部分枚举得到的 AllPairs”与“后续 Sampling”一起输出
-    → 一旦决定走 Sampling，必须丢弃 `AllPairs`，否则会破坏均匀性（某些 pair 被“过度代表”）。
-2. Sampling 分支必须拥有所有 $deg(a)$ 的精确值（用于 alias 权重）。
+1. **不能混合**“部分枚举的 AllPairs”与“后续 Sampling”共同输出
+    → 一旦决定走 Sampling，必须丢弃 AllPairs
+2. Sampling 分支必须有所有 outer 的**精确** $\deg(a)$ 以建 alias
 
-### 3.3.2 推荐实现：流式枚举尝试 + 越界后用 Count 补齐当前 outer 的剩余
+#### 4.3.3 推荐实现：流式枚举尝试 + 越界时用 Count 补齐当前 outer
 
-你原稿的“继续扫描 stream 只计数不存储”在 $|J|$ 巨大时会退化为 $\Omega(|J|)$ 的无谓代价。更好的做法：
+关键优化：越界发生时，不要继续枚举剩余 pair（否则在 $|J|$ 巨大时仍然可能被拖成 $\Omega(|J|)$）。做法是：
 
-- 在某个 $a$ 的 `Report(Q(a))` 过程中第一次超过 $J_\star$ 时：
-  1. 记录已经枚举的计数 `partial = deg_partial(a)`
-  2. 立刻调用一次 `Count(Q(a))` 得到 `total = deg(a)`
-  3. 把 $W$ 增加 `total - partial`（补齐真实总数）
-  4. **停止该 outer 的后续 Report**（不再扫描剩余输出）
-  5. 丢弃 AllPairs，切换到 Count-only 处理后续 outer
+- 当处理某个 outer $a$ 的 Report 流时首次超过 $J_\star$：
+  - `partial = deg_partial(a)`（已枚举的命中数）
+  - `total = Count(Q(a))`（精确总数）
+  - 用 `total - partial` 补齐累计计数
+  - 立即停止 Report 当前 outer 的剩余输出
+  - 清空 AllPairs，切换到 COUNT_ONLY
 
-这样可保证：
-
-- 额外枚举输出最多 $J_\star$ 条
-- 越界后不会再被 $|J|$ 拖死
-
-### 3.3.3 流程（单 pass + 早停）
-
-初始化：
-
-- `mode = ENUMERATE`
-- `AllPairs=[]`
-- `W=0`
-- `deg[a]=0`
-
-遍历每个 outer $a$：
-
-- 若 `mode == ENUMERATE`：
-  - 开始 `Report(Q(a))` 流式输出
-  - 每产出一个命中点 $p$：
-     `deg[a]++ ; W++`
-    - 若 `W <= J_star`：存到 `AllPairs`
-    - 若 `W == J_star + 1`（首次越界）：
-      1. `partial = deg[a]`
-      2. `total = Count(Q(a))`（精确）
-      3. `deg[a] = total`
-      4. `W += (total - partial)`（补齐）
-      5. `AllPairs.clear()`，`mode=COUNT_ONLY`
-      6. **break**（停止继续 Report 该 $a$）
-- 若 `mode == COUNT_ONLY`：
-  - `deg[a] = Count(Q(a))`
-  - `W += deg[a]`
-
-遍历结束：
-
-- 若 `W==0` 返回空
-- 若 `mode==ENUMERATE`：AllPairs 即完整 $J$，走数组采样
-- 否则：构建 alias，走 Sampling 输出
-
-### 3.3.4 伪代码
+#### 4.3.4 伪代码
 
 ```
 Algorithm SIRS-JS-Adaptive(OuterSet, InnerSet, t, J_star):
 
-# Preprocess: build P and SIRSIndex
+# Preprocess: build P, rank compress, build SIRSIndex
 
 mode = ENUMERATE
 AllPairs = []
 W = 0
-for each a in OuterSet:
-    deg[a] = 0
+for each a in OuterSet: deg[a] = 0
 
 for each a in OuterSet:
     Qa = BuildQueryMBR(a)
 
     if mode == ENUMERATE:
-        # stream report
         for p in SIRSIndex.ReportStream(Qa):
             deg[a] += 1
             W += 1
             if W <= J_star:
-                AllPairs.append((a.id, p.inner_id))
+                AllPairs.append(OutputAsCrossSetPair(a.id, p.inner_id))
             else:
-                # first overflow: switch
                 partial = deg[a]
-                total = SIRSIndex.Count(Qa)     # exact total
+                total = SIRSIndex.Count(Qa)        # exact total
                 deg[a] = total
-                W += (total - partial)
+                W += (total - partial)             # now W includes full deg[a]
                 AllPairs.clear()
                 mode = COUNT_ONLY
-                break  # stop reporting remaining for this a
+                break
 
-    else:
-        cnt = SIRSIndex.Count(Qa)
-        deg[a] = cnt
-        W += cnt
+    else:  # COUNT_ONLY
+        deg[a] = SIRSIndex.Count(Qa)               # exact
+        W += deg[a]
 
 if W == 0: return []
 
 if mode == ENUMERATE:
     return UniformArraySample(AllPairs, t)
 
-AliasOuter = BuildAlias({a: deg[a] | deg[a] > 0})
+AliasOuter = BuildAlias({a:deg[a] | deg[a] > 0})
 return OuterAliasPlusSIRS(AliasOuter, SIRSIndex, t)
 ```
 
 ------
 
-# 4. Adaptive 版本阈值 $J_\star$ 的选择策略（能写进论文 + 能落地）
+## 5. Adaptive 阈值 $J_\star$ 的选择策略（可写进论文 + 可落地）
 
-阈值要同时满足**内存硬约束**与**时间权衡**。推荐写成两部分，然后取最小值：
+建议写成：
 $$
 J_\star=\min\Big(J_\star^{\text{mem}},\ J_\star^{\text{time}}\Big).
 $$
 
-------
-
-## 4.1 内存硬约束（必须满足，否则枚举分支可能 OOM）
+### 5.1 内存硬约束（必须满足，否则 OOM）
 
 设：
 
-- 可用内存预算：`MemBudget`（字节）
-- 允许给 `AllPairs` 的比例：$\rho\in(0,1)$（建议 0.2～0.5）
-- 每个 pair 的存储开销：`sizeof(Pair)`（两 id + 容器开销）
+- 可用内存预算 `MemBudget`（字节）
+- 允许给 `AllPairs` 的比例 $\rho\in(0,1)$（建议 0.2～0.5）
+- pair 存储开销 `sizeof(Pair)`（至少 16B，两 64-bit id）
 
 则：
 $$
@@ -489,151 +603,113 @@ J_\star^{\text{mem}}
 \frac{\rho\cdot \text{MemBudget}}{\text{sizeof(Pair)}}
 \right\rfloor.
 $$
-工程上建议把 `sizeof(Pair)` 写成：
 
-- 若仅存两 64-bit id：至少 16B，但向量/对象对齐后常常是 16~24B
-- 如果还存指针/额外字段，请按真实结构体大小估
-
-------
-
-## 4.2 时间权衡（让 Adaptive “值回票价”）
+### 5.2 时间权衡（让 Adaptive “值回票价”）
 
 核心比较：
 
-- 枚举版开销至少 $\Omega(|J|)$（因为要输出所有 pair）
-- 采样版开销与 $t$ 成正比（反复 `Sample(Q,1)`）
+- 枚举版至少 $\Omega(|J|)$ 输出成本
+- 采样版主要随 $t$ 增长（每个样本一次或批量几次 SIRS sampling）
 
-推荐一个可写入论文的、足够稳健的模型：
+推荐两种写法：
 
-### 4.2.1 经验交叉点（最推荐：microbenchmark 标定）
+#### 写法 A（最审稿友好）：microbenchmark 标定交叉点
 
-做一次小规模标定：
+抽若干 query 做标定：
 
-1. 随机抽若干 outer $a$，测：
-   - 单次 `Sample(Q(a),1)` 平均耗时 $\hat{c}_{\text{samp}}$
-   - 生成一条 pair（即 report 输出一条命中并写入 AllPairs）的平均摊销耗时 $\hat{c}_{\text{pair}}$
-2. 估计交叉点：
+- 单次 `Sample(Q,1)` 平均耗时 $\hat c_{\text{samp}}$
+- 枚举并写入 1 条 pair 的摊销耗时 $\hat c_{\text{pair}}$
 
+估计交叉点：
 $$
-|J_{\text{cross}}|\cdot \hat{c}_{\text{pair}}
+|J_{\text{cross}}|\cdot \hat c_{\text{pair}}
 \approx
-t\cdot \hat{c}_{\text{samp}}.
+t\cdot \hat c_{\text{samp}}.
+$$
+取保守系数 $\gamma\in[0.7,0.9]$：
+$$
+J_\star^{\text{time}}=\lfloor \gamma\cdot |J_{\text{cross}}|\rfloor.
 $$
 
-1. 设：
+#### 写法 B（不做 benchmark 的可解释线性阈值）
 
 $$
-J_\star^{\text{time}}=\left\lfloor \gamma\cdot |J_{\text{cross}}| \right\rfloor
+J_\star^{\text{time}} = C_1\cdot t + C_2\cdot n_{\text{out}},
 $$
 
-其中 $\gamma\in[0.7,0.9]$（保守一点更安全）。
-
-### 4.2.2 若不做 benchmark：给一个“可解释”的线性阈值
-
-$$
-J_\star^{\text{time}} = C_1\cdot t + C_2\cdot n_{\text{outer}},
-$$
-
-其中：
-
-- $C_1$：每个样本等价的枚举输出条数（经验常数）
-- $C_2$：外层固定开销折算
-
-这比拍一个固定阈值更审稿友好：你说明了“随 $t$ 增大，枚举更可能划算”。
+其中 $C_1,C_2$ 是经验常数（在实验部分可固定）。
 
 ------
 
-# 5. 算法分析（正确性 + 复杂度：三版本都包含）
+## 6. 算法分析（正确性 + 复杂度，三版本都给）
 
 记：
 
-- $n_{\text{out}}=|{\text{OuterSet}}|$，$n_{\text{in}}=|{\text{InnerSet}}|$
-- $P=\{\phi(b)\mid b\in\text{InnerSet}\}$
-- $deg(a)=|P\cap Q(a)|$
-- $|J|=\sum_a deg(a)$
+- $n_{\text{out}}=|\text{OuterSet}|$，$n_{\text{in}}=|\text{InnerSet}|$
+- $P=\{\phi(b)\}$
+- $\deg(a)=|P\cap Q(a)|$
+- $|J|=\sum_a \deg(a)$
 
-------
+### 6.1 正确性
 
-## 5.1 关键引理：相交 $\Leftrightarrow$ 点落入 $Q(a)$
+#### 6.1.1 引理：相交 $\Leftrightarrow$ 点落入 $Q(a)$
 
-对任意 $a$（outer）和 $b$（inner）：
+已在 3.2.3 给出逐维等价证明，因此：
+
+- `Count(Q(a)) = deg(a)`（精确）
+- `Report(Q(a))` 枚举的 inner 集合等于所有与 $a$ 相交的 $b$
+- `Sample(Q(a),k)` 在这些 $b$ 上均匀采样（SIRS 定义保证）
+
+#### 6.1.2 Sampling 版本（SIRS‑JS‑Sampling）的均匀性
+
+对任意固定 $(a,b)\in J$：
 $$
-(a,b)\in J \iff a\cap b\neq\varnothing \iff \phi(b)\in Q(a).
+\Pr(\text{pick }a)=\frac{\deg(a)}{|J|},\qquad
+\Pr(\text{pick }b\mid a)=\frac{1}{\deg(a)}.
 $$
 因此：
-
-- `Count(Q(a))` 精确等于 $deg(a)$
-- `Report(Q(a))` 枚举的 inner 集合精确等于 $\{b:(a,b)\in J\}$
-- `Sample(Q(a),k)` 均匀采样点 $\phi(b)$ 等价于均匀采样匹配盒子 $b$
-
-------
-
-## 5.2 Sampling 版本的正确性
-
-### 5.2.1 均匀性（单次样本）
-
-任意固定 $(a,b)\in J$：
-
-- 外层选中 $a$：
-
 $$
-\Pr(\text{pick }a)=\frac{deg(a)}{|J|}.
+\Pr(\text{output }(a,b))=\frac{1}{|J|}.
 $$
 
-- 条件在 $a$ 上，SIRS 在 $P\cap Q(a)$ 上均匀采样 1 个点：
+#### 6.1.3 Sampling 版本的独立性（i.i.d.）
 
-$$
-\Pr(\text{pick }b\mid a)=\frac{1}{deg(a)}.
-$$
-
-所以：
-$$
-\Pr(\text{output }(a,b))
-=
-\frac{deg(a)}{|J|}\cdot\frac{1}{deg(a)}
-=
-\frac{1}{|J|}.
-$$
-
-### 5.2.2 独立性（i.i.d.）
-
-每次输出由两次独立随机过程组成：
-
-1. `AliasOuter.sample()`（每次调用独立）
-2. `SIRSIndex.Sample(Q,1)`（SIRS 定义要求样本独立，且跨 query 也独立） [users.cs.utah.edu+1](https://users.cs.utah.edu/~jeffp/papers/sirs-sigmod.pdf)
+- `AliasOuter.sample()` 每次调用独立（alias 方法要求不同 query 返回独立索引）
+- `SIRSIndex.Sample(Q,1)` 返回独立样本，且 SIRS 强调跨 query 也独立 
 
 因此 $Z_1,\dots,Z_t$ i.i.d. 且均匀。
 
-------
+#### 6.1.4 Enumerate+Sampling 的正确性
 
-## 5.3 Enumerate+Sampling 版本的正确性
+- 枚举阶段：对每个 $a$，Report(Q(a)) 得到所有相交 $b$，因此 `AllPairs` 不重不漏地包含 $J$
+- 采样阶段：对数组下标独立均匀采样，自然得到 i.i.d. uniform with replacement
 
-1. 枚举阶段：由 §5.1 引理，`AllPairs` 不重不漏地包含所有 $J$
-2. 采样阶段：在长度 $|J|$ 的数组上做独立均匀下标采样 → 显然 i.i.d. uniform with replacement
+#### 6.1.5 Adaptive 的正确性
 
-------
-
-## 5.4 Adaptive 版本的正确性
-
-Adaptive 有两种输出模式：
-
-- 若 $|J|\le J_\star$：等价于 Enumerate+Sampling → 正确
-- 若 $|J|>J_\star$：等价于 Sampling → 正确
-
-关键在于：分支选择只依赖确定的输入统计（最终的 $|J|$ 或越界判定），且**一旦越界丢弃 AllPairs**，不会引入任何“部分枚举导致的偏差”。
+- 若未越界：等价于 Enumerate+Sampling
+- 若越界：丢弃 AllPairs，依赖精确 $\deg(a)$ 建 alias，再走 Sampling
+   切换只影响“是否保存枚举结果”，不会改变概率分布，因此无偏。
 
 ------
 
-## 5.5 复杂度分析（用 SIRS Lemma 1 的抽象记号最审稿友好）
+### 6.2 复杂度分析（建议论文中使用 SIRS Lemma 1 的抽象符号）
 
-### 预处理
+#### 6.2.1 SIRS 的抽象采样复杂度符号（直接引用 Lemma 1）
 
-- 构建点集：$O(n_{\text{in}})$
-- 建 SIRSIndex：记为 `Build_SIRS(n_in)`（SIRS 论文讨论了线性空间、并给出 KD-tree 等实现；这里 baseline 可以引用其结论/实现） [users.cs.utah.edu](https://users.cs.utah.edu/~jeffp/papers/sirs-sigmod.pdf)
+记：
+$$
+\text{SIRSCost}(R,k)=O\big(M(n,R)+I(n,R)+k\big)
+$$
+其中 $M,I$ 来自 SIRS Lemma 1。
 
-------
+并定义 baseline 额外需要的：
 
-### 5.5.1 Sampling（SIRS‑JS‑Sampling）
+- $\text{CountCost}(R)$：精确 Count 的成本
+- $\text{ReportCost}(R)$：精确 Report 的成本（至少输出量 $|P\cap R|$）
+
+> 若你采用我在 3.5 的 KD-tree 实现，Count/Report 的过程是标准范围查询：全包含结点直接加子树规模；边界叶逐点检查。其时间由“访问节点数 + 边界叶扫描点数”构成，叶容量固定时可视作 $O(\#\text{visited nodes})$ 的主导项。
+
+#### 6.2.2 Sampling（SIRS‑JS‑Sampling）
 
 **时间**
 $$
@@ -647,13 +723,14 @@ O(n_{\text{out}})
 +
 \sum_{j=1}^{t} \text{SIRSCost}(Q(a_j),1).
 $$
-其中 `SIRSCost` 可直接引用 SIRS Lemma 1：$\text{SIRSCost}(R,k)=O\big(M(n,R)+I(n,R)+k\big)$
+（若使用“按 outer 分组批量 Sample”，则最后一项替换为 $\sum_{a: k_a>0}\text{SIRSCost}(Q(a),k_a)$，并且 $\sum_a k_a=t$。）
 
- **空间** $S_{\text{samp}} = O(n_{\text{in}} + n_{\text{out}} + t).$
+**空间**
+$$
+S_{\text{samp}}=O(n_{\text{in}}+n_{\text{out}}+t).
+$$
 
-------
-
-### 5.5.2 Enumerate+Sampling（SIRS‑JS‑Enumerate）
+#### 6.2.3 Enumerate+Sampling（SIRS‑JS‑Enumerate）
 
 **时间**
 $$
@@ -661,27 +738,23 @@ T_{\text{enum}}
 =
 \text{Build\_SIRS}(n_{\text{in}})
 +
-\sum_{a} \text{ReportCost}(Q(a))
+\sum_a \text{ReportCost}(Q(a))
 +
-O(t).
+O(t),
 $$
-并且 $\sum_a \text{ReportCost}(Q(a))$ 至少包含 $\Omega(|J|)$ 的输出成本。
+且 $\sum_a \text{ReportCost}(Q(a))$ 至少包含 $\Omega(|J|)$ 的输出成本。
 
 **空间**
 $$
-S_{\text{enum}} = O(n_{\text{in}} + n_{\text{out}} + |J| + t),
+S_{\text{enum}}
+=
+O(n_{\text{in}}+n_{\text{out}}+|J|+t).
 $$
-其中 $|J|$ 是主瓶颈。
 
-------
+#### 6.2.4 Adaptive+Sampling（SIRS‑JS‑Adaptive）
 
-### 5.5.3 Adaptive+Sampling（SIRS‑JS‑Adaptive）
-
-- 若未越界（$|J|\le J_\star$）：
-  - 时间/空间同 Enumerate+Sampling，但 $|J|\le J_\star$
-- 若越界（$|J|>J_\star$）：
-  - 额外枚举写入最多 $J_\star$ 条（然后丢弃）
-  - 之后转为 Sampling
+- 若 $|J|\le J_\star$：时间/空间同 Enumerate，但 $|J|$ 被 $J_\star$ 截断
+- 若 $|J|>J_\star$：最多枚举写入 $O(J_\star)$ 条后切换，之后同 Sampling
 
 因此可写为：
 $$
@@ -689,18 +762,18 @@ T_{\text{adp}}
 =
 \text{Build\_SIRS}(n_{\text{in}})
 +
-\sum_{a} \text{CountCost}(Q(a))
+\sum_a \text{CountCost}(Q(a))
 +
 O(n_{\text{out}})
 +
 \sum_{j=1}^{t} \text{SIRSCost}(Q(a_j),1)
 +
-O(J_\star).
+O(J_\star),
 $$
-空间：
-$$
-S_{\text{adp}}
-=
-O(n_{\text{in}} + n_{\text{out}} + t + J_\star),
-$$
-并且越界后 `AllPairs` 被清空，实际峰值受 $J_\star$ 控制。
+
+------
+
+## 你在论文里建议额外加的一段“适用范围说明”（避免 reviewer 卡你）
+
+由于嵌入把原 $d$ 维盒子变成 $2d$ 维点，baseline 实际运行在 $2d$ 维空间；而 SIRS 论文固定展示 $d=2$，并讨论面向低维（文中提到 $d<10$，评估到 $d=7$）。
+ 因此建议在 baseline 小节加一句“我们采用 SIRS 的低维假设；当 $d$ 较大时 baseline 可能退化，这属于 baseline 局限而非正确性问题”。
