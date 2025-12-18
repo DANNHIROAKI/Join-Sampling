@@ -18,8 +18,8 @@
 // Intended usage: small n (e.g., n_r,n_s <= 5k) to keep oracle feasible.
 //
 // Example:
-//   ./sjs_verify --dataset_source=synthetic --gen=stripe --dataset=verify \
-//                --n_r=2000 --n_s=2000 --alpha=1e-3 --gen_seed=1 \
+//   ./sjs_verify --dataset_source=synthetic --gen=stripe --dataset=verify
+//                --n_r=2000 --n_s=2000 --alpha=1e-3 --gen_seed=1
 //                --method=ours --variant=sampling --t=20000 --seed=1 --repeats=3
 
 #include "baselines/baseline_factory_2d.h"
