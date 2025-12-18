@@ -46,6 +46,7 @@ class IntervalTreeEnumSamplingBaseline final : public IBaseline<Dim, T> {
 
   bool Build(const DatasetT& ds, const Config& cfg, PhaseRecorder* phases, std::string* err) override {
     (void)cfg;
+    (void)err;  // unused parameter (interface requirement)
     auto scoped = phases ? phases->Scoped("build") : PhaseRecorder::ScopedPhase(nullptr, "");
 
     Reset();

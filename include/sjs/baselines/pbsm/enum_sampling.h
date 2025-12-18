@@ -137,6 +137,7 @@ class PBSMEnumSamplingBaseline final : public IBaseline<Dim, T> {
 
  private:
   bool EnsureEnumerated_(PhaseRecorder* phases, std::string* err) {
+    (void)err;  // unused parameter (interface requirement)
     if (have_enum_) return true;
 
     auto scoped = phases ? phases->Scoped("pbsm_enum_sampling_enumerate") : PhaseRecorder::ScopedPhase(nullptr, "");

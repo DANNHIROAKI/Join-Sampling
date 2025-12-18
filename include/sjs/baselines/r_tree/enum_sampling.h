@@ -180,6 +180,7 @@ class RTreeEnumSamplingBaseline final : public IBaseline<Dim, T> {
 
  private:
   bool EnsureEnumerated(PhaseRecorder* phases, std::string* err) {
+    (void)err;  // unused parameter (interface requirement)
     if (pairs_valid_) return true;
     if (!built_ || !ds_) return false;
 
