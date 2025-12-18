@@ -332,8 +332,8 @@ class IntervalTreeOnAxis {
 
   bool InsertBox(usize handle, const BoxT& b, std::string* err = nullptr) {
     const int a = opt_.axis;
-    const Scalar lo = static_cast<Scalar>(b.lo.v[a]);
-    const Scalar hi = static_cast<Scalar>(b.hi.v[a]);
+    const Scalar lo = static_cast<Scalar>(b.lo[a]);
+    const Scalar hi = static_cast<Scalar>(b.hi[a]);
     return tree_.Insert(handle, lo, hi, err);
   }
 
@@ -342,8 +342,8 @@ class IntervalTreeOnAxis {
   template <class EmitFn>
   void QueryBox(const BoxT& q, EmitFn&& emit) const {
     const int a = opt_.axis;
-    const Scalar qlo = static_cast<Scalar>(q.lo.v[a]);
-    const Scalar qhi = static_cast<Scalar>(q.hi.v[a]);
+    const Scalar qlo = static_cast<Scalar>(q.lo[a]);
+    const Scalar qhi = static_cast<Scalar>(q.hi[a]);
     tree_.Query(qlo, qhi, emit);
   }
 

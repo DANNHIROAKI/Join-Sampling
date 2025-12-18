@@ -44,9 +44,9 @@ struct Point {
   explicit Point(std::initializer_list<T> init) {
     SJS_DASSERT_MSG(static_cast<int>(init.size()) == Dim,
                     "Point initializer_list size must equal Dim");
-    int i = 0;
+    usize i = 0;
     for (T x : init) {
-      if (i < Dim) v[i++] = x;
+      if (i < static_cast<usize>(Dim)) v[i++] = x;
     }
     // If init shorter in release, remaining are zero-initialized.
   }
@@ -54,7 +54,7 @@ struct Point {
   // Fill all coordinates with a constant.
   static constexpr Point Filled(T x) noexcept {
     Point p;
-    for (int i = 0; i < Dim; ++i) p.v[i] = x;
+    for (usize i = 0; i < static_cast<usize>(Dim); ++i) p.v[i] = x;
     return p;
   }
 
@@ -80,7 +80,7 @@ struct Point {
 
   // -------- comparisons --------
   friend constexpr bool operator==(const Point& a, const Point& b) noexcept {
-    for (int i = 0; i < Dim; ++i) {
+    for (usize i = 0; i < static_cast<usize>(Dim); ++i) {
       if (!(a.v[i] == b.v[i])) return false;
     }
     return true;
@@ -89,7 +89,7 @@ struct Point {
 
   // Lexicographic order (useful for sorting).
   friend constexpr bool operator<(const Point& a, const Point& b) noexcept {
-    for (int i = 0; i < Dim; ++i) {
+    for (usize i = 0; i < static_cast<usize>(Dim); ++i) {
       if (a.v[i] < b.v[i]) return true;
       if (b.v[i] < a.v[i]) return false;
     }
@@ -99,59 +99,59 @@ struct Point {
   // -------- arithmetic --------
   friend constexpr Point operator+(const Point& a, const Point& b) noexcept {
     Point out;
-    for (int i = 0; i < Dim; ++i) out.v[i] = a.v[i] + b.v[i];
+    for (usize i = 0; i < static_cast<usize>(Dim); ++i) out.v[i] = a.v[i] + b.v[i];
     return out;
   }
   friend constexpr Point operator-(const Point& a, const Point& b) noexcept {
     Point out;
-    for (int i = 0; i < Dim; ++i) out.v[i] = a.v[i] - b.v[i];
+    for (usize i = 0; i < static_cast<usize>(Dim); ++i) out.v[i] = a.v[i] - b.v[i];
     return out;
   }
   friend constexpr Point operator*(const Point& a, T s) noexcept {
     Point out;
-    for (int i = 0; i < Dim; ++i) out.v[i] = a.v[i] * s;
+    for (usize i = 0; i < static_cast<usize>(Dim); ++i) out.v[i] = a.v[i] * s;
     return out;
   }
   friend constexpr Point operator*(T s, const Point& a) noexcept { return a * s; }
   friend constexpr Point operator/(const Point& a, T s) noexcept {
     Point out;
-    for (int i = 0; i < Dim; ++i) out.v[i] = a.v[i] / s;
+    for (usize i = 0; i < static_cast<usize>(Dim); ++i) out.v[i] = a.v[i] / s;
     return out;
   }
 
   Point& operator+=(const Point& b) noexcept {
-    for (int i = 0; i < Dim; ++i) v[i] += b.v[i];
+    for (usize i = 0; i < static_cast<usize>(Dim); ++i) v[i] += b.v[i];
     return *this;
   }
   Point& operator-=(const Point& b) noexcept {
-    for (int i = 0; i < Dim; ++i) v[i] -= b.v[i];
+    for (usize i = 0; i < static_cast<usize>(Dim); ++i) v[i] -= b.v[i];
     return *this;
   }
   Point& operator*=(T s) noexcept {
-    for (int i = 0; i < Dim; ++i) v[i] *= s;
+    for (usize i = 0; i < static_cast<usize>(Dim); ++i) v[i] *= s;
     return *this;
   }
   Point& operator/=(T s) noexcept {
-    for (int i = 0; i < Dim; ++i) v[i] /= s;
+    for (usize i = 0; i < static_cast<usize>(Dim); ++i) v[i] /= s;
     return *this;
   }
 
   // -------- component-wise ops --------
   static constexpr Point Min(const Point& a, const Point& b) noexcept {
     Point out;
-    for (int i = 0; i < Dim; ++i) out.v[i] = (a.v[i] < b.v[i]) ? a.v[i] : b.v[i];
+    for (usize i = 0; i < static_cast<usize>(Dim); ++i) out.v[i] = (a.v[i] < b.v[i]) ? a.v[i] : b.v[i];
     return out;
   }
   static constexpr Point Max(const Point& a, const Point& b) noexcept {
     Point out;
-    for (int i = 0; i < Dim; ++i) out.v[i] = (a.v[i] < b.v[i]) ? b.v[i] : a.v[i];
+    for (usize i = 0; i < static_cast<usize>(Dim); ++i) out.v[i] = (a.v[i] < b.v[i]) ? b.v[i] : a.v[i];
     return out;
   }
 
   // L-infinity norm (max abs coordinate), helpful for quick magnitude checks.
   T NormInf() const noexcept {
     T m = T(0);
-    for (int i = 0; i < Dim; ++i) {
+    for (usize i = 0; i < static_cast<usize>(Dim); ++i) {
       const T a = (v[i] < T(0)) ? -v[i] : v[i];
       if (a > m) m = a;
     }
@@ -161,9 +161,9 @@ struct Point {
   std::string ToString() const {
     std::ostringstream oss;
     oss << "(";
-    for (int i = 0; i < Dim; ++i) {
+    for (usize i = 0; i < static_cast<usize>(Dim); ++i) {
       oss << v[i];
-      if (i + 1 < Dim) oss << ",";
+      if (i + 1 < static_cast<usize>(Dim)) oss << ",";
     }
     oss << ")";
     return oss.str();

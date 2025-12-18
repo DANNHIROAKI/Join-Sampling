@@ -186,9 +186,9 @@ class AABBTree {
     std::nth_element(indices_.begin() + begin,
                      indices_.begin() + mid,
                      indices_.begin() + end,
-                     [&](u32 ia, u32 ib) {
-                       const T ca = boxes_[ia].Center().v[axis];
-                       const T cb = boxes_[ib].Center().v[axis];
+                    [&](u32 ia, u32 ib) {
+                      const T ca = boxes_[ia].Center()[axis];
+                      const T cb = boxes_[ib].Center()[axis];
                        if (ca < cb) return true;
                        if (cb < ca) return false;
                        return ia < ib;

@@ -173,7 +173,7 @@ class RTree {
   }
 
   static T CenterCoord(const BoxT& b, int axis) noexcept {
-    return (b.lo.v[axis] + b.hi.v[axis]) / T(2);
+    return (b.lo[axis] + b.hi[axis]) / T(2);
   }
 
   static BoxT UnionAll(Span<const Ref> refs) {

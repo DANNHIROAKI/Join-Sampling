@@ -43,8 +43,8 @@ inline void AppendRelationEvents(const Relation<Dim, T>& rel,
 
   for (usize i = 0; i < rel.boxes.size(); ++i) {
     const auto& b = rel.boxes[i];
-    const Scalar start = static_cast<Scalar>(b.lo.v[axis]);
-    const Scalar end = static_cast<Scalar>(b.hi.v[axis]);
+    const Scalar start = static_cast<Scalar>(b.lo[axis]);
+    const Scalar end = static_cast<Scalar>(b.hi[axis]);
     const Id id = rel.GetId(i);
 
     // Skip boxes that are empty on the sweep axis (start >= end).

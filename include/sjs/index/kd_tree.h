@@ -186,9 +186,9 @@ class KDTree {
     std::nth_element(indices_.begin() + begin,
                      indices_.begin() + mid,
                      indices_.begin() + end,
-                     [&](u32 ia, u32 ib) {
-                       const T a = pts_[ia].v[axis];
-                       const T b = pts_[ib].v[axis];
+                    [&](u32 ia, u32 ib) {
+                      const T a = pts_[ia][axis];
+                      const T b = pts_[ib][axis];
                        if (a < b) return true;
                        if (b < a) return false;
                        return ia < ib;

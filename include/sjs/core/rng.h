@@ -41,7 +41,7 @@ class Xoshiro256StarStar {
 
   void Seed(u64 seed) noexcept {
     SplitMix64 sm(seed);
-    for (int i = 0; i < 4; ++i) {
+    for (usize i = 0; i < 4; ++i) {
       s_[i] = sm.Next();
     }
     // all-zero state is not allowed; splitmix won't produce it in practice,

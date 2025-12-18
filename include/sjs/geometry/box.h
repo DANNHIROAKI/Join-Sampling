@@ -50,7 +50,7 @@ struct Box {
 
   static Box FromCenterSize(const Point<Dim, T>& center, const Point<Dim, T>& size) noexcept {
     Point<Dim, T> lo_, hi_;
-    for (int i = 0; i < Dim; ++i) {
+    for (usize i = 0; i < static_cast<usize>(Dim); ++i) {
       const T half = size.v[i] / T(2);
       lo_.v[i] = center.v[i] - half;
       hi_.v[i] = center.v[i] + half;
@@ -61,7 +61,7 @@ struct Box {
   // -------- validity / emptiness --------
   // Valid: lo <= hi for all dims (allows zero width).
   constexpr bool IsValid() const noexcept {
-    for (int i = 0; i < Dim; ++i) {
+    for (usize i = 0; i < static_cast<usize>(Dim); ++i) {
       if (lo.v[i] > hi.v[i]) return false;
     }
     return true;
@@ -69,7 +69,7 @@ struct Box {
 
   // Empty in half-open sense: any dimension has lo >= hi.
   constexpr bool IsEmpty() const noexcept {
-    for (int i = 0; i < Dim; ++i) {
+    for (usize i = 0; i < static_cast<usize>(Dim); ++i) {
       if (!(lo.v[i] < hi.v[i])) return true;
     }
     return false;
@@ -88,7 +88,7 @@ struct Box {
   T Volume() const noexcept {
     if (IsEmpty()) return T(0);
     T vol = T(1);
-    for (int i = 0; i < Dim; ++i) {
+    for (usize i = 0; i < static_cast<usize>(Dim); ++i) {
       const T w = hi.v[i] - lo.v[i];
       if (!(w > T(0))) return T(0);
       vol *= w;
@@ -98,7 +98,7 @@ struct Box {
 
   Point<Dim, T> Center() const noexcept {
     Point<Dim, T> c;
-    for (int i = 0; i < Dim; ++i) c.v[i] = (lo.v[i] + hi.v[i]) / T(2);
+    for (usize i = 0; i < static_cast<usize>(Dim); ++i) c.v[i] = (lo.v[i] + hi.v[i]) / T(2);
     return c;
   }
 
@@ -106,7 +106,7 @@ struct Box {
   // For half-open semantics, we include p by ensuring lo<=p and hi>p.
   // We use nextafter(p, +inf) to keep half-open consistent.
   void ExpandToIncludePoint(const Point<Dim, T>& p) noexcept {
-    for (int i = 0; i < Dim; ++i) {
+    for (usize i = 0; i < static_cast<usize>(Dim); ++i) {
       if (p.v[i] < lo.v[i]) lo.v[i] = p.v[i];
       if (p.v[i] >= hi.v[i]) {
         if constexpr (std::numeric_limits<T>::has_infinity) {
@@ -120,7 +120,7 @@ struct Box {
 
   // Expand this box to include another box (union / bounding box).
   void ExpandToIncludeBox(const Box& b) noexcept {
-    for (int i = 0; i < Dim; ++i) {
+    for (usize i = 0; i < static_cast<usize>(Dim); ++i) {
       if (b.lo.v[i] < lo.v[i]) lo.v[i] = b.lo.v[i];
       if (b.hi.v[i] > hi.v[i]) hi.v[i] = b.hi.v[i];
     }
@@ -130,7 +130,7 @@ struct Box {
   constexpr bool Contains(const Point<Dim, T>& p) const noexcept {
     // Empty box contains nothing.
     if (IsEmpty()) return false;
-    for (int i = 0; i < Dim; ++i) {
+    for (usize i = 0; i < static_cast<usize>(Dim); ++i) {
       const T x = p.v[i];
       if (x < lo.v[i]) return false;
       if (!(x < hi.v[i])) return false;  // half-open upper bound
@@ -143,7 +143,7 @@ struct Box {
   constexpr bool ContainsBox(const Box& inner) const noexcept {
     if (inner.IsEmpty()) return true;  // empty is contained by any box
     if (IsEmpty()) return false;
-    for (int i = 0; i < Dim; ++i) {
+    for (usize i = 0; i < static_cast<usize>(Dim); ++i) {
       if (inner.lo.v[i] < lo.v[i]) return false;
       if (inner.hi.v[i] > hi.v[i]) return false;
     }
@@ -154,7 +154,7 @@ struct Box {
   constexpr bool Intersects(const Box& b) const noexcept {
     // Quick reject empties.
     if (IsEmpty() || b.IsEmpty()) return false;
-    for (int i = 0; i < Dim; ++i) {
+    for (usize i = 0; i < static_cast<usize>(Dim); ++i) {
       if (!(lo.v[i] < b.hi.v[i] && b.lo.v[i] < hi.v[i])) return false;
     }
     return true;
@@ -164,7 +164,7 @@ struct Box {
   Box Intersection(const Box& b) const noexcept {
     if (!Intersects(b)) return Empty();
     Point<Dim, T> lo2, hi2;
-    for (int i = 0; i < Dim; ++i) {
+    for (usize i = 0; i < static_cast<usize>(Dim); ++i) {
       lo2.v[i] = (lo.v[i] > b.lo.v[i]) ? lo.v[i] : b.lo.v[i];
       hi2.v[i] = (hi.v[i] < b.hi.v[i]) ? hi.v[i] : b.hi.v[i];
     }
