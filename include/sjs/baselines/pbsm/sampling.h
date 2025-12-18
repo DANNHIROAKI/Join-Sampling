@@ -24,11 +24,13 @@
 // Notes
 // -----
 // - Geometry uses half-open boxes [lo, hi) in each dimension.
-// - Determinism is critical: for two-pass sampling, both passes must enumerate
-//   pairs in the same order. We enforce determinism by:
+// - Correctness of the two-pass *rank* sampling (Baseline §4.4 / Theorem 2) only
+//   requires Pass2 to be a one-to-one enumeration of J; the enumeration order
+//   does NOT need to match Pass1 (Pass1 is only used to obtain W = |J|).
+//   For reproducibility and debugging, we still enforce determinism by:
 //     * fixed partition traversal order,
-//     * sorting per-partition lists by (lower endpoint, id, index),
-//     * a fully deterministic forward-scan state machine.
+//     * sorting per-partition lists by (lower endpoint, id) as a total order,
+//     * a deterministic forward-scan state machine.
 // - The current project focus is 2D, but the code is written to be extensible
 //   to Dim>2 (stripes partitioning is naturally extensible).
 
@@ -837,31 +839,36 @@ class PBSMIndex {
 // --------------------------
 // Duplicate elimination (reference point)
 // --------------------------
-// 2D grid (Eq.(1)):
-//   rp = (max(x_l(r), x_l(s)), max(y_l(r), y_l(s)))
-//   report in tile T iff rp ∈ T (half-open containment)
-// 1D stripes: same but only check the partition axis.
+// Reference point (Baseline §3.5 / Lemma 3):
+//   p(r,s) = ( max(x_l(r), x_l(s)),  max(y_l(r), y_l(s)) ).
+//
+// 2D tiles (Eq.(1) in Tsitsigkos'19 / Baseline):
+//   report/count in tile T iff  p_x >= T.x_l  &&  p_y >= T.y_l.
+// 1D stripes (Tsitsigkos'19 simplification / Baseline):
+//   report/count in stripe T iff  p_axis >= T.axis_l  (only check the partition axis).
+//
+// Note: we intentionally do NOT check the upper bounds (p_x < T.x_u, p_y < T.y_u) here;
+// if a pair is discovered inside a partition, multi-assignment implies both rectangles overlap
+// that partition, which in turn implies the upper-bound conditions automatically.
 
 template <int Dim, class T>
 inline bool DuplicateTestStripes(const Box<Dim, T>& r,
                                  const Box<Dim, T>& s,
                                  const Box<Dim, T>& stripe_region,
                                  int part_axis) {
-  const T rp = (r.lo.v[static_cast<usize>(part_axis)] > s.lo.v[static_cast<usize>(part_axis)])
-                   ? r.lo.v[static_cast<usize>(part_axis)]
-                   : s.lo.v[static_cast<usize>(part_axis)];
-  const T lo = stripe_region.lo.v[static_cast<usize>(part_axis)];
-  const T hi = stripe_region.hi.v[static_cast<usize>(part_axis)];
-  // Half-open containment.
-  return (rp >= lo) && (rp < hi);
+  const usize ax = static_cast<usize>(part_axis);
+  const T rp = (r.lo.v[ax] > s.lo.v[ax]) ? r.lo.v[ax] : s.lo.v[ax];
+  const T lo = stripe_region.lo.v[ax];
+  // Baseline: only lower-bound test on the partition axis.
+  return (rp >= lo);
 }
 
 template <class T>
 inline bool DuplicateTestGrid2D(const Box<2, T>& r, const Box<2, T>& s, const Box<2, T>& tile_region) {
   const T rpx = (r.lo.v[0] > s.lo.v[0]) ? r.lo.v[0] : s.lo.v[0];
   const T rpy = (r.lo.v[1] > s.lo.v[1]) ? r.lo.v[1] : s.lo.v[1];
-  return (rpx >= tile_region.lo.v[0]) && (rpx < tile_region.hi.v[0]) &&
-         (rpy >= tile_region.lo.v[1]) && (rpy < tile_region.hi.v[1]);
+  // Baseline Eq.(1): only lower-bound test on x/y.
+  return (rpx >= tile_region.lo.v[0]) && (rpy >= tile_region.lo.v[1]);
 }
 
 // --------------------------
@@ -1241,7 +1248,7 @@ class PBSMSamplingBaseline final : public IBaseline<Dim, T> {
         ++idx;
       }
       if (j != req.size()) {
-        if (err) *err = "PBSMSamplingBaseline::Sample: stream ended early in pass2 (non-deterministic enumerate?)";
+        if (err) *err = "PBSMSamplingBaseline::Sample: stream ended early in pass2 (cardinality mismatch: expected W pairs from EnumerateUniquePairs)";
         return false;
       }
     }

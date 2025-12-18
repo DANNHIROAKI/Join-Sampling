@@ -3,22 +3,27 @@
 //
 // PBSM (Partition-Based Spatial-Merge) baseline (Variant::EnumSampling).
 //
-// This variant exposes the deterministic PBSM join enumerator and performs
-// uniform sampling WITH replacement by two-pass rank sampling over that
-// enumerator.
+// Baseline: "Enumerate+Sampling" (see Tsitsigkos’19 Baseline.md §4.3 / Theorem 1)
 //
-// In the experiment harness, EnumSampling variants are typically executed via
-// baselines::runners::RunEnumSamplingOnce(), which directly calls Enumerate()
-// and applies rank sampling externally. We still provide Sample() here for
-// completeness and for standalone use.
+//   1) Build PBSM partitions once (multi-assignment + per-partition sorting).
+//   2) EnumerateUniquePairs() once and MATERIALIZE the entire join result J into an array.
+//   3) Draw t i.i.d. unbiased indices in [0, |J|) WITH replacement and return Pairs[idx].
+//
+// Notes
+// -----
+// - This variant intentionally uses O(|J|) memory.
+// - Random integers in [0,W) MUST be unbiased (Baseline Appendix A1). We rely on
+//   Rng::UniformU64(W) to implement unbiased generation (e.g., rejection sampling).
 
 #include "sjs/baselines/pbsm/sampling.h"  // provides PBSMIndex + enumerator
 
-#include "sjs/sampling/rank_sampling.h"
+#include "sjs/core/assert.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace sjs {
@@ -38,11 +43,18 @@ class PBSMEnumSamplingBaseline final : public IBaseline<Dim, T> {
   void Reset() override {
     index_.Reset();
     built_ = false;
+    have_enum_ = false;
+    W_ = 0;
+    std::vector<PairId>().swap(all_pairs_);  // free memory
   }
 
   bool Build(const DatasetT& ds, const Config& cfg, PhaseRecorder* phases, std::string* err) override {
     auto scoped = phases ? phases->Scoped("build") : PhaseRecorder::ScopedPhase(nullptr, "");
     built_ = false;
+    have_enum_ = false;
+    W_ = 0;
+    std::vector<PairId>().swap(all_pairs_);  // free memory from previous runs
+
     if (!index_.Build(ds, cfg, phases, err)) return false;
     built_ = true;
     return true;
@@ -54,7 +66,7 @@ class PBSMEnumSamplingBaseline final : public IBaseline<Dim, T> {
              PhaseRecorder* phases,
              std::string* err) override {
     (void)cfg;
-    (void)rng;
+    (void)rng;  // deterministic; RNG not needed for counting
     if (!built_ || !index_.Built()) {
       if (err) *err = "PBSMEnumSamplingBaseline::Count: call Build() first";
       return false;
@@ -63,13 +75,12 @@ class PBSMEnumSamplingBaseline final : public IBaseline<Dim, T> {
       if (err) *err = "PBSMEnumSamplingBaseline::Count: out is null";
       return false;
     }
-    auto scoped = phases ? phases->Scoped("count") : PhaseRecorder::ScopedPhase(nullptr, "");
 
-    detail::PBSMJoinEnumerator<Dim, T> stream(&index_);
-    u64 W = 0;
-    PairId tmp;
-    while (stream.Next(&tmp)) ++W;
-    *out = MakeExactCount(W);
+    // Enumerate+Sampling naturally materializes all pairs; we do that here so a
+    // subsequent Sample() can reuse the same one-pass enumeration result.
+    if (!EnsureEnumerated_(phases, err)) return false;
+
+    *out = MakeExactCount(W_);
     return true;
   }
 
@@ -98,16 +109,17 @@ class PBSMEnumSamplingBaseline final : public IBaseline<Dim, T> {
     const u64 t = cfg.run.t;
     if (t == 0) return true;
 
-    auto scoped = phases ? phases->Scoped("rank_sampling") : PhaseRecorder::ScopedPhase(nullptr, "");
-    detail::PBSMJoinEnumerator<Dim, T> stream(&index_);
+    if (!EnsureEnumerated_(phases, err)) return false;
 
-    std::vector<PairId> samples;
-    sampling::RankSamplingInfo info;
-    if (!sampling::RankSampleWithReplacement<detail::PBSMJoinEnumerator<Dim, T>, PairId>(
-            &stream, t, rng, &samples, &info, err)) {
-      return false;
+    const u64 W = W_;
+    if (W == 0) return true;
+
+    auto scoped = phases ? phases->Scoped("pbsm_enum_sampling_draw") : PhaseRecorder::ScopedPhase(nullptr, "");
+    out->pairs.resize(static_cast<usize>(t));
+    for (u64 i = 0; i < t; ++i) {
+      const u64 idx = rng->UniformU64(W);  // must be unbiased (Baseline Appendix A1)
+      out->pairs[static_cast<usize>(i)] = all_pairs_[static_cast<usize>(idx)];
     }
-    out->pairs = std::move(samples);
     return true;
   }
 
@@ -124,8 +136,34 @@ class PBSMEnumSamplingBaseline final : public IBaseline<Dim, T> {
   }
 
  private:
+  bool EnsureEnumerated_(PhaseRecorder* phases, std::string* err) {
+    if (have_enum_) return true;
+
+    auto scoped = phases ? phases->Scoped("pbsm_enum_sampling_enumerate") : PhaseRecorder::ScopedPhase(nullptr, "");
+
+    std::vector<PairId>().swap(all_pairs_);
+    all_pairs_.clear();
+
+    detail::PBSMJoinEnumerator<Dim, T> stream(&index_);
+    stream.Reset();
+
+    PairId p;
+    while (stream.Next(&p)) {
+      all_pairs_.push_back(p);
+    }
+
+    W_ = static_cast<u64>(all_pairs_.size());
+    have_enum_ = true;
+    return true;
+  }
+
   detail::PBSMIndex<Dim, T> index_;
   bool built_ = false;
+
+  // Cached one-pass enumeration result (Pairs) for Enumerate+Sampling.
+  bool have_enum_ = false;
+  u64 W_ = 0;
+  std::vector<PairId> all_pairs_;
 };
 
 }  // namespace pbsm

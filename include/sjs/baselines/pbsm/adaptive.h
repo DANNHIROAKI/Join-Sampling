@@ -3,8 +3,7 @@
 //
 // PBSM (Partition-Based Spatial-Merge) baseline (Variant::Adaptive).
 //
-// This implements the adaptive strategy confirms to the "Adaptive" version
-// described in Tsitsigkos’19.md:
+// This implements Baseline "Adaptive+Sampling" (see Tsitsigkos’19 Baseline.md §4.5):
 //   - Phase 1: enumerate the unique PBSM join stream once, counting |J| exactly.
 //     While the running count W stays <= J*, also materialize the pairs.
 //     If W exceeds J*, discard the materialized pairs and continue counting only.
@@ -107,8 +106,8 @@ class PBSMAdaptiveBaseline final : public IBaseline<Dim, T> {
         } else {
           // Switch to count-only mode; discard materialization.
           mode_ = Mode::CountOnly;
-          all_pairs_.clear();
-          all_pairs_.shrink_to_fit();
+          // Baseline: discard partial enumeration and free memory (Pairs = empty_and_free()).
+          std::vector<PairId>().swap(all_pairs_);
         }
       }
     }
@@ -201,7 +200,7 @@ class PBSMAdaptiveBaseline final : public IBaseline<Dim, T> {
       ++cur;
     }
     if (k != req.size()) {
-      if (err) *err = "PBSMAdaptiveBaseline::Sample: stream ended early in pass2 (non-deterministic enumerate?)";
+      if (err) *err = "PBSMAdaptiveBaseline::Sample: stream ended early in pass2 (cardinality mismatch: expected W pairs from EnumerateUniquePairs)";
       return false;
     }
     return true;
