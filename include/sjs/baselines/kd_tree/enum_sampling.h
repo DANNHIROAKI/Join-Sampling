@@ -1,19 +1,24 @@
 #pragma once
 // sjs/baselines/kd_tree/enum_sampling.h
 //
-// KD-tree baseline (Variant::EnumSampling): enumerate join pairs deterministically
-// using sweep + KD-tree reporting, then draw i.i.d. uniform samples via two-pass
-// rank sampling.
+// KD-tree baseline (Variant::EnumSampling).
 //
-// This is a faithful implementation of the Enum+Sampling protocol used for baselines
-// in the project: the runner owns the two-pass logic, but this baseline provides:
-//   - Enumerate(): a deterministic join stream (KDJoinEnumerator)
-//   - Sample(): convenience wrapper around sampling::RankSampleWithReplacement
-//   - Count(): convenience wrapper (exact count) via a sampling baseline pass
+// Baseline v2.0 design: Enumerate+Sampling
+//   1) One sweep enumerates all join pairs J deterministically (using the same
+//      sweep + global rank embedding + static KD-tree + active on/off machinery
+//      as the Sampling baseline).
+//   2) Draw t i.i.d. uniform samples with replacement by random indexing into
+//      the materialized pair array.
+//
+// Notes:
+//   - This variant is intended for regimes where |J| is small enough to fit
+//     in memory. When |J| is large, use Variant::Sampling or Variant::Adaptive.
+//
 
 #include "sjs/baselines/kd_tree/sampling.h"
-#include "sjs/sampling/rank_sampling.h"
 
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -48,25 +53,40 @@ class KDTreeEnumSamplingBaseline final : public IBaseline<Dim, T> {
     return true;
   }
 
-  // Convenience exact count by reusing the sampling baseline's Phase-1.
+  // Exact count by full enumeration (|J| = number of enumerated pairs).
   bool Count(const Config& cfg,
              Rng* rng,
              CountResult* out,
              PhaseRecorder* phases,
              std::string* err) override {
-    (void)rng;
+    (void)cfg;
+    (void)rng;  // deterministic
     if (!built_ || !ds_) {
       if (err) *err = "KDTreeEnumSamplingBaseline::Count: call Build() first";
       return false;
     }
-    auto scoped = phases ? phases->Scoped("count_via_sampling_baseline") : PhaseRecorder::ScopedPhase(nullptr, "");
+    if (!out) {
+      if (err) *err = "KDTreeEnumSamplingBaseline::Count: out is null";
+      return false;
+    }
 
-    KDTreeSamplingBaseline<Dim, T> counter;
-    counter.Reset();
-    if (!counter.Build(*ds_, cfg, phases, err)) return false;
+    auto scoped = phases ? phases->Scoped("enumerate_count") : PhaseRecorder::ScopedPhase(nullptr, "");
 
-    // Count is deterministic; rng is unused.
-    return counter.Count(cfg, /*rng=*/nullptr, out, phases, err);
+    auto stream = Enumerate(cfg, phases, err);
+    if (!stream) return false;
+
+    u64 cnt = 0;
+    PairId tmp;
+    while (stream->Next(&tmp)) {
+      if (cnt == std::numeric_limits<u64>::max()) {
+        if (err) *err = "KDTreeEnumSamplingBaseline::Count: |J| overflowed u64";
+        return false;
+      }
+      ++cnt;
+    }
+
+    *out = MakeExactCount(cnt);
+    return true;
   }
 
   bool Sample(const Config& cfg,
@@ -92,28 +112,47 @@ class KDTreeEnumSamplingBaseline final : public IBaseline<Dim, T> {
     out->weighted = false;
     out->weights.clear();
 
-    const u64 t = cfg.run.t;
-    if (t == 0) return true;
+    const u64 t64 = cfg.run.t;
+    if (t64 == 0) return true;
+    if (t64 > static_cast<u64>(std::numeric_limits<usize>::max())) {
+      if (err) *err = "KDTreeEnumSamplingBaseline::Sample: t too large";
+      return false;
+    }
+    const usize t = static_cast<usize>(t64);
 
-    auto scoped = phases ? phases->Scoped("rank_sampling") : PhaseRecorder::ScopedPhase(nullptr, "");
+    // Step 1: enumerate all join pairs.
+    auto scoped = phases ? phases->Scoped("enumerate_pairs") : PhaseRecorder::ScopedPhase(nullptr, "");
 
     auto stream = Enumerate(cfg, phases, err);
     if (!stream) return false;
 
-    std::vector<PairId> samples;
-    sampling::RankSamplingInfo info;
-    if (!sampling::RankSampleWithReplacement<IJoinEnumerator, PairId>(stream.get(), t, rng, &samples, &info, err)) {
-      return false;
+    std::vector<PairId> pairs;
+    pairs.reserve(1024);  // heuristic; grows as needed
+
+    PairId p;
+    while (stream->Next(&p)) {
+      pairs.push_back(p);
     }
 
-    out->pairs = std::move(samples);
+    const u64 N = static_cast<u64>(pairs.size());
+    if (N == 0) {
+      // Empty join -> empty sample set.
+      return true;
+    }
+
+    // Step 2: i.i.d. uniform sampling with replacement via random indexing.
+    out->pairs.resize(t);
+    for (usize i = 0; i < t; ++i) {
+      const u64 idx = rng->UniformU64(N);  // in [0, N)
+      out->pairs[i] = pairs[static_cast<usize>(idx)];
+    }
+
     return true;
   }
 
   std::unique_ptr<IJoinEnumerator> Enumerate(const Config& cfg, PhaseRecorder* phases, std::string* err) override {
     (void)cfg;
     auto scoped = phases ? phases->Scoped("enumerate_prepare") : PhaseRecorder::ScopedPhase(nullptr, "");
-
     if (!built_ || !ds_) {
       if (err) *err = "KDTreeEnumSamplingBaseline::Enumerate: call Build() first";
       return nullptr;
@@ -131,4 +170,3 @@ class KDTreeEnumSamplingBaseline final : public IBaseline<Dim, T> {
 }  // namespace kd_tree
 }  // namespace baselines
 }  // namespace sjs
-

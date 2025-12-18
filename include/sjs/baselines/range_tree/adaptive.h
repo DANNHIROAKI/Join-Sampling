@@ -3,6 +3,8 @@
 //
 // Plane Sweep + Dynamic Range-Tree baseline (Variant::Adaptive).
 //
+// Design reference: docs/Baseline/RangeTree Baseline v2.0.md
+//
 // Adaptive strategy (mirrors the project's common adaptive pattern):
 //   - During Count(), we run the Phase-1 sweep to compute exact |J| and w_e.
 //   - If |J| stays <= j_star, we simultaneously enumerate and store all join
@@ -49,7 +51,7 @@ class RangeTreeAdaptiveBaseline final : public IBaseline<Dim, T> {
     weights_valid_ = false;
     W_ = 0;
     mode_small_ = false;
-    all_pairs_.clear();
+    std::vector<PairId>().swap(all_pairs_);
 
     events_.clear();
     start_id_of_event_.clear();
@@ -98,7 +100,7 @@ class RangeTreeAdaptiveBaseline final : public IBaseline<Dim, T> {
     weights_valid_ = false;
     W_ = 0;
     mode_small_ = false;
-    all_pairs_.clear();
+    std::vector<PairId>().swap(all_pairs_);
     return true;
   }
 
@@ -181,7 +183,7 @@ class RangeTreeAdaptiveBaseline final : public IBaseline<Dim, T> {
       if (mode_small_ && w > 0) {
         if (W > j_star) {
           mode_small_ = false;
-          all_pairs_.clear();
+          std::vector<PairId>().swap(all_pairs_);
         } else {
           // Enumerate actual pairs for this START.
           std::vector<u32> hits;
@@ -273,8 +275,8 @@ class RangeTreeAdaptiveBaseline final : public IBaseline<Dim, T> {
     {
       auto scoped = phases ? phases->Scoped("phase2_alias") : PhaseRecorder::ScopedPhase(nullptr, "");
 
-      sampling::AliasTable alias;
-      if (!alias.BuildFromU64(Span<const u64>(w_total_.data(), w_total_.size()), err)) return false;
+      detail::NonZeroStartAlias ev_alias;
+      if (!ev_alias.Build(Span<const u64>(w_total_.data(), w_total_.size()), err)) return false;
 
       struct SlotAssign {
         u32 sid;
@@ -283,7 +285,7 @@ class RangeTreeAdaptiveBaseline final : public IBaseline<Dim, T> {
       std::vector<SlotAssign> asg;
       asg.reserve(static_cast<usize>(t));
       for (u32 j = 0; j < t; ++j) {
-        const u32 sid = static_cast<u32>(alias.Sample(rng));
+        const u32 sid = ev_alias.SampleSid(rng);
         asg.push_back(SlotAssign{sid, j});
       }
       std::sort(asg.begin(), asg.end(), [](const SlotAssign& a, const SlotAssign& b) {

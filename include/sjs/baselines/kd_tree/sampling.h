@@ -4,7 +4,7 @@
 // Plane Sweep + Global Rank Embedding + Static KD-Tree w/ dynamic active counts
 // baseline (Variant::Sampling).
 //
-// This implements the algorithm described in "KD-Tree Baseline.md":
+// This implements the algorithm described in "KD-Tree Baseline v2.0.md":
 //   - Sweep on axis 0 (x1).
 //   - Embed rectangles on the remaining axes (2..d) into points in 2(d-1) dims
 //     using global ranks of (L_i, id) and (R_i, id) to make strict inequalities
@@ -14,7 +14,8 @@
 //     updating subtree active counts.
 //   - Phase 1: for each START event e (query box q), compute w_e = Count(Q(q))
 //     on the opposite tree.
-//   - Phase 2: build an alias table on {w_e} and assign t sample slots to events.
+//   - Phase 2: build an alias table on {w_e} after filtering out w_e==0 (v2.0 checklist #4),
+//     then assign t sample slots to events.
 //   - Phase 3: second sweep; for each START with t_e>0, draw t_e i.i.d. uniform
 //     samples from the local intersection set K_e using KD-tree range sampling.
 //
@@ -1096,25 +1097,43 @@ class KDTreeSamplingBaseline final : public IBaseline<Dim, T> {
     }
 
     // -----------------
-    // Phase 2: alias + slot assignment
+    // Phase 2: alias + slot assignment (filter w_e==0)
     // -----------------
     {
       auto _ = phases ? phases->Scoped("phase2_alias") : PhaseRecorder::ScopedPhase(nullptr, "");
 
+      // Baseline v2.0 (impl checklist #4): filter out START events with w_e==0
+      // before building the alias table, so they are never sampled.
+      std::vector<u32> nz_sids;
+      std::vector<u64> nz_w;
+      nz_sids.reserve(w_total_.size());
+      nz_w.reserve(w_total_.size());
+      for (u32 sid = 0; sid < static_cast<u32>(w_total_.size()); ++sid) {
+        const u64 w = w_total_[static_cast<usize>(sid)];
+        if (w == 0) continue;
+        nz_sids.push_back(sid);
+        nz_w.push_back(w);
+      }
+      if (nz_sids.empty()) {
+        if (err) *err = "KDTreeSamplingBaseline::Sample: internal error (W_>0 but no positive w_e)";
+        return false;
+      }
+
       sampling::AliasTable alias;
-      if (!alias.BuildFromU64(Span<const u64>(w_total_.data(), w_total_.size()), err)) {
+      if (!alias.BuildFromU64(Span<const u64>(nz_w.data(), nz_w.size()), err)) {
         return false;
       }
 
       struct SlotAssign {
-        u32 sid;
-        u32 slot;
+        u32 sid;   // original START id
+        u32 slot;  // output position
       };
 
       std::vector<SlotAssign> asg;
       asg.reserve(static_cast<usize>(t));
       for (u32 j = 0; j < t; ++j) {
-        const u32 sid = alias.Sample(rng);
+        const u32 p = alias.Sample(rng);  // index into nz_sids / nz_w
+        const u32 sid = nz_sids[static_cast<usize>(p)];
         asg.push_back(SlotAssign{sid, j});
       }
       std::sort(asg.begin(), asg.end(), [](const SlotAssign& a, const SlotAssign& b) {

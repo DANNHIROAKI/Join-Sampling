@@ -1,19 +1,34 @@
 #pragma once
 // sjs/baselines/range_tree/enum_sampling.h
 //
-// Plane Sweep + Dynamic Range-Tree baseline (Variant::EnumSampling).
+// RangeTree baseline (Variant::EnumSampling) — RT-Enumerate (Enumerate+Sampling)
 //
-// This variant exposes a deterministic enumerator (sweep + ActiveRangeTree)
-// and implements Sample() via two-pass rank sampling over that enumerator.
+// This variant is the *materialize-all* baseline described in
+//   docs/Baseline/RangeTree Baseline v2.0.md  (RT-Enumerate)
 //
-// In the experimental harness, EnumSampling variants are typically executed via
-// baselines::runners::RunEnumSamplingOnce(), which directly calls Enumerate()
-// and performs rank sampling itself. Still, we provide Sample() here for
-// completeness.
+//
+// Algorithm (v2.0 §3.1):
+//   1) One plane sweep on axis 0.
+//      For each START(q): Report all opposite active rectangles that intersect q
+//      in the remaining dimensions (here only y), and append the corresponding
+//      join pairs into an array Pairs.
+//   2) After the sweep, |Pairs| = |J|. Produce t i.i.d. uniform samples from J
+//      by sampling array indices uniformly with replacement.
+//
+// Notes
+// -----
+// * This baseline intentionally has time/space dependency on |J|, and may be
+//   infeasible when the join result is huge. It serves as a correctness and
+//   constant-factor reference.
+//
+// Implementation detail:
+// * We reuse the deterministic RangeJoinEnumerator (same sweep + ActiveRangeTree
+//   machinery as the Sampling baseline) to materialize all pairs.
 
 #include "sjs/baselines/range_tree/sampling.h"
-#include "sjs/sampling/rank_sampling.h"
 
+#include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -23,7 +38,7 @@ namespace sjs {
 namespace baselines {
 namespace range_tree {
 
-template <int Dim, class T>
+template <int Dim, class T = Scalar>
 class RangeTreeEnumSamplingBaseline final : public IBaseline<Dim, T> {
  public:
   static_assert(Dim == 2, "RangeTreeEnumSamplingBaseline is currently implemented for Dim==2 only");
@@ -44,16 +59,17 @@ class RangeTreeEnumSamplingBaseline final : public IBaseline<Dim, T> {
     auto scoped = phases ? phases->Scoped("build") : PhaseRecorder::ScopedPhase(nullptr, "");
     ds_ = &ds;
     built_ = true;
-    // Empty relations are fine; enumeration will be empty.
     return true;
   }
 
+  // Exact |J| by full enumeration (consistent with RT-Enumerate).
   bool Count(const Config& cfg,
              Rng* rng,
              CountResult* out,
              PhaseRecorder* phases,
              std::string* err) override {
-    (void)rng;
+    (void)cfg;
+    (void)rng;  // deterministic
     if (!built_ || !ds_) {
       if (err) *err = "RangeTreeEnumSamplingBaseline::Count: call Build() first";
       return false;
@@ -63,13 +79,26 @@ class RangeTreeEnumSamplingBaseline final : public IBaseline<Dim, T> {
       return false;
     }
 
-    // Exact count using the Phase-1 scheme from the Sampling variant.
-    auto scoped = phases ? phases->Scoped("count") : PhaseRecorder::ScopedPhase(nullptr, "");
-    RangeTreeSamplingBaseline<Dim, T> counter;
-    if (!counter.Build(*ds_, cfg, phases, err)) return false;
-    return counter.Count(cfg, /*rng=*/nullptr, out, phases, err);
+    auto scoped = phases ? phases->Scoped("enumerate_count") : PhaseRecorder::ScopedPhase(nullptr, "");
+
+    auto stream = std::make_unique<detail::RangeJoinEnumerator<Dim, T>>(&ds_->R, &ds_->S, /*axis=*/0,
+                                                                       join::SideTieBreak::RBeforeS);
+
+    PairId p;
+    u64 W = 0;
+    while (stream->Next(&p)) {
+      if (W == std::numeric_limits<u64>::max()) {
+        if (err) *err = "RangeTreeEnumSamplingBaseline::Count: |J| overflowed u64";
+        return false;
+      }
+      ++W;
+    }
+
+    *out = MakeExactCount(W);
+    return true;
   }
 
+  // Materialize all pairs then sample indices uniformly with replacement.
   bool Sample(const Config& cfg,
               Rng* rng,
               SampleSet* out,
@@ -93,19 +122,35 @@ class RangeTreeEnumSamplingBaseline final : public IBaseline<Dim, T> {
     out->weighted = false;
     out->weights.clear();
 
-    const u64 t = cfg.run.t;
-    if (t == 0) return true;
+    const u64 t64 = cfg.run.t;
+    if (t64 == 0) return true;
+    if (t64 > static_cast<u64>(std::numeric_limits<u32>::max())) {
+      if (err) *err = "RangeTreeEnumSamplingBaseline::Sample: t too large for u32 slots";
+      return false;
+    }
+    const u32 t = static_cast<u32>(t64);
 
-    auto scoped = phases ? phases->Scoped("rank_sampling") : PhaseRecorder::ScopedPhase(nullptr, "");
+    auto scoped = phases ? phases->Scoped("enumerate_materialize") : PhaseRecorder::ScopedPhase(nullptr, "");
+
     auto stream = Enumerate(cfg, phases, err);
     if (!stream) return false;
 
-    std::vector<PairId> samples;
-    sampling::RankSamplingInfo info;
-    if (!sampling::RankSampleWithReplacement<IJoinEnumerator, PairId>(stream.get(), t, rng, &samples, &info, err)) {
-      return false;
+    std::vector<PairId> pairs;
+    PairId p;
+    while (stream->Next(&p)) {
+      pairs.push_back(p);
     }
-    out->pairs = std::move(samples);
+
+    const u64 W = static_cast<u64>(pairs.size());
+    if (W == 0) {
+      return true;  // empty join
+    }
+
+    out->pairs.resize(static_cast<usize>(t));
+    for (u32 i = 0; i < t; ++i) {
+      const u64 j = rng->UniformU64(W);
+      out->pairs[static_cast<usize>(i)] = pairs[static_cast<usize>(j)];
+    }
     return true;
   }
 

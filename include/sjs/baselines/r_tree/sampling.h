@@ -3,7 +3,7 @@
 //
 // Plane Sweep + Dynamic R-Tree baseline (Variant::Sampling).
 //
-// Implements the algorithm described in "R-Tree Baseline.md":
+// Implements the algorithm described in "R-Tree Baseline v2.0.md":
 //   - Sweep on axis 0 (x1).
 //   - Maintain two dynamic R-trees over the projected boxes on dims 1..Dim-1
 //     (drop the sweep axis) for the active sets.
@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <unordered_map>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -347,30 +348,8 @@ class DynamicRTree {
   }
 
   // Draw k i.i.d. uniform samples WITH replacement from the set
-  // K(Q) = { obj : bbox(obj) intersects q }.
+  // { obj : bbox(obj) intersects q }.
   // Returns false if the intersection set is empty.
-  //
-  // Uniformity guarantee (mathematical proof):
-  //   Step A: Build frontier components that partition K(Q) into disjoint sets:
-  //     - FullNode components: entire subtrees where MBR ⊆ Q (weight = subtree.size)
-  //     - LeafHits components: filtered leaf entries that intersect Q (weight = |hits|)
-  //     - Components are disjoint: K(Q) = disjoint_union of all components
-  //     - Total weight W = sum(component.weight) = |K(Q)|
-  //
-  //   Step B: For each of k samples:
-  //     - Select component C with probability w_C / W (via alias table)
-  //     - Uniformly sample one object from component C:
-  //       * LeafHits: uniform selection from hits array (probability 1/w_C)
-  //       * FullNode: SampleFromSubtree() guarantees uniform over subtree (probability 1/w_C)
-  //
-  //   Therefore, for any object obj in K(Q):
-  //     Pr(obj) = sum_{C containing obj} Pr(C) * Pr(obj | C)
-  //              = sum_{C containing obj} (w_C / W) * (1 / w_C)
-  //              = sum_{C containing obj} (1 / W)
-  //              = 1 / W = 1 / |K(Q)|
-  //
-  //   This guarantees uniform distribution over K(Q). Independence follows from
-  //   independent random number generation for each sample.
   bool SampleIntersect(const BoxT& q, u32 k, Rng* rng, std::vector<u32>* out, QueryStats* st = nullptr) const {
     if (!rng || !out) return false;
     out->clear();
@@ -818,21 +797,6 @@ class DynamicRTree {
     }
   }
 
-  // Uniformly sample one leaf entry from the subtree rooted at nid.
-  //
-  // Uniformity guarantee (mathematical proof):
-  //   Let the subtree have n leaf entries, each with subtree size s_i = 1.
-  //   The root has total size S = sum(s_i) = n.
-  //   On the path from root to leaf i, at each internal node we choose a child
-  //   with probability s_child / s_parent (proportional to subtree size).
-  //   Therefore, the probability of selecting leaf i is:
-  //     Pr(leaf i) = product_{path} (s_child / s_parent) = s_i / S = 1/n.
-  //   This guarantees uniform distribution over all n leaf entries.
-  //
-  // Implementation:
-  //   - At each internal node, we use weighted random selection proportional to child.size
-  //   - At leaf nodes, we uniformly select from the children array
-  //   - The size field is maintained accurately during Insert/Delete operations
   u32 SampleFromSubtree(u32 nid, Rng* rng) const {
     SJS_DASSERT(rng);
     SJS_DASSERT(nid != kNull);
@@ -842,13 +806,11 @@ class DynamicRTree {
       const Node& n = nodes_[static_cast<usize>(cur)];
       SJS_DASSERT(n.size > 0);
       if (n.leaf) {
-        // Leaf node: uniform selection from children array.
         const u32 j = rng->UniformU32(static_cast<u32>(n.children.size()));
         return n.children[static_cast<usize>(j)].ref;
       }
 
-      // Internal node: choose child proportional to child.size (weighted random selection).
-      // This ensures that each leaf entry in the subtree has equal probability 1/n.size.
+      // Choose child proportional to child.size.
       const u64 total = static_cast<u64>(n.size);
       u64 r = rng->UniformU64(total);
       for (const auto& e : n.children) {
@@ -1193,6 +1155,7 @@ class RTreeSamplingBaseline final : public IBaseline<Dim, T> {
     out->weights.clear();
     if (t == 0) return true;
 
+    // Ensure Phase-1 weights exist (Baseline v2.0 §3.2 Phase1).
     if (!weights_valid_) {
       CountResult tmp;
       if (!Count(cfg, /*rng=*/nullptr, &tmp, phases, err)) return false;
@@ -1202,51 +1165,79 @@ class RTreeSamplingBaseline final : public IBaseline<Dim, T> {
       return true;
     }
 
-    struct Assignment {
-      u32 eid;
-      u32 slot;
-    };
-    auto assign_less = [](const Assignment& a, const Assignment& b) noexcept {
-      if (a.eid < b.eid) return true;
-      if (b.eid < a.eid) return false;
-      return a.slot < b.slot;
-    };
+    const u32 num_starts = static_cast<u32>(w_total_.size());
+
+    // Build an alias distribution over START events with positive weight only.
+    // This exactly matches p_e = w_e / W (Baseline v2.0 §3.2 Phase2) while avoiding
+    // any possibility of sampling a zero-weight event due to numeric corner cases.
+    std::vector<u32> pos_eids;
+    std::vector<u64> pos_w;
+    pos_eids.reserve(num_starts);
+    pos_w.reserve(num_starts);
+    for (u32 eid = 0; eid < num_starts; ++eid) {
+      const u64 w = w_total_[static_cast<usize>(eid)];
+      if (w > 0) {
+        pos_eids.push_back(eid);
+        pos_w.push_back(w);
+      }
+    }
+    if (pos_eids.empty()) {
+      // Should be impossible when W_ > 0, but keep it robust.
+      if (err) *err = "RTreeSamplingBaseline::Sample: no positive-weight START events (W>0)";
+      return false;
+    }
 
     // --------------------------
-    // Phase 2: alias on events + slot assignments
+    // Phase 2: alias on events + slot assignment (Baseline v2.0 §3.2 Phase2)
     // --------------------------
-    std::vector<Assignment> assign;
+    //
+    // We implement slots[start_id].append(j) using a compact CSR-like layout:
+    //   - slot_offsets[eid]..slot_offsets[eid+1] is the slot list for START eid.
+    //   - slots_data stores all slot indices contiguously.
+    std::vector<u32> slot_offsets;
+    std::vector<u32> slots_data;
     {
       auto scoped2 = phases ? phases->Scoped("phase2_assign") : PhaseRecorder::ScopedPhase(nullptr, "");
 
       sampling::AliasTable alias;
-      if (!alias.BuildFromU64(Span<const u64>(w_total_), err)) {
-        if (err && err->empty()) *err = "RTreeSamplingBaseline::Sample: failed to build alias table";
+      if (!alias.BuildFromU64(Span<const u64>(pos_w), err)) {
+        if (err && err->empty()) *err = "RTreeSamplingBaseline::Sample: alias build failed";
         return false;
       }
 
-      assign.reserve(t);
+      std::vector<u32> slot_counts(static_cast<usize>(num_starts), 0U);
+      std::vector<u32> chosen_eid(static_cast<usize>(t), 0U);
+
+      // Draw a START event for each output position and count.
       for (u32 j = 0; j < t; ++j) {
-        u32 eid = 0;
-        u64 w = 0;
-        for (int tries = 0; tries < 16; ++tries) {
-          eid = static_cast<u32>(alias.Sample(rng));
-          w = w_total_[eid];
-          if (w > 0) break;
-        }
-        if (w == 0) {
-          if (err) *err = "RTreeSamplingBaseline::Sample: alias produced only zero-weight events (unexpected)";
-          return false;
-        }
-        assign.push_back(Assignment{eid, j});
+        const u32 idx = static_cast<u32>(alias.Sample(rng));  // index into pos_eids
+        const u32 eid = pos_eids[static_cast<usize>(idx)];
+        chosen_eid[static_cast<usize>(j)] = eid;
+        slot_counts[static_cast<usize>(eid)]++;
       }
-      std::sort(assign.begin(), assign.end(), assign_less);
+
+      // Prefix sums -> offsets.
+      slot_offsets.assign(static_cast<usize>(num_starts + 1), 0U);
+      for (u32 eid = 0; eid < num_starts; ++eid) {
+        slot_offsets[static_cast<usize>(eid + 1)] =
+            slot_offsets[static_cast<usize>(eid)] + slot_counts[static_cast<usize>(eid)];
+      }
+      SJS_DASSERT(slot_offsets.back() == t);
+
+      // Fill slot lists.
+      slots_data.assign(static_cast<usize>(t), 0U);
+      std::vector<u32> write_pos(slot_offsets.begin(), slot_offsets.end() - 1);
+      for (u32 j = 0; j < t; ++j) {
+        const u32 eid = chosen_eid[static_cast<usize>(j)];
+        const u32 pos = write_pos[static_cast<usize>(eid)]++;
+        slots_data[static_cast<usize>(pos)] = j;
+      }
     }
 
     out->pairs.assign(static_cast<usize>(t), PairId{});
 
     // --------------------------
-    // Phase 3: second sweep + local sampling + slot fill
+    // Phase 3: second sweep + local sampling + slot fill (Baseline v2.0 §3.2 Phase3)
     // --------------------------
     {
       auto scoped3 = phases ? phases->Scoped("phase3_sample") : PhaseRecorder::ScopedPhase(nullptr, "");
@@ -1254,8 +1245,8 @@ class RTreeSamplingBaseline final : public IBaseline<Dim, T> {
       tree_r_.Clear();
       tree_s_.Clear();
 
-      usize a_ptr = 0;
       std::vector<u32> picked;
+      picked.reserve(256);
 
       for (usize ev_pos = 0; ev_pos < events_.size(); ++ev_pos) {
         const join::Event& e = events_[ev_pos];
@@ -1269,55 +1260,48 @@ class RTreeSamplingBaseline final : public IBaseline<Dim, T> {
           continue;
         }
 
+        // START
         const i32 sid_i32 = start_id_of_event_[ev_pos];
         SJS_DASSERT(sid_i32 >= 0);
         const u32 eid = static_cast<u32>(sid_i32);
 
-        // Find assignment range for this event id.
-        const usize begin = a_ptr;
-        while (a_ptr < assign.size() && assign[a_ptr].eid == eid) ++a_ptr;
-        const u32 t_e = static_cast<u32>(a_ptr - begin);
+        const u32 begin = slot_offsets[static_cast<usize>(eid)];
+        const u32 end = slot_offsets[static_cast<usize>(eid + 1)];
+        const u32 need = end - begin;
 
-        if (t_e > 0) {
-          picked.clear();
-          if (e.side == join::Side::R) {
-            const ProjBoxT& q = proj_r_[e.index];
-            if (!tree_s_.SampleIntersect(q, t_e, rng, &picked)) {
-              if (err) *err = "RTreeSamplingBaseline::Sample: SampleIntersect returned empty unexpectedly";
+        if (e.side == join::Side::R) {
+          const ProjBoxT& q = proj_r_[e.index];
+          if (need > 0) {
+            picked.clear();
+            if (!tree_s_.SampleIntersect(q, need, rng, &picked)) {
+              if (err) *err = "RTreeSamplingBaseline::Sample: SampleIntersect failed (unexpected empty K_e)";
               return false;
             }
             const Id rid = ds_->R.GetId(e.index);
-            for (u32 u = 0; u < t_e; ++u) {
+            for (u32 u = 0; u < need; ++u) {
               const u32 s_idx = picked[static_cast<usize>(u)];
-              out->pairs[static_cast<usize>(assign[begin + u].slot)] = PairId{rid, ds_->S.GetId(s_idx)};
-            }
-          } else {
-            const ProjBoxT& q = proj_s_[e.index];
-            if (!tree_r_.SampleIntersect(q, t_e, rng, &picked)) {
-              if (err) *err = "RTreeSamplingBaseline::Sample: SampleIntersect returned empty unexpectedly";
-              return false;
-            }
-            const Id sid = ds_->S.GetId(e.index);
-            for (u32 u = 0; u < t_e; ++u) {
-              const u32 r_idx = picked[static_cast<usize>(u)];
-              out->pairs[static_cast<usize>(assign[begin + u].slot)] = PairId{ds_->R.GetId(r_idx), sid};
+              const u32 slot = slots_data[static_cast<usize>(begin + u)];
+              out->pairs[static_cast<usize>(slot)] = PairId{rid, ds_->S.GetId(static_cast<usize>(s_idx))};
             }
           }
-        }
-
-        // Insert this START into its own active tree.
-        if (e.side == join::Side::R) {
-          const ProjBoxT& q = proj_r_[e.index];
           (void)tree_r_.Insert(static_cast<u32>(e.index), q);
         } else {
           const ProjBoxT& q = proj_s_[e.index];
+          if (need > 0) {
+            picked.clear();
+            if (!tree_r_.SampleIntersect(q, need, rng, &picked)) {
+              if (err) *err = "RTreeSamplingBaseline::Sample: SampleIntersect failed (unexpected empty K_e)";
+              return false;
+            }
+            const Id sid = ds_->S.GetId(e.index);
+            for (u32 u = 0; u < need; ++u) {
+              const u32 r_idx = picked[static_cast<usize>(u)];
+              const u32 slot = slots_data[static_cast<usize>(begin + u)];
+              out->pairs[static_cast<usize>(slot)] = PairId{ds_->R.GetId(static_cast<usize>(r_idx)), sid};
+            }
+          }
           (void)tree_s_.Insert(static_cast<u32>(e.index), q);
         }
-      }
-
-      if (a_ptr != assign.size()) {
-        if (err) *err = "RTreeSamplingBaseline::Sample: internal error (did not consume all assignments)";
-        return false;
       }
     }
 

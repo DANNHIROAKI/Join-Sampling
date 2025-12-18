@@ -3,7 +3,7 @@
 //
 // Plane Sweep + Dynamic R-Tree baseline (Variant::Adaptive).
 //
-// Adaptive strategy (from "R-Tree Baseline.md"):
+// Adaptive strategy (from "R-Tree Baseline v2.0.md"):
 //   - Always perform Phase-1 counting via a sweep + R-tree.
 //   - While the running total W <= J_star, also enumerate and materialize all
 //     pairs into AllPairs (exact join).
@@ -169,23 +169,12 @@ class RTreeAdaptiveBaseline final : public IBaseline<Dim, T> {
 
       if (e.side == join::Side::R) {
         const ProjBoxT& q = proj_r_[e.index];
-        
-        // Step A: Always count first (required for accurate weight w_e and total W).
-        // This ensures we have the exact weight before making enumeration decisions.
         const u64 w = tree_s_.CountIntersect(q);
         w_total_[sid] = w;
         W += w;
 
-        // Step B: Threshold check and optional enumeration.
-        // Key invariant: "Count first, then decide" prevents the scenario where
-        // we enumerate part of an event's pairs and then discover W > J_star.
-        // Since ReportIntersect() is atomic (returns all hits at once), we either:
-        //   - Enumerate the entire event's contribution (if W <= J_star), OR
-        //   - Skip enumeration entirely (if W > J_star after counting this event).
-        // This guarantees that AllPairs.size() <= J_star at all times.
         if (mode_ == Mode::Enumerate) {
           if (W <= J_star) {
-            // Safe to enumerate: current total W is within threshold.
             hits.clear();
             tree_s_.ReportIntersect(q, &hits);
             // Safety: ReportIntersect should match CountIntersect.
@@ -194,30 +183,20 @@ class RTreeAdaptiveBaseline final : public IBaseline<Dim, T> {
             for (u32 sidx : hits) {
               all_pairs_.push_back(PairId{rid, ds_->S.GetId(static_cast<usize>(sidx))});
             }
-            // Note: After appending, if W > J_star, we will switch mode on the next event.
-            // The current event's pairs are already in all_pairs_, but they will be
-            // discarded if we switch (see else branch below).
           } else {
-            // Threshold exceeded: switch to COUNT_ONLY mode.
-            // Discard any previously enumerated pairs (they may have pushed W over J_star).
+            // Trigger switch.
             mode_ = Mode::CountOnly;
             all_pairs_.clear();
-            // From now on, we only count (w_e) but do not enumerate pairs.
           }
         }
-        // If mode_ == Mode::CountOnly, we skip enumeration entirely.
 
-        // Step C: Insert this box into its own active tree.
         (void)tree_r_.Insert(static_cast<u32>(e.index), q);
       } else {
         const ProjBoxT& q = proj_s_[e.index];
-        
-        // Step A: Always count first (same logic as R side).
         const u64 w = tree_r_.CountIntersect(q);
         w_total_[sid] = w;
         W += w;
 
-        // Step B: Threshold check and optional enumeration (same logic as R side).
         if (mode_ == Mode::Enumerate) {
           if (W <= J_star) {
             hits.clear();
@@ -232,7 +211,6 @@ class RTreeAdaptiveBaseline final : public IBaseline<Dim, T> {
           }
         }
 
-        // Step C: Insert this box into its own active tree.
         (void)tree_s_.Insert(static_cast<u32>(e.index), q);
       }
     }
@@ -304,57 +282,88 @@ class RTreeAdaptiveBaseline final : public IBaseline<Dim, T> {
       return true;
     }
 
-    // COUNT_ONLY mode: fall back to Sampling variant's Phase-2/3.
+    // COUNT_ONLY mode: execute Baseline v2.0 "Sampling" Phase2+Phase3.
     auto scoped = phases ? phases->Scoped("phase2+3_sampling") : PhaseRecorder::ScopedPhase(nullptr, "");
 
-    // Phase 2: alias assignment.
-    sampling::AliasTable alias;
-    if (!alias.BuildFromU64(Span<const u64>(w_total_))) {
-      if (err) *err = "RTreeAdaptiveBaseline::Sample: alias build failed";
+    // This baseline stores slot indices in u32 (and DynamicRTree::SampleIntersect takes u32),
+    // so we require t <= 2^32-1 (practically always true).
+    if (t > static_cast<u64>(std::numeric_limits<u32>::max())) {
+      if (err) *err = "RTreeAdaptiveBaseline::Sample: t exceeds u32 limit";
+      return false;
+    }
+    const u32 t_u32 = static_cast<u32>(t);
+
+    const u32 num_starts = static_cast<u32>(w_total_.size());
+
+    // Build an alias distribution over START events with positive weight only.
+    std::vector<u32> pos_eids;
+    std::vector<u64> pos_w;
+    pos_eids.reserve(num_starts);
+    pos_w.reserve(num_starts);
+    for (u32 eid = 0; eid < num_starts; ++eid) {
+      const u64 w = w_total_[static_cast<usize>(eid)];
+      if (w > 0) {
+        pos_eids.push_back(eid);
+        pos_w.push_back(w);
+      }
+    }
+    if (pos_eids.empty()) {
+      if (err) *err = "RTreeAdaptiveBaseline::Sample: no positive-weight START events (W>0)";
       return false;
     }
 
-    struct Assignment {
-      u32 eid = 0;  // start-id
-      u32 slot = 0;
-    };
-
-    std::vector<Assignment> assign;
-    assign.reserve(static_cast<usize>(t));
-    for (u64 j = 0; j < t; ++j) {
-      // Avoid selecting a zero-weight event.
-      for (int tries = 0; tries < 16; ++tries) {
-        const u32 eid = static_cast<u32>(alias.Sample(rng));
-        if (w_total_[static_cast<usize>(eid)] == 0) continue;
-        assign.push_back(Assignment{eid, static_cast<u32>(j)});
-        break;
+    // --------------------------
+    // Phase 2: event alias + slots[start_id].append(j) (Baseline v2.0 §3.2 Phase2)
+    // --------------------------
+    // Compact CSR layout:
+    //   - slot_offsets[eid]..slot_offsets[eid+1] are the output positions assigned to START eid.
+    //   - slots_data stores all output positions contiguously.
+    std::vector<u32> slot_offsets;
+    std::vector<u32> slots_data;
+    {
+      sampling::AliasTable alias;
+      if (!alias.BuildFromU64(Span<const u64>(pos_w), err)) {
+        if (err && err->empty()) *err = "RTreeAdaptiveBaseline::Sample: alias build failed";
+        return false;
       }
-      if (assign.size() != static_cast<usize>(j + 1)) {
-        // Fallback: linear search for any positive weight (rare).
-        u32 eid = 0;
-        for (u32 i = 0; i < static_cast<u32>(w_total_.size()); ++i) {
-          if (w_total_[static_cast<usize>(i)] > 0) {
-            eid = i;
-            break;
-          }
-        }
-        assign.push_back(Assignment{eid, static_cast<u32>(j)});
+
+      std::vector<u32> slot_counts(static_cast<usize>(num_starts), 0U);
+      std::vector<u32> chosen_eid(static_cast<usize>(t_u32), 0U);
+
+      for (u32 j = 0; j < t_u32; ++j) {
+        const u32 idx = static_cast<u32>(alias.Sample(rng));  // index into pos_eids
+        const u32 eid = pos_eids[static_cast<usize>(idx)];
+        chosen_eid[static_cast<usize>(j)] = eid;
+        slot_counts[static_cast<usize>(eid)]++;
+      }
+
+      slot_offsets.assign(static_cast<usize>(num_starts + 1), 0U);
+      for (u32 eid = 0; eid < num_starts; ++eid) {
+        slot_offsets[static_cast<usize>(eid + 1)] =
+            slot_offsets[static_cast<usize>(eid)] + slot_counts[static_cast<usize>(eid)];
+      }
+      SJS_DASSERT(slot_offsets.back() == t_u32);
+
+      slots_data.assign(static_cast<usize>(t_u32), 0U);
+      std::vector<u32> write_pos(slot_offsets.begin(), slot_offsets.end() - 1);
+      for (u32 j = 0; j < t_u32; ++j) {
+        const u32 eid = chosen_eid[static_cast<usize>(j)];
+        const u32 pos = write_pos[static_cast<usize>(eid)]++;
+        slots_data[static_cast<usize>(pos)] = j;
       }
     }
 
-    std::sort(assign.begin(), assign.end(), [](const Assignment& a, const Assignment& b) {
-      if (a.eid < b.eid) return true;
-      if (b.eid < a.eid) return false;
-      return a.slot < b.slot;
-    });
+    out->pairs.assign(static_cast<usize>(t_u32), PairId{});
 
-    out->pairs.resize(static_cast<usize>(t));
-
-    // Phase 3: second sweep and local R-tree sampling.
+    // --------------------------
+    // Phase 3: second sweep + local sampling (Baseline v2.0 §3.2 Phase3)
+    // --------------------------
     tree_r_.Clear();
     tree_s_.Clear();
 
-    usize ap = 0;
+    std::vector<u32> picked;
+    picked.reserve(256);
+
     for (usize ev_pos = 0; ev_pos < events_.size(); ++ev_pos) {
       const join::Event& e = events_[ev_pos];
 
@@ -369,40 +378,41 @@ class RTreeAdaptiveBaseline final : public IBaseline<Dim, T> {
 
       const i32 sid_i32 = start_id_of_event_[ev_pos];
       SJS_DASSERT(sid_i32 >= 0);
-      const u32 sid = static_cast<u32>(sid_i32);
+      const u32 eid = static_cast<u32>(sid_i32);
 
-      // Find assignments for this start-id.
-      const usize begin = ap;
-      while (ap < assign.size() && assign[ap].eid == sid) ++ap;
-      const usize count = ap - begin;
+      const u32 begin = slot_offsets[static_cast<usize>(eid)];
+      const u32 end = slot_offsets[static_cast<usize>(eid + 1)];
+      const u32 need = end - begin;
 
       if (e.side == join::Side::R) {
         const ProjBoxT& q = proj_r_[e.index];
-        if (count > 0) {
-          std::vector<u32> picks;
-          if (!tree_s_.SampleIntersect(q, static_cast<u32>(count), rng, &picks)) {
+        if (need > 0) {
+          picked.clear();
+          if (!tree_s_.SampleIntersect(q, need, rng, &picked)) {
             if (err) *err = "RTreeAdaptiveBaseline::Sample: SampleIntersect failed (unexpected empty K_e)";
             return false;
           }
           const Id rid = ds_->R.GetId(e.index);
-          for (usize j = 0; j < count; ++j) {
-            const u32 sidx = picks[j];
-            out->pairs[static_cast<usize>(assign[begin + j].slot)] = PairId{rid, ds_->S.GetId(static_cast<usize>(sidx))};
+          for (u32 u = 0; u < need; ++u) {
+            const u32 sidx = picked[static_cast<usize>(u)];
+            const u32 slot = slots_data[static_cast<usize>(begin + u)];
+            out->pairs[static_cast<usize>(slot)] = PairId{rid, ds_->S.GetId(static_cast<usize>(sidx))};
           }
         }
         (void)tree_r_.Insert(static_cast<u32>(e.index), q);
       } else {
         const ProjBoxT& q = proj_s_[e.index];
-        if (count > 0) {
-          std::vector<u32> picks;
-          if (!tree_r_.SampleIntersect(q, static_cast<u32>(count), rng, &picks)) {
+        if (need > 0) {
+          picked.clear();
+          if (!tree_r_.SampleIntersect(q, need, rng, &picked)) {
             if (err) *err = "RTreeAdaptiveBaseline::Sample: SampleIntersect failed (unexpected empty K_e)";
             return false;
           }
           const Id sid_id = ds_->S.GetId(e.index);
-          for (usize j = 0; j < count; ++j) {
-            const u32 ridx = picks[j];
-            out->pairs[static_cast<usize>(assign[begin + j].slot)] = PairId{ds_->R.GetId(static_cast<usize>(ridx)), sid_id};
+          for (u32 u = 0; u < need; ++u) {
+            const u32 ridx = picked[static_cast<usize>(u)];
+            const u32 slot = slots_data[static_cast<usize>(begin + u)];
+            out->pairs[static_cast<usize>(slot)] = PairId{ds_->R.GetId(static_cast<usize>(ridx)), sid_id};
           }
         }
         (void)tree_s_.Insert(static_cast<u32>(e.index), q);

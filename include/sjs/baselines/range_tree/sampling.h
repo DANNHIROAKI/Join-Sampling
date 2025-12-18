@@ -3,7 +3,7 @@
 //
 // Plane Sweep + Dynamic 2D Range-Tree baseline (Variant::Sampling).
 //
-// This implements the algorithm in "RangeTree Baseline.md" for the
+// This implements the algorithm in "RangeTree Baseline v2.0.md" for the
 // currently-supported experimental setting (Dim=2 rectangles):
 //   - Sweep on axis 0 (x).
 //   - Embed rectangles on the remaining axes (here only y) into rank-space
@@ -81,6 +81,49 @@ struct RankBox {
       if (!(lo[d] < hi[d])) return true;
     }
     return false;
+  }
+};
+
+
+// --------------------------
+// Helper: START-event alias sampling with zero-weight filtering
+// --------------------------
+//
+// v2.0 design note:
+//   Phase-2 builds an alias table on START events with probability w_e / W,
+//   where w_e=|J_e|. Events with w_e==0 must never be sampled.  We therefore
+//   filter them out before building the alias table to avoid relying on any
+//   special-case behavior inside AliasTable for zero weights.
+
+struct NonZeroStartAlias {
+  sampling::AliasTable alias;
+  std::vector<u32> start_ids;  // map alias index -> START id (sid)
+
+  bool Build(Span<const u64> w_total, std::string* err) {
+    start_ids.clear();
+    std::vector<u64> w;
+    w.reserve(w_total.size());
+
+    // Keep only START events with positive weight.
+    for (u32 sid = 0; sid < static_cast<u32>(w_total.size()); ++sid) {
+      const u64 w_e = w_total[static_cast<usize>(sid)];
+      if (w_e == 0) continue;
+      start_ids.push_back(sid);
+      w.push_back(w_e);
+    }
+
+    if (w.empty()) {
+      if (err) *err = "NonZeroStartAlias::Build: all START weights are zero (empty join)";
+      return false;
+    }
+
+    return alias.BuildFromU64(Span<const u64>(w.data(), w.size()), err);
+  }
+
+  u32 SampleSid(Rng* rng) const {
+    const u32 idx = static_cast<u32>(alias.Sample(rng));
+    SJS_DASSERT(idx < start_ids.size());
+    return start_ids[static_cast<usize>(idx)];
   }
 };
 
@@ -1171,8 +1214,8 @@ class RangeTreeSamplingBaseline final : public IBaseline<Dim, T> {
     {
       auto _ = phases ? phases->Scoped("phase2_alias") : PhaseRecorder::ScopedPhase(nullptr, "");
 
-      sampling::AliasTable alias;
-      if (!alias.BuildFromU64(Span<const u64>(w_total_.data(), w_total_.size()), err)) return false;
+      detail::NonZeroStartAlias ev_alias;
+      if (!ev_alias.Build(Span<const u64>(w_total_.data(), w_total_.size()), err)) return false;
 
       struct SlotAssign {
         u32 sid;
@@ -1182,7 +1225,7 @@ class RangeTreeSamplingBaseline final : public IBaseline<Dim, T> {
       std::vector<SlotAssign> asg;
       asg.reserve(static_cast<usize>(t));
       for (u32 j = 0; j < t; ++j) {
-        const u32 sid = static_cast<u32>(alias.Sample(rng));
+        const u32 sid = ev_alias.SampleSid(rng);
         asg.push_back(SlotAssign{sid, j});
       }
       std::sort(asg.begin(), asg.end(), [](const SlotAssign& a, const SlotAssign& b) {

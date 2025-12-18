@@ -1,18 +1,20 @@
 #pragma once
 // sjs/baselines/interval_tree/enum_sampling.h
 //
-// Plane Sweep + IntervalTreeSampler baseline (Variant::EnumSampling).
+// IntervalTree Baseline (v2.0) — Variant::EnumSampling
+// ----------------------------------------------------
+// Matches the "Enumerate+Sampling" baseline in:
+//   docs/Baseline/IntervalTree Baseline v2.0.md
 //
-// This variant exposes a deterministic enumerator based on the same sweep +
-// interval-tree (A/B) machinery. Sampling is performed via generic two-pass
-// rank sampling over the enumeration stream (see sjs/sampling/rank_sampling.h).
+// Algorithm:
+//   1) One x-sweep enumerates all join pairs J into an array Pairs.
+//   2) Output t i.i.d. samples by drawing uniform indices in [0,|Pairs|).
 //
-// In the experimental harness, EnumSampling baselines are usually executed via
-// baselines::runners::RunEnumSamplingOnce(), which directly calls Enumerate().
-// We still provide Count() and Sample() here for completeness.
+// Notes:
+//   - This is intended as a classic baseline: O(n log n + |J|) time and O(|J|) memory.
+//   - The sweep/overlap logic is shared with sampling.h via IntervalTreeJoinEnumerator.
 
 #include "sjs/baselines/interval_tree/sampling.h"
-#include "sjs/sampling/rank_sampling.h"
 
 #include <memory>
 #include <string>
@@ -31,25 +33,24 @@ class IntervalTreeEnumSamplingBaseline final : public IBaseline<Dim, T> {
 
   Method method() const noexcept override { return Method::IntervalTree; }
   Variant variant() const noexcept override { return Variant::EnumSampling; }
-  std::string_view Name() const noexcept override { return "interval_tree_enum+sampling"; }
+  std::string_view Name() const noexcept override { return "interval_tree_enum_sampling"; }
 
   void Reset() override {
     ds_ = nullptr;
     built_ = false;
+
+    pairs_.clear();
+    pairs_valid_ = false;
+    W_ = 0;
   }
 
   bool Build(const DatasetT& ds, const Config& cfg, PhaseRecorder* phases, std::string* err) override {
     (void)cfg;
     auto scoped = phases ? phases->Scoped("build") : PhaseRecorder::ScopedPhase(nullptr, "");
 
+    Reset();
     ds_ = &ds;
     built_ = true;
-
-    if constexpr (Dim != 2) {
-      if (err) *err = "IntervalTreeEnumSamplingBaseline: currently only Dim=2 is supported";
-      built_ = false;
-      return false;
-    }
     return true;
   }
 
@@ -58,7 +59,9 @@ class IntervalTreeEnumSamplingBaseline final : public IBaseline<Dim, T> {
              CountResult* out,
              PhaseRecorder* phases,
              std::string* err) override {
+    (void)cfg;
     (void)rng;
+
     if (!built_ || !ds_) {
       if (err) *err = "IntervalTreeEnumSamplingBaseline::Count: call Build() first";
       return false;
@@ -68,11 +71,23 @@ class IntervalTreeEnumSamplingBaseline final : public IBaseline<Dim, T> {
       return false;
     }
 
-    // Use the O(n log n) exact counting scheme from the Sampling variant.
-    auto scoped = phases ? phases->Scoped("count") : PhaseRecorder::ScopedPhase(nullptr, "");
-    IntervalTreeSamplingBaseline<Dim, T> counter;
-    if (!counter.Build(*ds_, cfg, phases, err)) return false;
-    return counter.Count(cfg, /*rng=*/nullptr, out, phases, err);
+    // Enumerate and cache Pairs (this is the baseline's main cost).
+    if (!pairs_valid_) {
+      auto scoped = phases ? phases->Scoped("enumerate_all_pairs") : PhaseRecorder::ScopedPhase(nullptr, "");
+
+      pairs_.clear();
+      std::unique_ptr<IJoinEnumerator> it = Enumerate(cfg, phases, err);
+      if (!it) return false;
+
+      PairId p;
+      while (it->Next(&p)) pairs_.push_back(p);
+
+      W_ = static_cast<u64>(pairs_.size());
+      pairs_valid_ = true;
+    }
+
+    *out = MakeExactCount(W_);
+    return true;
   }
 
   bool Sample(const Config& cfg,
@@ -84,31 +99,39 @@ class IntervalTreeEnumSamplingBaseline final : public IBaseline<Dim, T> {
       if (err) *err = "IntervalTreeEnumSamplingBaseline::Sample: call Build() first";
       return false;
     }
-    if (!rng || !out) {
-      if (err) *err = "IntervalTreeEnumSamplingBaseline::Sample: null rng/out";
+    if (!rng) {
+      if (err) *err = "IntervalTreeEnumSamplingBaseline::Sample: rng is null";
       return false;
     }
+    if (!out) {
+      if (err) *err = "IntervalTreeEnumSamplingBaseline::Sample: out is null";
+      return false;
+    }
+
+    const u32 t = cfg.run.t;
 
     out->Clear();
     out->with_replacement = true;
     out->weighted = false;
     out->weights.clear();
 
-    const u64 t = cfg.run.t;
     if (t == 0) return true;
 
-    auto scoped = phases ? phases->Scoped("rank_sampling") : PhaseRecorder::ScopedPhase(nullptr, "");
-
-    auto stream = Enumerate(cfg, phases, err);
-    if (!stream) return false;
-
-    std::vector<PairId> samples;
-    sampling::RankSamplingInfo info;
-    if (!sampling::RankSampleWithReplacement<IJoinEnumerator, PairId>(stream.get(), t, rng, &samples, &info, err)) {
-      return false;
+    // Ensure Pairs exist.
+    if (!pairs_valid_) {
+      CountResult tmp;
+      if (!Count(cfg, /*rng=*/nullptr, &tmp, phases, err)) return false;
     }
+    if (W_ == 0) return true;
 
-    out->pairs = std::move(samples);
+    out->pairs.resize(static_cast<usize>(t));
+
+    auto scoped = phases ? phases->Scoped("sample_from_pairs") : PhaseRecorder::ScopedPhase(nullptr, "");
+
+    for (u32 i = 0; i < t; ++i) {
+      const u64 idx = rng->UniformU64(W_);
+      out->pairs[static_cast<usize>(i)] = pairs_[static_cast<usize>(idx)];
+    }
     return true;
   }
 
@@ -117,19 +140,23 @@ class IntervalTreeEnumSamplingBaseline final : public IBaseline<Dim, T> {
                                              std::string* err) override {
     (void)cfg;
     auto scoped = phases ? phases->Scoped("enumerate_prepare") : PhaseRecorder::ScopedPhase(nullptr, "");
+
     if (!built_ || !ds_) {
       if (err) *err = "IntervalTreeEnumSamplingBaseline::Enumerate: call Build() first";
       return nullptr;
     }
 
-    // Self-contained enumerator using interval-tree A/B reporting.
-    return std::make_unique<detail::IntervalTreeJoinEnumerator<Dim, T>>(&ds_->R, &ds_->S, /*axis=*/0,
-                                                                        join::SideTieBreak::RBeforeS);
+    // Streaming enumerator (one sweep) — used for materializing Pairs and also for external callers.
+    return std::make_unique<detail::IntervalTreeJoinEnumerator<Dim, T>>(&ds_->R, &ds_->S);
   }
 
  private:
   const DatasetT* ds_{nullptr};
   bool built_{false};
+
+  std::vector<PairId> pairs_;
+  bool pairs_valid_{false};
+  u64 W_{0};
 };
 
 }  // namespace interval_tree

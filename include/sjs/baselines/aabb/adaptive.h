@@ -3,7 +3,7 @@
 //
 // Plane Sweep + Dynamic AABB-Tree baseline (Variant::Adaptive).
 //
-// This follows the "Adaptive+Sampling" variant in "AABB-Tree Baseline.md":
+// This follows the "Adaptive+Sampling" variant in "AABB-Tree Baseline v2.0.md":
 //   - Phase1: sweep and compute weights w_e exactly using CountIntersect.
 //            While W <= J*, also enumerate pairs (via ReportIntersect) into
 //            AllPairs; if W exceeds J*, discard and switch to COUNT_ONLY.
@@ -296,39 +296,35 @@ class AABBAdaptiveBaseline final : public IBaseline<Dim, T> {
     std::vector<Assignment> assign;
     {
       auto scoped = phases ? phases->Scoped("phase2_assign") : PhaseRecorder::ScopedPhase(nullptr, "");
-      
-      // Filter out zero-weight events before building alias table to avoid
-      // sampling zero-weight events. This is more efficient than retry logic.
-      std::vector<u64> filtered_weights;
-      std::vector<u32> eid_map;  // maps filtered index -> original event id
-      filtered_weights.reserve(w_total_.size());
-      eid_map.reserve(w_total_.size());
-      for (usize i = 0; i < w_total_.size(); ++i) {
-        if (w_total_[i] > 0) {
-          filtered_weights.push_back(w_total_[i]);
-          eid_map.push_back(static_cast<u32>(i));
-        }
+      // Build alias only on positive-weight START events (w_e > 0), as required by the v2.0 design.
+      std::vector<u32> pos_eids;
+      std::vector<u64> pos_w;
+      pos_eids.reserve(w_total_.size());
+      pos_w.reserve(w_total_.size());
+      for (u32 eid = 0; eid < static_cast<u32>(w_total_.size()); ++eid) {
+        const u64 w = w_total_[static_cast<usize>(eid)];
+        if (w == 0) continue;
+        pos_eids.push_back(eid);
+        pos_w.push_back(w);
       }
-
-      if (filtered_weights.empty()) {
-        if (err) *err = "AABBAdaptiveBaseline::Sample: all events have zero weight (unexpected)";
+      if (pos_w.empty()) {
+        if (err) *err = "AABBAdaptiveBaseline::Sample: internal error (W>0 but no positive-weight events)";
         return false;
       }
 
       sampling::AliasTable alias;
-      if (!alias.BuildFromU64(Span<const u64>(filtered_weights), err)) {
+      if (!alias.BuildFromU64(Span<const u64>(pos_w), err)) {
         if (err && err->empty()) *err = "AABBAdaptiveBaseline::Sample: failed to build alias table";
         return false;
       }
 
       assign.reserve(t);
       for (u32 j = 0; j < t; ++j) {
-        const usize filtered_idx = alias.Sample(rng);
-        SJS_DASSERT(filtered_idx < eid_map.size());
-        const u32 eid = eid_map[filtered_idx];
-        SJS_DASSERT(w_total_[eid] > 0);  // Sanity check
+        const u32 idx = static_cast<u32>(alias.Sample(rng));
+        const u32 eid = pos_eids[static_cast<usize>(idx)];
         assign.push_back(Assignment{eid, j});
       }
+
       std::sort(assign.begin(), assign.end(), assign_less);
     }
 

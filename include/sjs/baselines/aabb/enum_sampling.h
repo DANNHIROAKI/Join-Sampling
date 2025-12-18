@@ -3,16 +3,15 @@
 //
 // Plane Sweep + Dynamic AABB-Tree baseline (Variant::EnumSampling).
 //
-// This variant exposes a deterministic enumerator (sweep + AABB-tree) and
-// implements Sample() by two-pass rank sampling over that enumerator.
+// Baseline v2.0 design (Enumerate+Sampling):
+//   1) One plane sweep to enumerate *all* join pairs J into a vector Pairs.
+//   2) Uniform i.i.d. sampling with replacement by sampling indices in Pairs.
 //
-// In the experimental harness, EnumSampling variants are typically executed via
-// baselines::runners::RunEnumSamplingOnce(), which directly calls Enumerate()
-// and performs rank sampling itself. Still, we provide Sample() here for
-// completeness.
+// This is the "materialize then sample" baseline described in
+// "AABB-Tree Baseline v2.0.md". It is intentionally memory-heavy
+// (space Θ(|J|)) and serves as a correctness/quality reference.
 
 #include "sjs/baselines/aabb/sampling.h"
-#include "sjs/sampling/rank_sampling.h"
 
 #include <memory>
 #include <string>
@@ -45,10 +44,7 @@ class AABBEnumSamplingBaseline final : public IBaseline<Dim, T> {
 
     ds_ = &ds;
     built_ = true;
-    if (ds.R.Size() == 0 || ds.S.Size() == 0) {
-      // Empty relation is fine; enumeration will be empty.
-      return true;
-    }
+    // Empty relations are fine; enumeration will be empty.
     return true;
   }
 
@@ -57,8 +53,7 @@ class AABBEnumSamplingBaseline final : public IBaseline<Dim, T> {
              CountResult* out,
              PhaseRecorder* phases,
              std::string* err) override {
-    (void)cfg;
-    (void)rng;
+    (void)rng;  // deterministic
     if (!built_ || !ds_) {
       if (err) *err = "AABBEnumSamplingBaseline::Count: call Build() first";
       return false;
@@ -68,8 +63,7 @@ class AABBEnumSamplingBaseline final : public IBaseline<Dim, T> {
       return false;
     }
 
-    // Efficient exact count using the same Phase-1 scheme as the Sampling variant.
-    // (No randomness, no materialization of pairs.)
+    // Efficient exact count using the Sampling variant's Phase-1 scheme.
     auto scoped = phases ? phases->Scoped("count") : PhaseRecorder::ScopedPhase(nullptr, "");
     AABBSamplingBaseline<Dim, T> counter;
     if (!counter.Build(*ds_, /*cfg=*/cfg, phases, err)) return false;
@@ -99,22 +93,43 @@ class AABBEnumSamplingBaseline final : public IBaseline<Dim, T> {
     out->weighted = false;
     out->weights.clear();
 
-    const u64 t = cfg.run.t;
+    const u32 t = cfg.run.t;
     if (t == 0) return true;
 
-    auto scoped = phases ? phases->Scoped("rank_sampling") : PhaseRecorder::ScopedPhase(nullptr, "");
+    // --------------------------
+    // Phase 1: enumerate all join pairs into Pairs
+    // --------------------------
+    std::vector<PairId> pairs;
+    {
+      auto scoped = phases ? phases->Scoped("enumerate_pairs") : PhaseRecorder::ScopedPhase(nullptr, "");
 
-    auto stream = Enumerate(cfg, phases, err);
-    if (!stream) return false;
+      auto stream = Enumerate(cfg, phases, err);
+      if (!stream) return false;
 
-    std::vector<PairId> samples;
-    sampling::RankSamplingInfo info;
-    if (!sampling::RankSampleWithReplacement<IJoinEnumerator, PairId>(stream.get(), t, rng, &samples, &info, err)) {
-      return false;
+      PairId p;
+      while (stream->Next(&p)) {
+        pairs.push_back(p);
+      }
     }
 
-    // If join is empty, RankSampleWithReplacement returns 0 samples.
-    out->pairs = std::move(samples);
+    const u64 W = static_cast<u64>(pairs.size());
+    if (W == 0) {
+      // Empty join.
+      return true;
+    }
+
+    // --------------------------
+    // Phase 2: uniform i.i.d. sampling from the materialized array
+    // --------------------------
+    {
+      auto scoped = phases ? phases->Scoped("sample_from_pairs") : PhaseRecorder::ScopedPhase(nullptr, "");
+      out->pairs.resize(static_cast<usize>(t));
+      for (u32 i = 0; i < t; ++i) {
+        const u64 idx = rng->UniformU64(W);
+        out->pairs[static_cast<usize>(i)] = pairs[static_cast<usize>(idx)];
+      }
+    }
+
     return true;
   }
 
