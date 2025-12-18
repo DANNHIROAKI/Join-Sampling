@@ -90,7 +90,7 @@ static void TestSampleFromSubtreeUniformity(TestContext& t) {
   // Sample many times from the root.
   Rng rng(12345);
   const sjs::u32 num_samples = 10000;
-  std::vector<sjs::u32> counts(10, 0);
+  std::vector<sjs::u64> counts(10, 0);
 
   // Access the root node (we need to use a query that hits everything).
   // Since we can't directly access the root, we use SampleIntersect with a large query.
@@ -111,8 +111,7 @@ static void TestSampleFromSubtreeUniformity(TestContext& t) {
   }
 
   // Chi-square test for uniformity.
-  const auto chi2_result = sjs::sampling::quality::ChiSquareUniform(
-      sjs::Span<const sjs::u64>(reinterpret_cast<const sjs::u64*>(counts.data()), 10));
+  const auto chi2_result = sjs::sampling::quality::ChiSquareUniform(counts);
 
   // With 10 categories and 10000 samples, expected count per category = 1000.
   // Chi-square statistic should be small (well below critical value for df=9).
@@ -150,7 +149,7 @@ static void TestSampleIntersectUniformity(TestContext& t) {
   CHECK_EQ(t, tree.Size(), 8u);
 
   // Query that intersects all boxes.
-  const B2 query(P2{0.5}, P2{4.5});
+  const B2 query(P2{Scalar(0.5), Scalar(0.5)}, P2{Scalar(4.5), Scalar(4.5)});
 
   // Verify all boxes intersect the query.
   sjs::u64 count = tree.CountIntersect(query);
@@ -159,7 +158,7 @@ static void TestSampleIntersectUniformity(TestContext& t) {
   // Sample many times.
   Rng rng(54321);
   const sjs::u32 num_samples = 8000;
-  std::vector<sjs::u32> counts(8, 0);
+  std::vector<sjs::u64> counts(8, 0);
 
   for (sjs::u32 i = 0; i < num_samples; ++i) {
     std::vector<sjs::u32> samples;
@@ -174,8 +173,7 @@ static void TestSampleIntersectUniformity(TestContext& t) {
   }
 
   // Chi-square test for uniformity.
-  const auto chi2_result = sjs::sampling::quality::ChiSquareUniform(
-      sjs::Span<const sjs::u64>(reinterpret_cast<const sjs::u64*>(counts.data()), 8));
+  const auto chi2_result = sjs::sampling::quality::ChiSquareUniform(counts);
 
   // With 8 categories and 8000 samples, expected = 1000 each.
   // For df=7, p-value > 0.01 requires chi2 < ~18.48.
@@ -206,14 +204,14 @@ static void TestSampleIntersectBatchUniformity(TestContext& t) {
     CHECK(t, tree.Insert(i, box, &err));
   }
 
-  const B2 query(P2{0.0}, P2{5.0});
+  const B2 query(P2{Scalar(0.0), Scalar(0.0)}, P2{Scalar(5.0), Scalar(5.0)});
   CHECK_EQ(t, tree.CountIntersect(query), 5u);
 
   // Sample in batches of 10, many times.
   Rng rng(99999);
   const sjs::u32 num_batches = 1000;
   const sjs::u32 batch_size = 10;
-  std::vector<sjs::u32> counts(5, 0);
+  std::vector<sjs::u64> counts(5, 0);
 
   for (sjs::u32 b = 0; b < num_batches; ++b) {
     std::vector<sjs::u32> samples;
@@ -230,8 +228,7 @@ static void TestSampleIntersectBatchUniformity(TestContext& t) {
 
   // Chi-square test.
   const sjs::u32 total_samples = num_batches * batch_size;
-  const auto chi2_result = sjs::sampling::quality::ChiSquareUniform(
-      sjs::Span<const sjs::u64>(reinterpret_cast<const sjs::u64*>(counts.data()), 5));
+  const auto chi2_result = sjs::sampling::quality::ChiSquareUniform(counts);
 
   CHECK(t, chi2_result.p_value > 0.01);
   CHECK(t, chi2_result.df == 4u);
