@@ -1,21 +1,25 @@
 #pragma once
 // sjs/baselines/tsunami/enum_sampling.h
 //
-// Tsunami baseline (Variant::EnumSampling).
+// Tsunami baseline (Variant::EnumSampling) — strictly aligned with docs/Baseline/Tsunami’20 Baseline.md.
 //
-// This variant implements TSUNAMI-Enumerate-ArraySample per the baseline writeup:
-//  1. Enumerate all join pairs into AllPairs array
-//  2. Sample t pairs uniformly with replacement from AllPairs
+// This variant implements:
+//   TSUNAMI-Enumerate-ArraySample
 //
-// This is the naive but straightforward approach: enumerate first, then sample.
-// It has good constant factors for small joins but requires O(|J|) memory.
+// Algorithm (exact, i.i.d., uniform WITH replacement):
+//   - Enumerate the full join result J into an array AllPairs (Θ(|J|) memory).
+//   - Sample t indices i.i.d. uniformly from [0..|J|-1] and output AllPairs[idx].
+//
+// This is the most direct/naïve baseline and is intended to demonstrate the baseline limitation:
+// worst-case memory/time still depends on |J|.
 
 #include "sjs/baselines/tsunami/sampling.h"
 
-#include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace sjs {
@@ -35,11 +39,7 @@ class TsunamiEnumSamplingBaseline final : public IBaseline<Dim, T> {
   Variant variant() const noexcept override { return Variant::EnumSampling; }
   std::string_view Name() const noexcept override { return "tsunami_enum_sampling"; }
 
-  void Reset() override {
-    prep_.Reset();
-    counted_ = false;
-    all_pairs_.clear();
-  }
+  void Reset() override { prep_.Reset(); }
 
   bool Build(const DatasetT& ds, const Config& cfg, PhaseRecorder* phases, std::string* err) override {
     auto scoped = phases ? phases->Scoped("build") : PhaseRecorder::ScopedPhase(nullptr, "");
@@ -65,21 +65,18 @@ class TsunamiEnumSamplingBaseline final : public IBaseline<Dim, T> {
       return false;
     }
 
-    // Enumerate all pairs to get exact count and populate all_pairs_.
-    auto scoped = phases ? phases->Scoped("enumerate_all_pairs") : PhaseRecorder::ScopedPhase(nullptr, "");
-    
-    all_pairs_.clear();
+    // Exact count by streaming enumeration (no materialization needed for Count()).
+    auto scoped = phases ? phases->Scoped("count_by_stream_enumeration") : PhaseRecorder::ScopedPhase(nullptr, "");
     auto stream = Enumerate(cfg, phases, err);
     if (!stream) return false;
 
     stream->Reset();
     PairId tmp{};
+    u64 n = 0;
     while (stream->Next(&tmp)) {
-      all_pairs_.push_back(tmp);
+      ++n;
     }
-    
-    counted_ = true;
-    *out = MakeExactCount(static_cast<u64>(all_pairs_.size()));
+    *out = MakeExactCount(n);
     return true;
   }
 
@@ -109,27 +106,31 @@ class TsunamiEnumSamplingBaseline final : public IBaseline<Dim, T> {
     const u64 t = cfg.run.t;
     if (t == 0) return true;
 
-    // Ensure all pairs are enumerated.
-    if (!counted_) {
-      CountResult tmp;
-      if (!Count(cfg, /*rng=*/nullptr, &tmp, phases, err)) return false;
+    // Enumerate full join result into AllPairs (Θ(|J|) memory).
+    auto scoped = phases ? phases->Scoped("enumerate_all_pairs") : PhaseRecorder::ScopedPhase(nullptr, "");
+    std::vector<PairId> all_pairs;
+    {
+      auto stream = Enumerate(cfg, phases, err);
+      if (!stream) return false;
+
+      stream->Reset();
+      PairId tmp{};
+      while (stream->Next(&tmp)) {
+        all_pairs.push_back(tmp);
+      }
     }
 
-    if (all_pairs_.empty()) {
-      // Empty join.
-      return true;
+    const u64 W = static_cast<u64>(all_pairs.size());
+    if (W == 0) {
+      return true;  // empty join
     }
 
-    // Sample t pairs uniformly with replacement from AllPairs.
-    auto scoped = phases ? phases->Scoped("sample_from_all_pairs") : PhaseRecorder::ScopedPhase(nullptr, "");
-    const u64 W = static_cast<u64>(all_pairs_.size());
-    
+    // Array-sample with replacement.
     out->pairs.resize(static_cast<usize>(t));
     for (u64 i = 0; i < t; ++i) {
-      const u64 idx = rng->UniformU64(W);
-      out->pairs[static_cast<usize>(i)] = all_pairs_[static_cast<usize>(idx)];
+      const u64 idx = rng->UniformU64(W);  // [0..W-1]
+      out->pairs[static_cast<usize>(i)] = all_pairs[static_cast<usize>(idx)];
     }
-    
     return true;
   }
 
@@ -147,9 +148,6 @@ class TsunamiEnumSamplingBaseline final : public IBaseline<Dim, T> {
 
  private:
   detail::TsunamiPreproc<Dim, T> prep_;
-  
-  bool counted_ = false;
-  std::vector<PairId> all_pairs_;  // Explicit storage of all join pairs
 };
 
 }  // namespace tsunami

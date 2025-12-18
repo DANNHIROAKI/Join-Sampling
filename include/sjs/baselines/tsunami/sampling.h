@@ -1,40 +1,31 @@
 #pragma once
 // sjs/baselines/tsunami/sampling.h
 //
-// Tsunami baseline (Variant::Sampling).
+// Tsunami baseline (Variant::Sampling) — strictly aligned with docs/Baseline/Tsunami’20 Baseline.md.
 //
-// This baseline follows the idea in Tsunami’20-based writeup: reduce box
-// intersection join to a 2*Dim dimensional orthogonal range filtering problem
-// by encoding each box r as a point p(r) = (L_1..L_D, R_1..R_D), and for each
-// query box q run a range query equivalent to:
-//   for all i: L_i(r) < R_i(q)  AND  R_i(r) > L_i(q)
+// Goal: exact i.i.d. uniform sampling WITH replacement on the spatial intersection join result J.
 //
-// Sampling algorithm (exact, i.i.d., uniform WITH replacement):
-//   Pass 1: compute deg[q] for each query q and W = sum deg[q] = |J|.
-//   Draw t global ranks U_j ~ Unif{1..W} and sort.
-//   Pass 2: re-scan only those queries whose blocks contain at least one rank;
-//           within such a query, stop early once the maximum requested local
-//           rank is reached.
+// Baseline idea:
+//   1) Reduce box intersection join to a 2*Dim dimensional orthogonal range filtering problem:
+//        encode each data-side box r as a point
+//          p(r) = (L_1..L_D, R_1..R_D)
+//        and for each query-side box q build a 2*D dimensional range Q(q) such that:
+//          r intersects q  <=>  p(r) ∈ Q(q)
+//   2) Treat Tsunami as a black-box range filtering engine with interface:
+//        BuildTsunamiIndex(Points, WorkloadQueries) -> Index
+//        Query(Index, Q(q)) -> stream of matched ids
+//      In this repository we provide a small deterministic in-memory iterator to stand in for that
+//      interface; it can be swapped with a real Tsunami implementation without changing the sampling logic.
+//   3) Implement TSUNAMI-2Pass-RankSample (exact, i.i.d., uniform with replacement):
+//        Pass 1: compute deg[q] and W=Σdeg[q]=|J|
+//        Draw t global ranks U_j ~ Unif{1..W} and sort
+//        Pass 2: re-scan only the q-blocks that contain at least one rank; within a q-block stop early at umax.
 //
-// INDEX IMPLEMENTATION NOTE:
-//   The original Tsunami'20 paper uses Grid Tree + Augmented Grid as the learned
-//   multi-dimensional index. For this baseline, we use a StaticKDTree as a
-//   practical replacement that provides the same interface (range filtering over
-//   high-dimensional points) and deterministic query results. This substitution
-//   maintains the algorithmic correctness while making the implementation more
-//   accessible and reproducible.
-//
-// Implementation note (strict inequalities / half-open semantics):
-//   The Tsunami'20 paper suggests using integer coordinates with ±1 boundary
-//   adjustments (scaling floats to integers if needed). However, we use a
-//   floating-point approach with nextafter() because:
-//   1. It is exact for floating-point data without scaling errors
-//   2. It avoids the need for coordinate scaling/compression preprocessing
-//   3. It preserves the original data precision
-//   The condition R_i(r) > L_i(q) is encoded as:
-//     R_i(r) >= nextafter(L_i(q), +inf)
-//   so that a half-open range query [lo, +inf) matches the strict inequality.
-//   This is exact for floating-point Scalars.
+// Important correctness requirements (mirrors the baseline doc):
+//   - Deterministic join stream: query order A is fixed (we sort by object id), and for a fixed query q the
+//     range engine enumerates matches in a repeatable order.
+//   - Strict inequalities for half-open boxes are handled via "rank + secondary key" coordinate compression
+//     (Baseline §3.3, Scheme B). This avoids relying on +/-1 or floating epsilons and is provably exact.
 
 #include "sjs/baselines/baseline_api.h"
 
@@ -43,7 +34,7 @@
 #include "sjs/geometry/point.h"
 
 #include <algorithm>
-#include <cmath>
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -88,11 +79,6 @@ inline bool ParseSide(std::string_view s, join::Side* out) {
   return false;
 }
 
-inline join::Side ChooseIndexSideDefault(const Dataset<2>& ds) {
-  // Default: index the larger relation.
-  return (ds.S.Size() >= ds.R.Size()) ? join::Side::S : join::Side::R;
-}
-
 template <int Dim, class T>
 join::Side ChooseIndexSide(const Dataset<Dim, T>& ds, const Config& cfg) {
   // Config override: run.extra["tsunami.index_side"] in {"R","S","larger","smaller"}.
@@ -108,35 +94,31 @@ join::Side ChooseIndexSide(const Dataset<Dim, T>& ds, const Config& cfg) {
       return (ds.S.Size() <= ds.R.Size()) ? join::Side::S : join::Side::R;
     }
   }
-
-  // Default heuristic.
+  // Default heuristic: index the larger relation.
   return (ds.S.Size() >= ds.R.Size()) ? join::Side::S : join::Side::R;
 }
 
 // --------------------------
-// Static KD-tree with streaming range iterator.
+// Tsunami black-box adapter (streaming range filter).
 // --------------------------
-// We keep a small KD-tree implementation local to this baseline because we
-// need an incremental iterator (Next()) to implement deterministic join
-// enumeration without materializing full query results.
+// This is an adapter/stub that matches the baseline doc's black-box interface.
+// It is intentionally deterministic so that Pass1 and Pass2 see the same join stream order.
 //
-// NOTE: This serves as a practical replacement for Tsunami's Grid Tree +
-// Augmented Grid index, providing the same range filtering interface while
-// being simpler to implement and verify. The deterministic traversal order
-// ensures consistent results across runs.
+// If you later integrate a real Tsunami implementation, keep this interface and swap the internals.
 
 template <int K, class T>
-class StaticKDTree {
+class TsunamiIndexStub {
  public:
-  static_assert(std::is_floating_point_v<T>, "StaticKDTree requires floating-point T (for +/-inf and nextafter)");
+  static_assert(std::is_floating_point_v<T>,
+                "TsunamiIndexStub currently uses Box<K,T> with +/-inf Empty() sentinels; instantiate with floating T");
   using PointT = Point<K, T>;
-  using BoxT = Box<K, T>;
+  using RangeT = Box<K, T>;
 
   struct BuildOptions {
     u32 leaf_size = 16;
   };
 
-  StaticKDTree() = default;
+  TsunamiIndexStub() = default;
 
   void Clear() {
     points_.clear();
@@ -148,7 +130,12 @@ class StaticKDTree {
   usize Size() const noexcept { return points_.size(); }
   bool Empty() const noexcept { return points_.empty(); }
 
-  void Build(const std::vector<PointT>& points, BuildOptions opt = BuildOptions{}) {
+  // BuildTsunamiIndex(Points, WorkloadQueries) -> Index
+  // NOTE: The stub ignores WorkloadQueries, but we keep the signature to align with the baseline doc.
+  void Build(const std::vector<PointT>& points,
+             const std::vector<RangeT>& workload_queries,
+             BuildOptions opt = BuildOptions{}) {
+    (void)workload_queries;
     Clear();
     points_ = points;
     opt_ = opt;
@@ -161,9 +148,10 @@ class StaticKDTree {
     root_ = BuildRec(/*begin=*/0, /*end=*/static_cast<u32>(points_.size()));
   }
 
-  struct RangeIter {
-    const StaticKDTree* tree = nullptr;
-    BoxT range = BoxT::Empty();
+  // Query(Index, range) -> stream of matched ids (indices into Points)
+  struct QueryIter {
+    const TsunamiIndexStub* tree = nullptr;
+    RangeT range = RangeT::Empty();
     std::vector<u32> stack;
 
     // Leaf scan state.
@@ -174,11 +162,11 @@ class StaticKDTree {
     // Optional counter for diagnostics.
     u64* candidate_checks = nullptr;
 
-    RangeIter() = default;
+    QueryIter() = default;
 
-    RangeIter(const StaticKDTree* t, const BoxT& r, u64* cand = nullptr) { Reset(t, r, cand); }
+    QueryIter(const TsunamiIndexStub* t, const RangeT& r, u64* cand = nullptr) { Reset(t, r, cand); }
 
-    void Reset(const StaticKDTree* t, const BoxT& r, u64* cand = nullptr) {
+    void Reset(const TsunamiIndexStub* t, const RangeT& r, u64* cand = nullptr) {
       tree = t;
       range = r;
       candidate_checks = cand;
@@ -235,7 +223,7 @@ class StaticKDTree {
   static constexpr u32 kNull = std::numeric_limits<u32>::max();
 
   struct Node {
-    BoxT bbox = BoxT::Empty();
+    RangeT bbox = RangeT::Empty();
     u32 left = kNull;
     u32 right = kNull;
     u32 begin = 0;
@@ -251,15 +239,15 @@ class StaticKDTree {
   u32 root_ = kNull;
   BuildOptions opt_{};
 
-  BoxT ComputeBounds(u32 begin, u32 end) const {
-    BoxT b = BoxT::Empty();
+  RangeT ComputeBounds(u32 begin, u32 end) const {
+    RangeT b = RangeT::Empty();
     for (u32 i = begin; i < end; ++i) {
       b.ExpandToIncludePoint(points_[indices_[i]]);
     }
     return b;
   }
 
-  int ChooseSplitAxis(const BoxT& bbox) const noexcept {
+  int ChooseSplitAxis(const RangeT& bbox) const noexcept {
     int axis = 0;
     T best = bbox.Width(0);
     for (int d = 1; d < K; ++d) {
@@ -342,54 +330,123 @@ class StaticKDTree {
 };
 
 // --------------------------
-// Box -> point embedding for Tsunami baseline.
+// Rank + secondary-key coordinate encoding (Baseline §3.3, Scheme B).
 // --------------------------
+//
+// For each of the K=2*Dim axes, build a strict total order of the data-side attribute values
+// using the key (value, record_id). Each data record gets a unique rank per axis, even when
+// values repeat. Strict inequalities in the original domain are mapped to half-open rank ranges:
+//   X < b  -> rank(X) in [0, lower_bound((b, MIN_ID)))
+//   X > a  -> rank(X) in [upper_bound((a, MAX_ID)), N)
+// where N is the number of data records.
+// This makes half-open box intersection conditions provably exact without epsilons.
+//
+// NOTE: This transform is only used to make strict inequalities executable and exact.
+// The range filtering engine indexes rank-points and answers rank-ranges.
+
+template <class T>
+inline bool KeyLess(const std::pair<T, Id>& a, const std::pair<T, Id>& b) noexcept {
+  if (a.first < b.first) return true;
+  if (b.first < a.first) return false;
+  return a.second < b.second;
+}
 
 template <int Dim, class T>
-struct TsunamiEmbedding {
-  static_assert(Dim >= 1, "TsunamiEmbedding: Dim must be >= 1");
+class TsunamiRankEncoding {
+ public:
+  static_assert(Dim >= 1, "TsunamiRankEncoding requires Dim >= 1");
   static constexpr int K = 2 * Dim;
-  static_assert(K <= kMaxSupportedDim,
-                "TsunamiEmbedding uses Point<2*Dim>; increase kMaxSupportedDim or reduce Dim");
-  static_assert(std::is_floating_point_v<T>, "TsunamiEmbedding requires floating-point T (Scalar)");
-
-  using BoxT = Box<Dim, T>;
   using PointK = Point<K, T>;
   using RangeBox = Box<K, T>;
+  using BoxT = Box<Dim, T>;
 
-  static PointK Encode(const BoxT& b) {
+  struct Axis {
+    // Sorted (value, id) keys for this axis; size == n_data
+    std::vector<std::pair<T, Id>> keys;
+    // rank_of_data_idx[data_idx] = rank position in keys[]
+    std::vector<u32> rank_of_data_idx;
+
+    void Clear() {
+      keys.clear();
+      rank_of_data_idx.clear();
+    }
+
+    usize Size() const noexcept { return keys.size(); }
+
+    // lower_bound((bound, MIN_ID))
+    usize LowerBoundByValue(const T& bound) const {
+      const Id kMinId = std::numeric_limits<Id>::lowest();
+      const std::pair<T, Id> probe{bound, kMinId};
+      return static_cast<usize>(std::lower_bound(keys.begin(), keys.end(), probe, KeyLess<T>) - keys.begin());
+    }
+
+    // upper_bound((bound, MAX_ID))
+    usize UpperBoundByValue(const T& bound) const {
+      const Id kMaxId = std::numeric_limits<Id>::max();
+      const std::pair<T, Id> probe{bound, kMaxId};
+      return static_cast<usize>(std::upper_bound(keys.begin(), keys.end(), probe, KeyLess<T>) - keys.begin());
+    }
+  };
+
+  void Reset() {
+    n_data_ = 0;
+    for (auto& a : axes_) a.Clear();
+  }
+
+  usize n_data() const noexcept { return n_data_; }
+  const std::array<Axis, K>& axes() const noexcept { return axes_; }
+
+  // Build axis ranks from the data-side relation.
+  template <class RelT>
+  void BuildFromDataRel(const RelT& rel_data) {
+    Reset();
+    n_data_ = rel_data.Size();
+    for (int axis = 0; axis < K; ++axis) {
+      BuildAxis(rel_data, axis);
+    }
+  }
+
+  // Encode a data-side record (by index) into a K-dim rank point.
+  PointK EncodeDataPoint(u32 data_idx) const {
     PointK p;
-    for (int i = 0; i < Dim; ++i) {
-      p.v[static_cast<usize>(i)] = b.lo.v[static_cast<usize>(i)];
-      p.v[static_cast<usize>(Dim + i)] = b.hi.v[static_cast<usize>(i)];
+    for (int axis = 0; axis < K; ++axis) {
+      const u32 r = axes_[axis].rank_of_data_idx[static_cast<usize>(data_idx)];
+      p.v[static_cast<usize>(axis)] = static_cast<T>(r);
     }
     return p;
   }
 
-  // Build the 2*Dim query range for a query box q.
-  // Returns false if the implied range is empty.
-  static bool MakeQueryRange(const BoxT& q, RangeBox* out) {
+  // Build the K-dim rank range for a query box q.
+  // Returns false if the implied rank-range is empty.
+  bool MakeQueryRange(const BoxT& q, RangeBox* out) const {
     if (!out) return false;
     if (q.IsEmpty()) {
       *out = RangeBox::Empty();
       return false;
     }
 
-    const T pinf = std::numeric_limits<T>::infinity();
-    const T ninf = -std::numeric_limits<T>::infinity();
-
+    // N can be 0.
+    const usize N = n_data_;
     PointK lo;
     PointK hi;
-    for (int i = 0; i < Dim; ++i) {
-      // L_i(r) < R_i(q)  ->  L_i(r) in (-inf, R_i(q))
-      lo.v[static_cast<usize>(i)] = ninf;
-      hi.v[static_cast<usize>(i)] = q.hi.v[static_cast<usize>(i)];
 
-      // R_i(r) > L_i(q)  ->  R_i(r) in (L_i(q), +inf)
-      // Represent strict lower bound using nextafter.
-      const T open_lo = std::nextafter(q.lo.v[static_cast<usize>(i)], pinf);
-      lo.v[static_cast<usize>(Dim + i)] = open_lo;
-      hi.v[static_cast<usize>(Dim + i)] = pinf;
+    // First Dim axes are L_i(r) values: require L_i(r) < R_i(q).
+    // Second Dim axes are R_i(r) values: require R_i(r) > L_i(q).
+    for (int i = 0; i < Dim; ++i) {
+      const usize axis_L = static_cast<usize>(i);
+      const usize axis_R = static_cast<usize>(Dim + i);
+
+      const T bound_hi = q.hi.v[static_cast<usize>(i)];
+      const T bound_lo = q.lo.v[static_cast<usize>(i)];
+
+      const usize hi_rank = axes_[axis_L].LowerBoundByValue(bound_hi);    // [0..N]
+      const usize lo_rank = axes_[axis_R].UpperBoundByValue(bound_lo);    // [0..N]
+
+      lo.v[axis_L] = static_cast<T>(0);
+      hi.v[axis_L] = static_cast<T>(hi_rank);
+
+      lo.v[axis_R] = static_cast<T>(lo_rank);
+      hi.v[axis_R] = static_cast<T>(N);
     }
 
     RangeBox range(lo, hi);
@@ -399,6 +456,52 @@ struct TsunamiEmbedding {
     }
     *out = range;
     return true;
+  }
+
+ private:
+  usize n_data_ = 0;
+  std::array<Axis, K> axes_{};
+
+  template <class RelT>
+  void BuildAxis(const RelT& rel_data, int axis) {
+    Axis& A = axes_[static_cast<usize>(axis)];
+    A.Clear();
+    A.keys.reserve(n_data_);
+    A.rank_of_data_idx.assign(n_data_, 0U);
+
+    // Temporary array with data_idx so we can write rank_of_data_idx.
+    struct Tmp {
+      T v;
+      Id id;
+      u32 data_idx;
+    };
+    std::vector<Tmp> tmp;
+    tmp.reserve(n_data_);
+
+    for (usize i = 0; i < n_data_; ++i) {
+      const auto& b = rel_data.boxes[i];
+      const Id id = rel_data.GetId(i);
+
+      T v{};
+      if (axis < Dim) {
+        v = b.lo.v[static_cast<usize>(axis)];
+      } else {
+        v = b.hi.v[static_cast<usize>(axis - Dim)];
+      }
+      tmp.push_back(Tmp{v, id, static_cast<u32>(i)});
+    }
+
+    std::sort(tmp.begin(), tmp.end(), [](const Tmp& a, const Tmp& b) {
+      if (a.v < b.v) return true;
+      if (b.v < a.v) return false;
+      return a.id < b.id;
+    });
+
+    A.keys.resize(n_data_);
+    for (usize pos = 0; pos < n_data_; ++pos) {
+      A.keys[pos] = std::pair<T, Id>{tmp[pos].v, tmp[pos].id};
+      A.rank_of_data_idx[static_cast<usize>(tmp[pos].data_idx)] = static_cast<u32>(pos);
+    }
   }
 };
 
@@ -413,10 +516,11 @@ class TsunamiPreproc {
   using RelT = Relation<Dim, T>;
   using BoxT = Box<Dim, T>;
   static constexpr int K = 2 * Dim;
-  using Embed = TsunamiEmbedding<Dim, T>;
-  using PointK = typename Embed::PointK;
-  using RangeBox = typename Embed::RangeBox;
-  using KD = StaticKDTree<K, T>;
+
+  using PointK = Point<K, T>;
+  using RangeBox = Box<K, T>;
+  using IndexT = TsunamiIndexStub<K, T>;
+  using RankEnc = TsunamiRankEncoding<Dim, T>;
 
   void Reset() {
     ds_ = nullptr;
@@ -426,8 +530,10 @@ class TsunamiPreproc {
     rel_query_ = nullptr;
     rel_data_ = nullptr;
     query_order_.clear();
-    points_.clear();
-    kd_.Clear();
+    rank_points_.clear();
+    workload_ranges_.clear();
+    index_.Clear();
+    rank_enc_.Reset();
   }
 
   bool Build(const DatasetT& ds, const Config& cfg, PhaseRecorder* phases, std::string* err) {
@@ -443,7 +549,7 @@ class TsunamiPreproc {
     rel_query_ = (query_side_ == join::Side::R) ? &ds.R : &ds.S;
     rel_data_ = (index_side_ == join::Side::R) ? &ds.R : &ds.S;
 
-    // Deterministic query order: by stable object id ascending.
+    // Deterministic query order A: by stable object id ascending.
     {
       auto _ = phases ? phases->Scoped("tsunami_build_query_order") : PhaseRecorder::ScopedPhase(nullptr, "");
       query_order_.resize(rel_query_->Size());
@@ -457,14 +563,53 @@ class TsunamiPreproc {
       });
     }
 
-    // Encode data side boxes to points and build KD-tree.
+    // Build rank encoding (Scheme B) from the data-side relation.
+    {
+      auto _ = phases ? phases->Scoped("tsunami_build_rank_encoding") : PhaseRecorder::ScopedPhase(nullptr, "");
+      rank_enc_.BuildFromDataRel(*rel_data_);
+    }
+
+    // Encode data-side boxes to rank points.
+    {
+      auto _ = phases ? phases->Scoped("tsunami_build_points") : PhaseRecorder::ScopedPhase(nullptr, "");
+      rank_points_.reserve(rel_data_->Size());
+      for (usize i = 0; i < rel_data_->Size(); ++i) {
+        rank_points_.push_back(rank_enc_.EncodeDataPoint(static_cast<u32>(i)));
+      }
+    }
+
+    // Build workload query set WorkloadQueries = {Q(q) | q in A}.
+    {
+      auto _ = phases ? phases->Scoped("tsunami_build_workload_queries") : PhaseRecorder::ScopedPhase(nullptr, "");
+      workload_ranges_.resize(query_order_.size());
+      const auto& rel_q = *rel_query_;
+      for (usize qi = 0; qi < query_order_.size(); ++qi) {
+        const u32 q_idx = query_order_[qi];
+        const BoxT& q = rel_q.boxes[static_cast<usize>(q_idx)];
+        RangeBox range;
+        if (!rank_enc_.MakeQueryRange(q, &range)) {
+          workload_ranges_[qi] = RangeBox::Empty();
+        } else {
+          workload_ranges_[qi] = range;
+        }
+      }
+    }
+
+    // Build index: BuildTsunamiIndex(Points, WorkloadQueries).
     {
       auto _ = phases ? phases->Scoped("tsunami_build_index") : PhaseRecorder::ScopedPhase(nullptr, "");
-      points_.reserve(rel_data_->Size());
-      for (const auto& b : rel_data_->boxes) {
-        points_.push_back(Embed::Encode(b));
+      typename IndexT::BuildOptions opt{};
+      // Optional: cfg.run.extra["tsunami.leaf_size"] (stub only).
+      auto it = cfg.run.extra.find("tsunami.leaf_size");
+      if (it != cfg.run.extra.end()) {
+        try {
+          const int v = std::stoi(it->second);
+          if (v > 0) opt.leaf_size = static_cast<u32>(v);
+        } catch (...) {
+          // ignore parse failure; keep default
+        }
       }
-      kd_.Build(points_, typename KD::BuildOptions{});
+      index_.Build(rank_points_, workload_ranges_, opt);
     }
 
     built_ = true;
@@ -476,6 +621,7 @@ class TsunamiPreproc {
 
   join::Side query_side() const noexcept { return query_side_; }
   join::Side index_side() const noexcept { return index_side_; }
+
   const RelT& QueryRel() const {
     SJS_DASSERT(rel_query_);
     return *rel_query_;
@@ -484,10 +630,16 @@ class TsunamiPreproc {
     SJS_DASSERT(rel_data_);
     return *rel_data_;
   }
-  const std::vector<u32>& QueryOrder() const noexcept { return query_order_; }
-  const KD& Index() const noexcept { return kd_; }
 
-  bool MakeRangeForQuery(const BoxT& q, RangeBox* out) const { return Embed::MakeQueryRange(q, out); }
+  const std::vector<u32>& QueryOrder() const noexcept { return query_order_; }
+  const std::vector<RangeBox>& WorkloadRanges() const noexcept { return workload_ranges_; }
+  const IndexT& Index() const noexcept { return index_; }
+
+  // Range for a query block position qi (aligned with QueryOrder()).
+  const RangeBox& RangeAt(usize qi) const {
+    SJS_DASSERT(qi < workload_ranges_.size());
+    return workload_ranges_[qi];
+  }
 
   // Convert (query index into QueryRel, data index into DataRel) into PairId in (R,S) order.
   PairId MakePair(u32 q_idx, u32 data_idx) const {
@@ -511,8 +663,10 @@ class TsunamiPreproc {
 
   std::vector<u32> query_order_;
 
-  std::vector<PointK> points_;
-  KD kd_;
+  RankEnc rank_enc_;
+  std::vector<PointK> rank_points_;
+  std::vector<RangeBox> workload_ranges_;  // aligned with query_order_ (i.e., A[1..n1] order)
+  IndexT index_;
 };
 
 // --------------------------
@@ -522,14 +676,11 @@ class TsunamiPreproc {
 template <int Dim, class T>
 class TsunamiJoinEnumerator final : public IJoinEnumerator {
  public:
-  using BoxT = Box<Dim, T>;
   using Preproc = TsunamiPreproc<Dim, T>;
-  static constexpr int K = 2 * Dim;
-  using Embed = TsunamiEmbedding<Dim, T>;
-  using RangeBox = typename Embed::RangeBox;
-  using KD = typename Preproc::KD;
+  using IndexT = typename Preproc::IndexT;
+  using RangeBox = typename Preproc::RangeBox;
 
-  TsunamiJoinEnumerator(const Preproc* prep)
+  explicit TsunamiJoinEnumerator(const Preproc* prep)
       : prep_(prep) {
     Reset();
   }
@@ -539,7 +690,7 @@ class TsunamiJoinEnumerator final : public IJoinEnumerator {
     q_pos_ = 0;
     cur_q_idx_ = 0;
     has_iter_ = false;
-    iter_ = typename KD::RangeIter{};
+    iter_ = typename IndexT::QueryIter{};
     cand_ = 0;
   }
 
@@ -547,14 +698,12 @@ class TsunamiJoinEnumerator final : public IJoinEnumerator {
     if (!out) return false;
     if (!prep_ || !prep_->built()) return false;
 
-    const auto& rel_q = prep_->QueryRel();
     const auto& order = prep_->QueryOrder();
 
     while (true) {
       if (has_iter_) {
         usize data_pt = 0;
         if (iter_.Next(&data_pt)) {
-          // data_pt is an index into DataRel().boxes
           *out = prep_->MakePair(cur_q_idx_, static_cast<u32>(data_pt));
           ++stats_.output_pairs;
           stats_.candidate_checks = cand_;
@@ -569,14 +718,13 @@ class TsunamiJoinEnumerator final : public IJoinEnumerator {
         return false;
       }
 
+      const usize qi = q_pos_;
       cur_q_idx_ = order[q_pos_++];
       ++stats_.num_events;  // treat each query as an "event" for bookkeeping
 
-      RangeBox range;
-      const BoxT& q = rel_q.boxes[static_cast<usize>(cur_q_idx_)];
-      if (!prep_->MakeRangeForQuery(q, &range)) {
-        // Empty range => no matches.
-        continue;
+      const RangeBox& range = prep_->RangeAt(qi);
+      if (range.IsEmpty()) {
+        continue;  // no matches for this query
       }
 
       iter_.Reset(&prep_->Index(), range, &cand_);
@@ -585,7 +733,6 @@ class TsunamiJoinEnumerator final : public IJoinEnumerator {
   }
 
   const join::JoinStats& Stats() const noexcept override {
-    // Keep candidate_checks in sync with the iterator's running counter.
     stats_.candidate_checks = cand_;
     return stats_;
   }
@@ -593,14 +740,12 @@ class TsunamiJoinEnumerator final : public IJoinEnumerator {
  private:
   const Preproc* prep_ = nullptr;
 
-  // NOTE: Stats() is const but the interface returns a const reference; we
-  // keep candidate_checks in sync by marking stats_ mutable.
   mutable join::JoinStats stats_;
   usize q_pos_ = 0;
   u32 cur_q_idx_ = 0;
 
   bool has_iter_ = false;
-  typename KD::RangeIter iter_;
+  typename IndexT::QueryIter iter_;
   u64 cand_ = 0;
 };
 
@@ -653,7 +798,7 @@ bool TwoPassRankSampleUsingDeg(const TsunamiPreproc<Dim, T>& prep,
 
   auto scoped = phases ? phases->Scoped("tsunami_pass2_rank_sample") : PhaseRecorder::ScopedPhase(nullptr, "");
 
-  // Draw ranks.
+  // Draw i.i.d. global ranks with replacement.
   std::vector<RankRec> ranks;
   ranks.resize(static_cast<usize>(t));
   for (u64 i = 0; i < t; ++i) {
@@ -664,8 +809,8 @@ bool TwoPassRankSampleUsingDeg(const TsunamiPreproc<Dim, T>& prep,
 
   out_pairs->assign(static_cast<usize>(t), PairId{});
 
-  const auto& rel_q = prep.QueryRel();
   const auto& order = prep.QueryOrder();
+  const auto& ranges = prep.WorkloadRanges();
 
   u64 g = 0;      // processed pairs so far
   usize p = 0;    // pointer into ranks
@@ -678,7 +823,6 @@ bool TwoPassRankSampleUsingDeg(const TsunamiPreproc<Dim, T>& prep,
 
     const u64 deg = deg_order[qi];
     if (deg == 0) {
-      // No pairs in this block.
       continue;
     }
 
@@ -700,14 +844,13 @@ bool TwoPassRankSampleUsingDeg(const TsunamiPreproc<Dim, T>& prep,
 
     // Execute query and stop early at umax.
     const u32 q_idx = order[qi];
-    typename TsunamiEmbedding<Dim, T>::RangeBox range;
-    const auto& qbox = rel_q.boxes[static_cast<usize>(q_idx)];
-    if (!prep.MakeRangeForQuery(qbox, &range)) {
+    const auto& range = ranges[qi];
+    if (range.IsEmpty()) {
       if (err) *err = "TwoPassRankSampleUsingDeg: empty range for a query that should have matches";
       return false;
     }
 
-    typename TsunamiPreproc<Dim, T>::KD::RangeIter it(&prep.Index(), range);
+    typename TsunamiPreproc<Dim, T>::IndexT::QueryIter it(&prep.Index(), range);
     u64 c = 0;
     usize j = 0;
     usize data_pt = 0;
@@ -739,7 +882,7 @@ bool TwoPassRankSampleUsingDeg(const TsunamiPreproc<Dim, T>& prep,
 }  // namespace detail
 
 // --------------------------
-// TsunamiSamplingBaseline
+// TsunamiSamplingBaseline  (TSUNAMI-2Pass-RankSample)
 // --------------------------
 
 template <int Dim, class T = Scalar>
@@ -752,7 +895,6 @@ class TsunamiSamplingBaseline final : public IBaseline<Dim, T> {
   using DatasetT = Dataset<Dim, T>;
   using BoxT = Box<Dim, T>;
 
-  // NOTE: Method::Tsunami is not in core/types.h yet. We return Unknown for now.
   Method method() const noexcept override { return Method::Tsunami; }
   Variant variant() const noexcept override { return Variant::Sampling; }
   std::string_view Name() const noexcept override { return "tsunami_sampling"; }
@@ -767,8 +909,7 @@ class TsunamiSamplingBaseline final : public IBaseline<Dim, T> {
   bool Build(const DatasetT& ds, const Config& cfg, PhaseRecorder* phases, std::string* err) override {
     auto scoped = phases ? phases->Scoped("build") : PhaseRecorder::ScopedPhase(nullptr, "");
     Reset();
-    if (!prep_.Build(ds, cfg, phases, err)) return false;
-    return true;
+    return prep_.Build(ds, cfg, phases, err);
   }
 
   bool Count(const Config& cfg,
@@ -791,23 +932,20 @@ class TsunamiSamplingBaseline final : public IBaseline<Dim, T> {
 
     auto scoped = phases ? phases->Scoped("phase1_count") : PhaseRecorder::ScopedPhase(nullptr, "");
 
-    const auto& rel_q = prep_.QueryRel();
     const auto& order = prep_.QueryOrder();
+    const auto& ranges = prep_.WorkloadRanges();
 
     deg_order_.assign(order.size(), 0ULL);
     u64 W = 0;
 
     for (usize qi = 0; qi < order.size(); ++qi) {
-      const u32 q_idx = order[qi];
-      const BoxT& q = rel_q.boxes[static_cast<usize>(q_idx)];
-
-      typename detail::TsunamiEmbedding<Dim, T>::RangeBox range;
-      if (!prep_.MakeRangeForQuery(q, &range)) {
+      const auto& range = ranges[qi];
+      if (range.IsEmpty()) {
         deg_order_[qi] = 0;
         continue;
       }
 
-      typename detail::TsunamiPreproc<Dim, T>::KD::RangeIter it(&prep_.Index(), range);
+      typename detail::TsunamiPreproc<Dim, T>::IndexT::QueryIter it(&prep_.Index(), range);
       u64 deg = 0;
       usize data_pt = 0;
       while (it.Next(&data_pt)) {
@@ -867,7 +1005,7 @@ class TsunamiSamplingBaseline final : public IBaseline<Dim, T> {
       return true;
     }
 
-    auto scoped = phases ? phases->Scoped("phase2_3_sample") : PhaseRecorder::ScopedPhase(nullptr, "");
+    auto scoped = phases ? phases->Scoped("phase2_pass2_locate") : PhaseRecorder::ScopedPhase(nullptr, "");
 
     std::vector<PairId> pairs;
     if (!detail::TwoPassRankSampleUsingDeg(prep_, deg_order_, W_, t, rng, &pairs, phases, err)) {

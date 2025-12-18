@@ -1,8 +1,21 @@
-# 1. 问题定义与分析（对齐 Spatial Join Sampling）+ 引用 Tsunami’20
+# Tsunami‑JSS Baseline 设计报告（90+版）
 
-## 1.1 输入、join 结果与采样目标
+## 0. Baseline 总览（给读者的 5 行结论）
 
-给定两个集合（两张表）的轴对齐半开盒子（MBR）：
+我们要在 spatial intersection join 的结果集合 $J$ 上做 **exact i.i.d. uniform sampling with replacement**。Baseline 不利用几何结构（如 plane sweep/分解），而是把“盒子相交”转为“高维点的范围过滤”，并把 **Tsunami** 当作一个强力的 learned multi‑dimensional range filtering 引擎来加速过滤。随后用三种策略实现均匀抽样：
+
+1. **Sampling（2Pass‑RankSample）**：两遍扫描 join stream，用全局 rank 定位样本；
+2. **Enumerate+Sampling（ArraySample）**：枚举全部 $J$ 到数组后抽样；
+3. **Adaptive+Sampling**：输出小则枚举，大则切换到 2Pass 方案，避免内存爆炸。
+    三者都能保证 **exact i.i.d. uniform with replacement**，但最坏复杂度仍会依赖 $|J|$（这是 baseline 的局限性，用来凸显你们 Ours 的优势）。
+
+------
+
+# 1. 问题定义与分析
+
+## 1.1 输入、Join 结果与采样目标
+
+给定两类轴对齐半开盒（MBR）集合：
 
 - $R_c=\{r_{c1},\dots,r_{c n_1}\}$
 - $R_{\bar c}=\{r_{\bar c1},\dots,r_{\bar c n_2}\}$
@@ -11,282 +24,367 @@
 $$
 r=\prod_{i=1}^{d}[L_i(r),R_i(r)),\quad L_i(r)<R_i(r).
 $$
-只关心跨集合相交对（intersection join / filter step）：
+只关心跨集合的相交对（intersection join / filter step）：
 $$
 J=\{(r_c,r_{\bar c})\mid r_c\in R_c,\ r_{\bar c}\in R_{\bar c},\ r_c\cap r_{\bar c}\neq\varnothing\}.
 $$
-半开区间相交判定为（逐维）：
+半开区间相交判定（逐维）：
 $$
 r_c\cap r_{\bar c}\neq\varnothing \iff \forall i,\ \max(L_i(r_c),L_i(r_{\bar c}))<\min(R_i(r_c),R_i(r_{\bar c})).
 $$
-（这与您给出的对齐描述一致。） 
-
-**采样目标（你们研究的标准目标）**：输出 $t$ 个样本
+**采样目标**：输出 $t$ 个样本
 $$
 Z_1,\dots,Z_t\in J
 $$
 满足 **i.i.d. 均匀有放回**：
 $$
-\Pr(Z_j=P)=\frac1{|J|}\ (\forall P\in J),\qquad Z_1,\dots,Z_t\ \text{相互独立}.
+\Pr(Z_j=P)=\frac1{|J|}\ \ (\forall P\in J),\qquad Z_1,\dots,Z_t\ \text{相互独立}.
 $$
 
+> 这里的目标与 “Spatial Join Sampling” 语境完全一致：抽样对象是 join pair，分布必须是对 $J$ 的**严格均匀分布**（而非近似/加权）。
 
 ------
 
-## 1.2 Baseline 的核心思路：把“盒子相交”转为“点的高维范围过滤”
+## 1.2 Baseline 的核心思想：Box‑intersection → 2d‑dim point range filtering
 
-Tsunami 本质索引的是**点记录**，而我们的对象是**盒子**。Baseline 采用标准转换：
+Tsunami 原生索引的是 **点（records/points）**，而 spatial join 的对象是 **盒子**。Baseline 采用标准转换：
 
-对每个盒子 $r\in R_{\bar c}$ 编码为 $2d$ 维点
+对每个被索引侧盒子 $r$ 编码为 $2d$ 维点：
 $$
 p(r)=\big(L_1(r),\dots,L_d(r),\ R_1(r),\dots,R_d(r)\big)\in\mathbb{R}^{2d}.
 $$
-盒子 $q\in R_c$ 与 $r$ 相交当且仅当对所有维度 $i$：
+对查询侧盒子 $q$，与 $r$ 相交当且仅当对所有维度 $i$：
 
 - $L_i(r) < R_i(q)$
 - $R_i(r) > L_i(q)$
 
-这等价于对点 $p(r)$ 做一个 $2d$ 维正交范围查询（部分维度是 $(-\infty,\cdot)$、$(\cdot,+\infty)$ 形式）。 
+因此可等价为：点 $p(r)$ 落入一个 $2d$ 维正交范围查询（其中部分维度是半无限区间 $(-\infty,\cdot)$ 或 $(\cdot,+\infty)$）。
 
-因此 join 的“枚举/计数”可以通过“对每个 $q\in R_c$ 做一次 Tsunami range filter 得到匹配集合”完成。
-
-------
-
-## 1.3 引用 Tsunami’20 的关键内容（我们 baseline 依赖哪些“论文要点”）
-
-**论文信息**：*Tsunami: A Learned Multi-dimensional Index for Correlated Data and Skewed Workloads*（Ding, Nathan, Alizadeh, Kraska）。 
-
-Baseline 将 Tsunami 当作“range filtering 引擎”，主要继承以下内容（与实验/实现强相关）：
-
-1. **目标查询形态是多维范围谓词过滤**（典型 SQL 形式的多维范围过滤）。
-2. **结构与查询流程**：Tsunami 由 **Grid Tree + Augmented Grid** 组成；查询时先定位相交 region，再在 region 内定位 cell ranges，并通过 lookup table 映射到物理存储区间，最后扫描并检查过滤谓词。
-3. **线性代价模型**（用于分析/解释性能趋势）：
-
-$$
-\text{Time}=w_0(\#\text{cell ranges})+w_1(\#\text{scanned points})(\#\text{filtered dims})
-$$
-
-其中 filtered dims 在我们 baseline 中固定为 $2d$。
-
-4. **工程实现习惯**：实验实现使用 64-bit integer 属性；若是浮点属性会缩放为整数。这个点对我们处理“严格不等号/半开边界”很关键。
+> 直观上：相交要求 “$r$ 的左端点在 $q$ 右端点左侧” 且 “$r$ 的右端点在 $q$ 左端点右侧”。这正好是对 $(L,R)$ 端点坐标的二维不等式集合（每一维各两条）。
 
 ------
 
-## 1.4 Baseline 的研究定位（为什么“合理且强”）
+## 1.3 Baseline 的研究定位：为什么“合理且强”
 
-- 这是一个**强 DB/系统派 baseline**：它不引入你们论文的特殊几何结构，而是借助 Tsunami’20 的 learned multi‑dim index 做 range filtering（很多 reviewer 会认可）。
-- 它能做到 **exact i.i.d. uniform with replacement**（不是近似、不是加权近似）。
-- 其缺点也很“baseline 化”：为了保证严格均匀，仍不可避免要“触及/计数”大量输出，最坏仍 $\Omega(|J|)$。
-
-------
-
-# 2. 核心数据结构
-
-## 2.1 点编码与查询范围（Box → Point）
-
-令被索引侧 $B:=R_{\bar c}$，查询侧 $A:=R_c$（也可互换，通常把更大的一侧放进 Tsunami 更合算）。
-
-**点编码：**
-$$
-p(r)=\big(L_1(r),\dots,L_d(r),R_1(r),\dots,R_d(r)\big)\in\mathbb{R}^{2d}.
-$$
-
-
-**查询范围（理论形式）：** 对 $q\in A$，相交条件等价于：
-$$
-\forall i:\quad L_i(r) < R_i(q)\ \land\ R_i(r) > L_i(q).
-$$
-对应 $2d$ 维范围：
-
-- 第 1..d 维（存 $L_i(r)$）：$(-\infty,\ R_i(q))$
-- 第 d+1..2d 维（存 $R_i(r)$）：$(L_i(q),\ +\infty)$
-
-
+- **强系统 baseline**：不使用你们方法里的几何分解/模式结构，而是借助 Tsunami 的 learned multi‑dim index 做高维过滤，属于系统/DB reviewer 常认可的对照思路。
+- **抽样是 exact**：通过 rank‑based 的定位方案，可实现严格 i.i.d. uniform with replacement（不是近似）。
+- **局限性也“baseline 化”**：在我们将 Tsunami 当作 *range filter engine* 并通过“遍历返回的匹配结果”来计数/枚举的接口模型下，要做到严格均匀往往不可避免地触及大量输出，最坏仍会依赖 $|J|$（这正是它与 Ours 的本质差异点）。
 
 ------
 
-## 2.2 严格不等号/半开边界的“可执行化”（强烈建议写进实现细节）
+# 2. 引用 Tsunami’20/’21 的关键内容
 
-Tsunami 在实现中偏好整数域（64-bit integer），浮点会缩放成整数。
- 因此 baseline 需要把严格不等号转成可执行的整数边界。
+> 这里不是复述 Tsunami 全文，而是明确：baseline 使用 Tsunami 的哪些机制/假设，哪些是我们需要写进论文才能“自洽可复现”的点。
 
-给出两种实现方案（你们选其一写进论文即可）：
+## 2.1 论文信息（建议写进引用段）
 
-### 方案 A：缩放到整数 + $\pm 1$ 边界（最贴近 Tsunami’20 工程习惯）
-
-若坐标已是整数、盒子为半开 $[L,R)$，则：
-
-- $L_i(r) < R_i(q)$ 可写成 $L_i(r)\le R_i(q)-1$
-- $R_i(r) > L_i(q)$ 可写成 $R_i(r)\ge L_i(q)+1$
-
-浮点时先乘 $10^k$ 并取整，再用 $\pm 1$ 做“严格不等号”边界修正。
-
-同时把 $(-\infty,\cdot)$、$(\cdot,+\infty)$ 用数据域全局最小/最大值（或 int64 最小/最大但要避免溢出）替代。
-
-### 方案 B：坐标压缩（rank）+ 二级键（更稳健，避免“$\pm 1$”假设）
-
-对每个维度的所有端点值做排序，并用二级键 $(\text{value},\text{id})$ 做 tie‑break，把严格 $<$、$>$ 映射为 rank 区间端点的 `lower_bound/upper_bound`。
- 优点：对任意离散/浮点数据都不会因为缩放误差产生边界错判。
-
-> 如果你们打算“严谨到可证明正确”，方案 B 往往更讨 reviewer 喜欢；若更偏工程可复现，方案 A 更直接。
+- **标题**：*Tsunami: A Learned Multi-dimensional Index for Correlated Data and Skewed Workloads*
+- **作者**：Jialin Ding, Vikram Nathan, Mohammad Alizadeh, Tim Kraska
+- **发表**：PVLDB Vol.14 No.2 (2021)（你们文内可继续称 Tsunami’20 以对齐工程实现来源）
 
 ------
 
-## 2.3 Tsunami 索引（作为黑盒接口描述即可）
+## 2.2 Tsunami 的任务与数据模型：多维范围过滤（point filtering）
 
-你们不需要复述 Tsunami 的所有 learned 细节，但**需要明确它在 baseline 中提供什么接口**：
+Tsunami 面向单表点数据，把 records 视为 $d$ 维空间中的点，支持典型 SQL 形式的多维范围谓词过滤（range predicates）。
+
+> 这恰好与我们的 Box→Point 转换对齐：我们把每个盒子映射为 $2d$ 维点，然后对每个查询盒子 $q$ 发起一个 $2d$ 维范围过滤。
+
+------
+
+## 2.3 Tsunami 的结构与查询流程：为什么它是“强 filter 引擎”
+
+Tsunami 是一个 **clustered、in‑memory、read‑optimized** 的 learned multi‑dim index。其核心由两部分组成：
+
+- **Grid Tree**：按工作负载将数据空间划分为多个不重叠区域，用于缓解 query skew；
+- **Augmented Grid**：在每个区域内部构建网格索引，并用相关性建模（如 functional mappings、conditional CDFs）来更好处理维度相关性。
+
+**查询流程（我们 baseline 依赖其“过滤工作流”）**：
+
+1. 遍历 Grid Tree 找到与查询范围相交的 regions；
+2. 在每个 region 内定位相交的网格 cells，并通过 lookup table 映射到物理存储的连续区间；
+3. 扫描这些物理区间内的点并检查过滤谓词，产出匹配结果。
+
+> Baseline 将 Tsunami 视为提供接口 `Query(Index, Q) -> stream of matched ids` 的过滤引擎，并依赖它“能返回所有满足范围谓词的点 id”。
+
+------
+
+## 2.4 Tsunami 的线性代价模型：用于解释 baseline 的性能趋势
+
+Tsunami 在优化 Augmented Grid 时使用一个简单的线性代价模型：
+$$
+\text{Time}=w_0\cdot(\#\text{cell ranges})+w_1\cdot(\#\text{scanned points})\cdot(\#\text{filtered dims}).
+$$
+并解释了 cell range（物理上连续的 cell 扫描段）、scanned points、filtered dims 等概念。
+
+在我们的 baseline 中，过滤维度固定为 $\#\text{filtered dims}=2d$，因此该模型也能解释 “维度翻倍” 对性能的影响：如果 scanned points 相同，单点检查的维度因子约翻倍。
+
+------
+
+## 2.5 Tsunami 的实现细节：64-bit 整数与浮点缩放（影响严格不等号处理）
+
+Tsunami 的实现与评测中使用 **64-bit integer-valued attributes**；若是浮点属性，通常会限制小数位数并按最小的 $10^k$ 进行缩放转整数。
+
+> 这直接影响我们 baseline 的“严格不等号/半开边界”如何落地：
+>
+> - 若数据确实是整数（或固定精度缩放且无误差），$\pm 1$ 方案很自然；
+> - 若存在浮点误差或非固定精度，必须改用 rank/二级键方案来保证严格正确（见 §3.3）。
+
+------
+
+# 3. 核心数据结构
+
+## 3.1 选择索引侧与查询侧
+
+令
+
+- 被索引侧（data side）：$B := R_{\bar c}$
+- 查询侧（workload side）：$A := R_c$
+
+也可互换；工程上通常把更大的一侧放入索引更合算（减少构建多次查询的成本）。
+
+------
+
+## 3.2 Box → Point 编码（索引数据）
+
+对每个 $r\in B$，构造 $2d$ 维点：
+$$
+p(r)=\big(L_1(r),\dots,L_d(r),R_1(r),\dots,R_d(r)\big).
+$$
+Tsunami 的“单表点过滤”即对集合 $\{p(r)\mid r\in B\}$ 建索引。
+
+------
+
+## 3.3 查询范围 $Q(q)$ 的构造（严格不等号与半无限范围）
+
+对每个查询盒子 $q\in A$，相交条件等价于对所有 $i$：
+$$
+L_i(r) < R_i(q)\quad\land\quad R_i(r) > L_i(q).
+$$
+因此在 $2d$ 维空间中，查询范围可写为：
+
+- 第 $1..d$ 维（存 $L_i(r)$）：$(-\infty,\ R_i(q))$
+- 第 $d+1..2d$ 维（存 $R_i(r)$）：$(L_i(q),\ +\infty)$
+
+但 Tsunami 的谓词通常是“闭区间/可执行”的 $a\le x\le b$。因此必须把严格不等号与半无限边界 **落地为可执行的整数边界**。我们给出两种实现方案（二选一写进论文即可）。
+
+------
+
+### 方案 A：整数域（或固定精度缩放）+$\pm 1$ 边界（工程直觉最强）
+
+若所有坐标已在整数域（或你能保证浮点已按固定小数位缩放为整数且无误差）：
+
+- $L_i(r) < R_i(q)$ 变为
+  $$
+  L_i(r)\le R_i(q)-1.
+  $$
+
+- $R_i(r) > L_i(q)$ 变为
+  $$
+  R_i(r)\ge L_i(q)+1.
+  $$
+
+半无限边界可用该维度的全局最小/最大值替代（或安全的 int64 sentinel，但必须避免溢出）。
+
+**必须写清的前提（否则 reviewer 会质疑正确性）**：
+
+- 数据确实是整数或固定精度缩放；
+- $R_i(q)-1$、$L_i(q)+1$ 不溢出且语义正确（建议用饱和处理：若 $R_i(q)$ 已是最小值则该维度约束为空，若 $L_i(q)$ 已是最大值同理）。
+
+------
+
+### 方案 B：坐标压缩（rank）+ 二级键（严格可证明正确，推荐）
+
+对每个维度属性（共有 $2d$ 个属性轴）分别做坐标压缩。关键是处理重复值与严格不等号：
+
+- 对该维度的所有值 $\{x\}$ 构造键 $(x,\text{id})$ 或 $(x,\text{tie})$ 排序，得到严格全序；
+- 用 `lower_bound/upper_bound` 将严格不等号映射到 rank 区间端点。
+
+以某个属性 $X$ 为例：
+
+- 约束 $X < b$ 对应 rank 区间
+  $$
+  X\in [\text{minRank},\ \text{lb}(b)-1],
+  $$
+  其中 $\text{lb}(b)$ 是 `lower_bound(b)` 的返回位置。
+
+- 约束 $X > a$ 对应
+  $$
+  X\in [\text{ub}(a),\ \text{maxRank}],
+  $$
+  其中 $\text{ub}(a)$ 是 `upper_bound(a)` 的返回位置。
+
+**优点**：不依赖“$\pm 1$”和浮点缩放的正确性；对任意离散/浮点数据都能保证边界不漏不重。
+ **建议**：如果你们希望 baseline 在论文里“严格到可证明”，选方案 B 最稳。
+
+------
+
+## 3.4 Tsunami 在 baseline 中的黑盒接口（必须明确）
+
+为了让 baseline 可复现，我们只需要 Tsunami 提供以下抽象接口：
 
 - `BuildTsunamiIndex(Points, WorkloadQueries) -> Index`
-  - Points：$\{p(r)\mid r\in B\}$
-  - Workload：$\{Q(q)\mid q\in A\}$
-     Tsunami 的 index creation 包含离线优化与数据重排（clustered layout）。
-- `Query(Index, Q(q)) -> stream of matched r-ids`
-   查询流程由 Grid Tree + Augmented Grid 定位 cell ranges 并扫描过滤。
+  - `Points = { p(r) | r ∈ B }`
+  - `WorkloadQueries = { Q(q) | q ∈ A }`（可用全量或采样子集）
+- `Query(Index, Q(q)) -> stream/list of matched r-ids`
+   返回所有满足范围过滤谓词的 $r$ 的 id。
 
-> 实现上：把 Tsunami 当作“高维 range filter engine”即可。
+> Tsunami 的内部结构（Grid Tree + Augmented Grid）与三步查询流程，解释了为什么它是强力 filter 引擎，但 baseline 不需要复刻它的学习细节，只需使用其查询接口。
 
 ------
 
-## 2.4 Sampling 需要的辅助结构
+## 3.5 Sampling 需要的辅助数组/结构（3 个版本共用）
 
-对三个版本分别需要：
+**通用**（Sampling / Enumerate / Adaptive 都用到）：
 
-### 通用
+- `A[1..n1]`：查询侧对象顺序（建议按 id 升序，保证确定性）
+- `deg[i]`：$\deg(A[i]) = |\text{Matches}(A[i])|$
+- `W = Σ deg[i] = |J|`
 
-- `A[1..n1]`：查询侧对象顺序（建议按对象 id 升序，保证确定性）。
-- `deg[i]`：第 $i$ 个查询对象 $q=A[i]$ 的匹配数 $|\text{Matches}(q)|$。
-- `W = Σ deg[i] = |J|`。
+**Sampling（2Pass‑RankSample）额外**：
 
-### Sampling 版本额外
+- `Ranks = [(U_j, j)]`：全局 rank 与样本位置绑定
+- `Ans[1..t]`：输出数组
 
-- `Ranks = [(U_j, j)]`：全局秩（rank）与样本位置绑定，并按 rank 排序。
-- `Ans[1..t]`：输出样本数组。
+**Enumerate+Sampling 额外**：
 
-### Enumerate+Sampling 版本额外
+- `AllPairs`：显式存储所有 join pair（可能很大）
 
-- `AllPairs`：显式存储 join 输出对（可能很大）。
+**Adaptive 额外**：
 
-### Adaptive 版本额外
-
-- `J_*`：阈值（见第 4 节）
+- 阈值 `J_star`
 - `mode ∈ {ENUMERATE, COUNT_ONLY}`
 
 ------
 
-# 3. 算法详细流程（三个版本）
+## 3.6 确定性 join stream（对 2Pass‑RankSample 至关重要）
 
-下面把 Tsunami‑JSS 扩成三个版本，并给出足够“可复现”的确定性细节与伪代码。
+为了让“rank → pair”的映射稳定，我们把 join 输出定义为一个**确定性序列** $P_1,\dots,P_W$：
 
-------
+- 外层：按 `A[1],A[2],...,A[n1]` 固定顺序遍历查询盒子；
+- 内层：对固定 $q$，按 `TsunamiQuery(Q(q))` 返回的顺序依次枚举匹配的 $r$。
 
-## 3.0 三个版本共享的预处理
+这要求：
 
-### Step 0：选择哪一侧建 Tsunami
+1. `A` 的顺序固定；
+2. Tsunami 返回的匹配结果顺序在同一 index layout 下可重复（通常等于物理扫描顺序）；
+3. 对重复 key/相同点坐标的记录，物理排序或 tie‑break 必须稳定（例如按 record id 稳定排序）。
 
-默认：
-
-- $A := R_c$（查询侧 / workload）
-- $B := R_{\bar c}$（被索引侧 / data）
-
-通常把更大的一侧放到 Tsunami 更划算。
-
-### Step 1：构造点表与工作负载查询集合
-
-- 点表：$\{p(r)\mid r\in B\}\subset\mathbb{R}^{2d}$ 
-- 工作负载：$\{Q(q)\mid q\in A\}$（由 2.1/2.2 定义）
-
-### Step 2：建索引
-
-用 Tsunami 的离线优化（Grid Tree + Augmented Grid）构建 clustered index。
+> 这点必须写进论文/报告，否则 reviewer 会指出：如果结果顺序不确定，“rank 第 k 个 pair 是谁”就不稳定，进而采样实现无法被严格证明。
 
 ------
 
-## 3.1 版本 I：Sampling（TSUNAMI‑2Pass‑RankSample）
+# 4. 算法详细流程（三个版本）
 
-### 核心思想
+## 4.0 公共预处理（所有版本共享）
 
-先把全体 join 对看成一个确定性“流”（stream）：
+### Step 0：决定索引侧/查询侧
 
-- 外层：按固定顺序遍历 $q\in A$
-- 内层：对每个 $q$，以 Tsunami Query 返回的固定扫描/返回顺序遍历 $\text{Matches}(q)$
+默认用 $B=R_{\bar c}$ 建索引、$A=R_c$ 做 workload 查询（可互换）。
 
-从而得到序列 $P_1,\dots,P_W$（$W=|J|$）。
- Sampling 就是：抽 $t$ 个 i.i.d. 均匀 rank，再在第二遍扫描中“命中这些 rank”。
+### Step 1：构造点表与 query 工作负载
 
-### 算法流程
+- 点表：`Points = { p(r) | r ∈ B }`（维度 $2d$）
+- workload：`WorkloadQueries = { Q(q) | q ∈ A }`（维度 $2d$）
 
-**Pass 1（计数）：**
- 对每个 $q\in A$ 运行一次 Tsunami range query，并计数输出数目得到：
+### Step 2：Build Tsunami Index
+
+调用 `BuildTsunamiIndex(Points, WorkloadQueries)` 得到 `Index`。
+ Tsunami 的优化逻辑会基于 workload 来优化结构（Grid Tree + Augmented Grid）并组织物理布局，这也是它在 skew/correlation 下表现强的原因。
+
+> 实验中可说明 build 是一次性离线成本：评价 join sampling 通常关注 query/sampling runtime；但你们也可以在附录报告 build 时间以更透明。
+
+------
+
+## 4.1 版本 I：Sampling（TSUNAMI‑2Pass‑RankSample）
+
+### 4.1.1 核心思想
+
+把所有 join pair 视为确定性序列 $P_1,\dots,P_W$。
+ 生成 $t$ 个 i.i.d. 均匀 rank：$U_j \sim \mathrm{Unif}\{1,\dots,W\}$。
+ 第二遍扫描时定位并输出 $P_{U_j}$。
+
+------
+
+### 4.1.2 Pass 1：计数（得到 deg 与 W）
+
+对每个 $q\in A$：执行 `TsunamiQuery(Q(q))` 并计数：
 $$
 \deg(q)=|\text{Matches}(q)|,\qquad W=\sum_{q\in A}\deg(q).
 $$
-**生成 ranks：**
+若 $W=0$，返回空。
+
+> 注意：此处“计数”是在我们 baseline 的接口模型里通过遍历 query 返回结果完成，因此至少会触及每个实际匹配一次。
+
+------
+
+### 4.1.3 生成 ranks
+
+对 $j=1..t$：独立生成
 $$
-U_j\stackrel{i.i.d.}{\sim}\mathrm{Unif}\{1,\dots,W\},\quad j=1..t
+U_j\stackrel{i.i.d.}{\sim}\mathrm{Unif}\{1,\dots,W\}
 $$
-并把 `(U_j, j)` 按 `U_j` 升序排序。
+并构造 `Ranks = sort([(U_j, j)])`。
 
-**Pass 2（定位输出）：**
- 维护全局已扫过对数 `g`。遍历 $q\in A$：
+------
 
-- 若当前最小 rank $U$ 满足 $U>g+\deg(q)$：说明该 $q$ 的 block 内没有任何样本位置，**跳过执行 query**（这是工程上节省 pass2 的关键）。
-- 否则执行 query，流式遍历匹配，同时用局部计数 `c` 命中需要的局部位置 $u = U-g$。
+### 4.1.4 Pass 2：定位输出（跳过无关 query + 早停）
 
-> 同一个 rank 出现多次会输出同一对多次，这正是“有放回”的体现。
+维护全局已扫过 pair 数 `g`。对每个 $q\in A$：
 
-### 伪代码（可直接放文稿）
+- 若当前最小 rank $U > g+\deg(q)$，则该 $q$ 的 block 内没有样本 rank，**跳过执行 TsunamiQuery**，仅令 `g += deg(q)`。
+- 否则执行 TsunamiQuery(Q(q))，并在匹配流中用局部计数 `c` 找到需要的第 $u=U-g$ 个匹配，回填 `Ans[pos] = (q,r)`。
+- 同一 rank 可出现多次，输出同一对多次，正是有放回抽样。
 
-（以下伪代码的“计数+排序+二遍命中”结构与你们已写版本一致，我把工程细节补齐了。）
+**可复现伪代码**（建议直接放入报告）：
 
 ```
-TSUNAMI-2Pass-RankSample(A, B, t):
+TSUNAMI-2Pass-RankSample(A, Index, t):
 
-# Preprocess: build Tsunami index on points p(r), r in B, with workload queries from A.
-
-# Pass 1: count
+# Pass 1: count degrees
 for q in A (fixed order):
     deg[q] = 0
-    for r in TsunamiQuery(Q(q)):   # stream results
+    for r in TsunamiQuery(Index, Q(q)):
         deg[q]++
 
 W = sum_q deg[q]
 if W == 0: return empty
 
-# draw global ranks with replacement
+# draw i.i.d. global ranks with replacement
 for j = 1..t:
     U[j] ~ UniformInt(1, W)
 Ranks = sort([(U[j], j)] by U)
 
 # Pass 2: locate outputs
 Ans[1..t]
-g = 0               # processed pairs so far
-p = 1               # pointer in Ranks
+g = 0          # global offset = number of pairs before current q-block
+p = 1          # pointer in Ranks (sorted)
 
 for q in A (same order):
     if p > t: break
 
-    # skip this query if no rank falls in (g, g+deg[q]]
+    # skip if no rank falls inside (g, g+deg[q]]
     if Ranks[p].U > g + deg[q]:
         g += deg[q]
         continue
 
-    # collect all needed local positions within this q-block
-    Local = []   # list of (u, original_pos)
+    # collect all local positions needed in this q-block
+    Local = []
     while p <= t and Ranks[p].U <= g + deg[q]:
-        u = Ranks[p].U - g    # 1..deg[q]
-        Local.append((u, Ranks[p].pos))
+        u = Ranks[p].U - g              # u in [1..deg[q]]
+        Local.append((u, Ranks[p].pos)) # pos = original sample index
         p++
 
-    Local.sort by u
+    sort Local by u
     umax = Local.last.u
 
-    # run Tsunami query and stop early at umax
+    # stream matches and stop early at umax-th match
     c = 0
-    i = 1   # pointer in Local
-    for r in TsunamiQuery(Q(q)):
+    i = 1
+    for r in TsunamiQuery(Index, Q(q)):
         c++
         while i <= |Local| and Local[i].u == c:
-            Ans[ Local[i].pos ] = (q, r)
+            Ans[Local[i].pos] = (q, r)
             i++
         if c == umax: break
 
@@ -295,35 +393,28 @@ for q in A (same order):
 return Ans
 ```
 
-### 关键实现注意点（保证严格正确）
+**必须写清的正确性条件（工程注意点）**：
 
-1. **固定 A 的顺序**（比如按 id），否则 “stream 定义”不确定。
-2. **Tsunami Query 的扫描/返回顺序要可重复**：通常用“物理存储顺序”即可（不要在返回结果上再做随机 shuffle）。
-3. **半开/严格不等号**必须通过 2.2 的方案处理，否则会出现边界 pair 被误算/漏算。
+1. `A` 顺序固定；
+2. TsunamiQuery 的匹配输出顺序可重复（建议等于物理扫描顺序）；
+3. 严格不等号必须按 §3.3 的方案实现，否则边界 pair 会误算/漏算。
 
 ------
 
-## 3.2 版本 II：Enumerate+Sampling（TSUNAMI‑Enumerate‑ArraySample）
+## 4.2 版本 II：Enumerate+Sampling（TSUNAMI‑Enumerate‑ArraySample）
 
-### 核心思想
+### 4.2.1 核心思想
 
-直接用 Tsunami 把 join 输出对 $J$ **完整枚举到数组** `AllPairs`，然后在数组上做均匀 i.i.d. 采样（最朴素、常数小，但空间爆）。这与你们“Enumerate+Sampling”版本的精神一致：**先枚举，再随机取样**。
+直接枚举全部 join 输出对 $J$ 到数组 `AllPairs`，然后在数组上做 i.i.d. 均匀下标采样。实现最直观，但空间 $\Theta(|J|)$。
 
-### 算法流程
-
-1. 枚举：
-   - 对每个 $q\in A$：执行 TsunamiQuery(Q(q))，对每个返回 $r\in B$：append `(q,r)` 到 `AllPairs`
-2. 抽样：
-   - 对 $j=1..t$：`idx ~ Unif(0..|AllPairs|-1)`，输出 `AllPairs[idx]`
-
-### 伪代码
+### 4.2.2 伪代码
 
 ```
-TSUNAMI-Enumerate-ArraySample(A, B, t):
+TSUNAMI-Enumerate-ArraySample(A, Index, t):
 
 AllPairs = []
 for q in A (fixed order):
-    for r in TsunamiQuery(Q(q)):
+    for r in TsunamiQuery(Index, Q(q)):
         AllPairs.append((q, r))
 
 W = |AllPairs|
@@ -338,72 +429,66 @@ return Ans
 
 ------
 
-## 3.3 版本 III：Adaptive+Sampling（TSUNAMI‑Adaptive）
+## 4.3 版本 III：Adaptive+Sampling（TSUNAMI‑Adaptive）
 
-### 核心思想
+### 4.3.1 核心思想
 
-用阈值 $J_\star$ 自动选择：
+用阈值 $J_\star$ 自适应选择：
 
-- 若 $|J|\le J_\star$：走 **Enumerate+Sampling**（只需一遍遍历 + 数组采样）
-- 若 $|J|>J_\star$：走 **Sampling（两遍 rank）**（节省内存；第二遍只对命中 query 再查）
-
-> 这正是你们 Adaptive 框架的 baseline 化版本：小输出用枚举，大输出用两遍采样。
+- 若 $|J|\le J_\star$：直接 Enumerate+Sampling（只需一遍扫描 + 数组采样）
+- 若 $|J|> J_\star$：走 2Pass‑RankSample（节省内存；第二遍仅对命中 query 执行）
 
 ------
 
-### 重要现实点：Tsunami 不一定天然提供“只 Count 不枚举对象 id”的接口
+### 4.3.2 实现现实点：Tsunami 未必提供 CountOnly API
 
-因此 Adaptive 的 Phase1 实现有两种写法：
+因此给出两种写法：
 
-- **写法 A（理想，若 Tsunami 能提供 CountOnly）**：先 Count 再决定是否枚举，保证枚举量严格 $\le J_\star$（和你们别的 Adaptive 文档一致的“先 Count 再判断”哲学）。
-- **写法 B（更普适）**：Query 一次流式返回时同时 count；若还处于 ENUMERATE 且 `AllPairs.size < J_star` 就 append；一旦达到阈值立刻切换并清空 `AllPairs`。这样不会 OOM，且额外写入最多 $J_\star$ 条。
+- **写法 A（理想）**：若 Tsunami 提供 `CountOnly(Q)`，可先 count 再决定是否枚举。
+- **写法 B（通用、可落地）**：Query 流式返回时永远 count，同时只在未超阈值时追加到 `AllPairs`；一旦超过阈值立刻切换并释放 `AllPairs`，后续只计数。
 
-下面给出 **写法 B** 的“可落地 baseline”（最常用，也最省事）。
+下面给出写法 B（最通用）。
 
 ------
 
-### TSUNAMI‑Adaptive（写法 B）流程
+### 4.3.3 写法 B：一次遍历完成精确计数 +（可选）小规模枚举
 
-**Phase 1：一次遍历（永远 count，必要时 append 直到阈值）**
-
-初始化：
+**Phase 1：count + maybe enumerate until threshold**
 
 - `mode = ENUMERATE`
-- `AllPairs` 预留容量 `J_star`（可选）
+- `AllPairs = []`（最多 $J_\star$）
 - `W = 0`
+- 同时维护 `deg[q]`
 
-对每个 $q\in A$：
+遍历 $q\in A$ 并流式扫描匹配 $r$：
 
-- `deg[q]=0`
-- 遍历 TsunamiQuery(Q(q)) 返回的每个 $r$：
-  - `deg[q]++ ; W++`（永远做）
-  - 若 `mode==ENUMERATE`：
-    - 若 `AllPairs.size < J_star`：append `(q,r)`
-    - 否则（达到阈值）：
-       `mode = COUNT_ONLY`；清空并释放 `AllPairs`（例如 `clear+shrink_to_fit`）；后续不再 append
+- 永远：`deg[q]++ ; W++`
+- 若 `mode==ENUMERATE`：
+  - 若 `|AllPairs| < J_star`：append `(q,r)`
+  - 否则：切换 `mode=COUNT_ONLY`，释放 `AllPairs`
 
-遍历结束后我们总能得到精确的 `deg[]` 与 $W=|J|$。
+**Phase 1 后分支**：
 
-**Phase 1 后分支：**
-
-- 若 `mode==ENUMERATE`（说明 $W \le J_\star$，且 `AllPairs` 已完整）：直接数组采样输出（等价 Enumerate+Sampling）
-- 若 `mode==COUNT_ONLY`（说明 $W > J_\star$）：转入 Sampling 的 ranks + Pass2 输出
+- 若 `mode==ENUMERATE`：说明 $W\le J_\star$，`AllPairs` 已完整枚举 $J$，直接数组采样
+- 若 `mode==COUNT_ONLY`：说明 $W>J_\star$，转入 Sampling 分支：
+  - 生成 ranks（用已知 $W$）
+  - 执行“仅 Pass2 的定位输出”（deg 已在 Phase1 得到，无需再计数一遍）
 
 ------
 
-### 伪代码（写法 B）
+### 4.3.4 伪代码（写法 B）
 
 ```
-TSUNAMI-Adaptive(A, B, t, J_star):
+TSUNAMI-Adaptive(A, Index, t, J_star):
 
 mode = ENUMERATE
 AllPairs = []
 W = 0
 
-# Phase 1: count + maybe store until threshold
+# Phase 1: exact count; enumerate only if small
 for q in A:
     deg[q] = 0
-    for r in TsunamiQuery(Q(q)):
+    for r in TsunamiQuery(Index, Q(q)):
         deg[q]++
         W++
 
@@ -417,247 +502,221 @@ for q in A:
 if W == 0: return empty
 
 if mode == ENUMERATE:
-    # W <= J_star, AllPairs contains full J
+    # AllPairs contains the full join result
     for j = 1..t:
         idx ~ UniformInt(0, W-1)
         Ans[j] = AllPairs[idx]
     return Ans
 
-# else mode == COUNT_ONLY: do Sampling branch (ranks + Pass2)
-return TSUNAMI-2Pass-RankSample-UsingDeg(A, B, t, deg, W)
+# mode == COUNT_ONLY: do rank-sampling branch using deg and W
+return TSUNAMI-Pass2-LocateUsingDeg(A, Index, t, deg, W)
 ```
 
-> 其中 `TSUNAMI-2Pass-RankSample-UsingDeg` 就是 3.1 的 Pass2，但 Pass1 已经得到 deg 与 W 了，所以无需再跑一遍计数。
+------
+
+# 5. Adaptive 阈值 $J_\star$ 的选择策略
+
+阈值本质上是在 “**省一遍扫描**” 与 “**避免存储爆炸**” 之间折中：
+
+- 小 $|J|$：枚举 + 数组采样更快更简单；
+- 大 $|J|$：必须切换到 rank‑sampling，避免 $\Theta(|J|)$ 内存。
+
+给出三层策略（建议都写进论文，层次清晰）。
 
 ------
 
-# 4. Adaptive 版本阈值 $J_\star$ 的选择策略（给出可写进论文的规则）
+## 5.1 内存硬约束（必须写）
 
-阈值的本质：**允许枚举存储多少 join pairs，来换取“少一遍查询扫描”**。
-
-下面给出三个层次的策略（从必须到可选）。
-
-------
-
-## 4.1 内存硬约束（必须满足）
-
-假设每个 pair 只存两个对象 id（或指针），`sizeof(Pair)` 字节；给 `AllPairs` 的预算为 `MemBudget·ρ`（$0<\rho<1$）：
+设给 `AllPairs` 的内存预算为 `MemBudget·ρ`（$0<\rho<1$），每个 pair 的存储开销为 `sizeof(Pair)` 字节，则：
 $$
 J_\star^{\text{mem}}
-=\left\lfloor\frac{\rho\cdot \text{MemBudget}}{\text{sizeof(Pair)}}\right\rfloor.
-$$
-实际取值必须满足：
-$$
+=\left\lfloor\frac{\rho\cdot \text{MemBudget}}{\text{sizeof(Pair)}}\right\rfloor,
+\qquad
 J_\star \le J_\star^{\text{mem}}.
 $$
-
-> 这条规则可以防止 baseline 在密集 join 上直接 OOM（尤其 Tsunami 返回结果很大时）。这一条是“必须写”的。
+这保证不会 OOM。
 
 ------
 
-## 4.2 时间权衡（建议写：让大分支别被额外写入拖垮）
+## 5.2 时间权衡（建议写：避免大分支被额外写入拖垮）
 
-Tsunami‑Adaptive（写法 B）在“大分支”里最多额外写入/尝试存储 $J_\star$ 个 pair，随后立即丢弃并转为 COUNT_ONLY。
-
-因此大分支的额外开销是 $O(J_\star)$ 级别（主要是内存写入），你可以给出一个建议：
+在写法 B 中，一旦触发切换，最多额外“写入/尝试存储” $J_\star$ 个 pair 就会丢弃，因此大分支多了一个 $O(J_\star)$ 的写入开销。为了不让它压倒主要开销，常见建议是：
 $$
-J_\star^{\text{time}} = C_1\cdot t + C_2\cdot n_1
-\quad\text{或更粗：}\quad
-J_\star^{\text{time}}=C\cdot t,
+J_\star^{\text{time}} = C\cdot t
+\quad\text{或}\quad
+J_\star^{\text{time}} = C_1\cdot t + C_2\cdot n_1.
 $$
-直觉是：当你只需要 $t$ 个样本时，没必要为了省第二遍而“写入过大规模的 AllPairs”。
+直觉：当只需要 $t$ 个样本时，不值得为省第二遍扫描而写入过多 pair。
 
-最终取：
+最终可取：
 $$
 J_\star=\min\bigl(J_\star^{\text{mem}},\ J_\star^{\text{time}}\bigr).
 $$
 
 ------
 
-## 4.3 工程标定（最推荐：交叉点拟合）
+## 5.3 工程标定（最推荐：交叉点拟合）
 
-这与“通用 Adaptive 框架”的常见做法一致：
+做 benchmark 标定（与你们目前草稿一致，但这里把“怎么写进论文”说完整）：
 
-1. 在代表性数据分布与参数 $(n_1,n_2,d,t)$ 下跑：
-   - “纯 Enumerate+Sampling”
-   - “纯 Sampling（两遍 rank）”
-2. 找到两者耗时相当的输出规模 $|J_{\text{cross}}|$
-3. 令 $J_\star$ 略小于该交叉点（并受 $J_\star^{mem}$ 截断）
+1. 固定若干代表性配置 $(n_1,n_2,d,t)$ 与数据分布；
+2. 分别测：纯 Enumerate+Sampling 与纯 2Pass‑RankSample 的耗时随 $|J|$ 变化；
+3. 找到两者耗时相当的交叉点 $|J_{\text{cross}}|$；
+4. 取 $J_\star \approx \alpha |J_{\text{cross}}|$（$\alpha\in(0,1)$ 略小），并受 $J_\star^{mem}$ 截断。
 
-这样写进论文会非常自然：阈值来自 **benchmark 标定**，不是拍脑袋。
-
-------
-
-# 5. 算法分析（正确性、复杂度；三版本都包含）
-
-## 5.1 正确性：Box→Point 范围过滤的等价性
-
-对任意两盒子 $q,r$，在第 $i$ 维相交当且仅当：
-$$
-\max(L_i(q),L_i(r))<\min(R_i(q),R_i(r))
-\iff L_i(r)<R_i(q)\ \land\ R_i(r)>L_i(q).
-$$
-将所有维度合并，就得到“点 $p(r)$”落入“查询范围 $Q(q)$”的充要条件。该等价转换是 Tsunami‑JSS 正确性的几何基础。
+这样写的好处是：阈值不是拍脑袋，而是“与实现/硬件相关的经验最优点”。
 
 ------
 
-## 5.2 正确性：Sampling（两遍 rank）是 exact i.i.d. uniform
+# 6. 算法分析（正确性 + 复杂度；三版本都包含）
 
-把 join 输出定义成确定性流：
+## 6.1 正确性基础：Box→Point 过滤的充要等价
 
-- 先按固定顺序遍历 $q\in A$
-- 再按 Tsunami query 内部扫描/返回顺序遍历 $\text{Matches}(q)$
+**命题**：对任意半开盒 $q,r$，有
+$$
+q\cap r\neq\varnothing
+\iff
+\forall i,\ L_i(r) < R_i(q)\ \land\ R_i(r) > L_i(q).
+$$
+**证明（逐维）**：
+ 半开区间相交等价于
+$$
+\max(L_i(q),L_i(r))<\min(R_i(q),R_i(r)).
+$$
+这等价于同时满足：
 
-得到 $P_1,\dots,P_W$，其中 $W=|J|=\sum_q \deg(q)$。
+- $L_i(r)<R_i(r)$（否则 $L_i(r)\ge R_i(q)\Rightarrow \max(\cdot)\ge R_i(q)\ge \min(\cdot)$ 不相交）
+- $R_i(r)>L_i(q)$（否则 $R_i(r)\le L_i(q)\Rightarrow \min(\cdot)\le L_i(q)\le \max(\cdot)$ 不相交）
+   反向同理。合并所有维度即可。∎
 
-Sampling 版本生成 $U_j\sim \text{Unif}\{1..W\}$，并令 $Z_j=P_{U_j}$。于是对任意固定 pair $P_k\in J$：
+因此，用 Tsunami 对 $p(r)$ 做 $2d$ 维范围过滤得到的匹配集合，与真实相交集合一一对应。
+
+------
+
+## 6.2 版本 I：2Pass‑RankSample 的正确性（exact i.i.d. uniform）
+
+把 join 输出定义为确定性序列 $P_1,\dots,P_W$。算法生成 $U_j\sim \mathrm{Unif}\{1..W\}$，并输出 $Z_j=P_{U_j}$。
+
+对任意固定 pair $P_k\in J$：
 $$
 \Pr(Z_j=P_k)=\Pr(U_j=k)=\frac1W=\frac1{|J|}.
 $$
-因为 $U_1,\dots,U_t$ 独立生成，所以 $Z_1,\dots,Z_t$ i.i.d.。
+且 $U_1,\dots,U_t$ 独立生成，因此 $Z_1,\dots,Z_t$ **i.i.d. 均匀有放回**。∎ 
+
+**注意**：该证明依赖 §3.6 的“确定性 join stream”条件（外层顺序与 Tsunami 返回顺序可重复）。
 
 ------
 
-## 5.3 正确性：Enumerate+Sampling 是 exact i.i.d. uniform
+## 6.3 版本 II：Enumerate+Sampling 的正确性（exact i.i.d. uniform）
 
-`AllPairs` 是对 $J$ 的一次枚举（每个 $q$ 只对应其匹配 $r$，不会跨 $q$ 重复），在数组上做独立均匀下标采样显然得到 $J$ 上 i.i.d. 均匀有放回样本。
-
-------
-
-## 5.4 正确性：Adaptive 不破坏正确性
-
-Adaptive 只是根据 $W$（或触发阈值）在两种**已正确**的方法之间选择：
-
-- 若未切换：等价于 Enumerate+Sampling
-- 若切换：等价于 Sampling（两遍 rank）
-
-切换行为不改变 $Q(q)$ 的定义、不改变 Tsunami 返回的匹配集合，因此不会引入偏差。
+`AllPairs` 是对 $J$ 的一次完整枚举（每条 `(q,r)` 出现一次）。在数组上对下标做 i.i.d. 均匀采样显然得到 $J$ 上的 i.i.d. 均匀有放回样本。∎ 
 
 ------
 
-## 5.5 复杂度：通用记号与 Tsunami 代价模型
+## 6.4 版本 III：Adaptive 的正确性（切换不改变分布）
 
-记：
+Adaptive 只是在两种**已正确**的方法之间选择：
 
-- $n_1=|A|$，$n_2=|B|$
+- 若未切换（$W\le J_\star$）：等价 Enumerate+Sampling；
+- 若切换（$W> J_\star$）：丢弃已枚举结果但保留精确 `deg[]` 与 `W`，随后执行与 2Pass‑RankSample 相同的 rank‑定位输出（无需再做 Pass1 计数），因此与 Sampling 分支完全等价。∎ 
+
+------
+
+## 6.5 复杂度：记号、Tsunami 代价模型与三版本结论
+
+### 6.5.1 记号
+
+- $n_1=|A|$, $n_2=|B|$
 - $\deg(q)=|\text{Matches}(q)|$
-- $W=|J|=\sum_q \deg(q)$
+- $W=|J|=\sum_{q\in A}\deg(q)$
 
-Tsunami 提供的可用于解释实验趋势的代价模型（单 query）：
-$$
-\text{Time}(q)\approx w_0\cdot C_q + w_1\cdot S_q\cdot (2d),
-$$
-其中 $C_q$ 是 cell ranges 数，$S_q$ 是扫描点数，过滤维度固定为 $2d$。
+### 6.5.2 Tsunami 的单次查询代价模型（解释趋势用）
 
-另外，一个必须写清楚的下界：因为每个真实相交对至少要被“产出并计数”一次，计数阶段有
+Tsunami 给出线性模型：
 $$
-T_1=\Omega(W).
+\text{Time}(q)\approx w_0\cdot C_q + w_1\cdot S_q\cdot( \#\text{filtered dims}),
 $$
+其中 $C_q$ 是 cell ranges 数，$S_q$ 是扫描点数，$\#\text{filtered dims}$ 为过滤维度数。
 
+在 baseline 中：$\#\text{filtered dims}=2d$。
 
 ------
 
-## 5.6 版本 I：Sampling 的复杂度
+### 6.5.3 版本 I：Sampling（2Pass‑RankSample）
 
-### 时间
+**时间**
 
-- **建索引**：Tsunami 的 build 包含离线优化与重排，通常记为
+- Build：记为 $T_{\text{build}}$（离线优化+重排等一次性成本）
+
+- Pass1 计数：
   $$
-  T_{\text{build}}=T_{\text{opt}}+T_{\text{reorder}}.
+  T_1 \approx \sum_{q\in A}\big(w_0 C_q + w_1 S_q\cdot 2d\big).
   $$
-  
-
-- **Pass1（计数）**：
+  在本 baseline 的接口模型中，计数通过遍历返回结果完成，因此至少需要触及每个匹配一次，从而有 baseline‑特定下界：
   $$
-  T_1\approx \sum_{q\in A}\big(w_0 C_q + w_1 S_q(2d)\big)=\Omega(W).
+  T_1=\Omega(W)
+  \quad (\text{在“遍历 Query 输出计数”的实现模型下}).
   $$
+  这不是问题本身的下界，而是本 baseline 的限制。
 
-- **排序 ranks**：$O(t\log t)$ 
+- ranks 排序：$O(t\log t)$
 
-- **Pass2（抽样输出）**：只对命中的 $A'\subseteq A$ 再执行 query，最坏仍可到 $\Omega(W)$，但 $t$ 小时常显著少于全体 query。
+- Pass2 定位输出：只对命中的 $A'\subseteq A$ 执行 query；最坏仍可达到 $\Omega(W)$，但当 $t$ 小且命中稀疏时通常明显小于全量 query。
 
-综合（按你们 baseline 写法）：
+综合：
 $$
-T_{\text{Sampling}}
-=
-T_{\text{build}} + T_1 + O(t\log t) + T_2,
-\quad T_2\text{ 最坏 }=\Omega(W).
+T_{\text{Sampling}} = T_{\text{build}} + T_1 + O(t\log t) + T_2.
 $$
+**额外空间（不含 Tsunami index 本体）**
 
-
-### 空间（不含 Tsunami 索引本体）
-
-- `deg[q]`：$O(n_1)$
-- `Ranks` 与 `Ans`：$O(t)$
-
-因此：
 $$
 S_{\text{Sampling,extra}}=O(n_1+t).
 $$
 
+---
+
+### 6.5.4 版本 II：Enumerate+Sampling 
+
+**时间**   枚举必须写出全部 \(W\) 个 pair：\(\Omega(W)\)，加上 Tsunami 扫描开销： 
+
+$$
+T_{\text{Enum}}\approx T_{\text{build}} + \sum_{q\in A}\big(w_0 C_q + w_1 S_q\cdot 2d\big) + \Theta(W) + O(t).
+$$
+
+
+**空间**
+$$
+S_{\text{Enum,extra}}=\Theta(W)+O(t).
+$$
+这是该版本最大风险（密集 join 时 OOM）。
 
 ------
 
-## 5.7 版本 II：Enumerate+Sampling 的复杂度
-
-### 时间
-
-- 枚举阶段：必须产出全部 $W$ 个 pair（至少 $\Omega(W)$），外加 Tsunami query 扫描成本（用上面的代价模型解释即可）。
-- 采样阶段：$O(t)$。
-
-### 空间
-
-- `AllPairs`：$\Theta(W)$（主风险点）
-- 输出：$O(t)$
-
-所以：
-$$
-S_{\text{Enumerate}}=\Theta(W)+O(t).
-$$
-
-> 这正是该版本的 baseline 意义：小 $W$ 时常数最好；大 $W$ 时会内存爆。
-
-------
-
-## 5.8 版本 III：Adaptive+Sampling 的复杂度
+### 6.5.5 版本 III：Adaptive+Sampling
 
 分两种情况：
 
-### Case A：未触发切换（$W\le J_\star$）
+- **Case A（未切换，$W\le J_\star$）**：等价 Enumerate+Sampling，但 $W$ 被阈值限制，因此空间受控：
+  $$
+  S_{\text{Adaptive,peak}} = O(J_\star+t).
+  $$
+- **Case B（触发切换，$W>J_\star$）**：Phase1 仍要完成精确计数，同时最多额外写入 $O(J_\star)$ 个 pair（随后丢弃），再进入 rank‑sampling 的定位输出：
+  $$
+  T_{\text{Adaptive}} = T_{\text{build}} + T_1 + O(J_\star) + O(t\log t) + T_2,
+  $$
 
-- 时间：一遍枚举 + 数组采样
-- 空间：$\Theta(W)\le\Theta(J_\star)$
+  $$
+  S_{\text{Adaptive,peak}} = O(n_1+t+J_\star).
+  $$
 
-### Case B：触发切换（$W>J_\star$）
-
-- Phase1：无论如何都要完成计数；额外写入/尝试存储最多 $J_\star$ 个 pair（随后丢弃）
-- Phase2+Pass2：等价 Sampling 的 ranks + 第二遍输出
-
-因此可写为：
-$$
-T_{\text{Adaptive}}
-=
-T_{\text{build}}
-+
-T_1
-+
-O(J_\star)
-+
-O(t\log t)
-+
-T_2,
-$$
-其中 $T_1=\Omega(W)$，$T_2$ 最坏也可 $\Omega(W)$。
-
-峰值额外空间（不含索引）：
-$$
-S_{\text{Adaptive,peak}}
-=
-O(n_1+t+\min(W,J_\star)).
-$$
+  若按 §5 的建议取 $J_\star$（受内存与 $t$ 控制），即可保证大分支不会被额外写入拖垮。
 
 ------
 
-# 结尾：你们在论文里怎么“摆放”这个 baseline（建议一句话版）
+# 附录（可选但强烈建议加）：实现检查清单（让 reviewer 一眼安心）
 
-> **Tsunami‑JSS Baseline**：把盒子相交 join 转成 $2d$ 维点的正交范围过滤；用 Tsunami’20（Grid Tree + Augmented Grid 的 learned multi‑dim index）作为 range filter 引擎，对每个查询盒子返回所有相交对象并形成确定性 join stream；再通过（1）两遍 rank 定位或（2）显式枚举数组采样或（3）阈值自适应切换，实现 **exact i.i.d. uniform sampling with replacement**，用于对比你们“在最坏情况下不依赖 $|J|$”的采样方法。
+1. **严格不等号处理**：明确选方案 A 或 B，并写清前提。若用 A，说明数据是 int64 或固定精度缩放；否则用 B。
+2. **确定性输出顺序**：固定 `A` 顺序；Tsunami 返回顺序需可重复；重复点需稳定 tie‑break。
+3. **计数溢出**：`deg`、`W` 建议用 64-bit/128-bit 计数（$|J|$ 可能非常大）。
+4. **随机数可复现**：固定 seed；`UniformInt(1,W)` 需支持大 $W$。
+5. **Pass2 早停**：仅在你明确定义了“rank 对应匹配输出顺序”且 TsunamiQuery 流式可中断时使用；否则可以不早停以避免实现差异。

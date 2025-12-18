@@ -1,15 +1,16 @@
 #pragma once
 // sjs/baselines/tsunami/adaptive.h
 //
-// Tsunami baseline (Variant::Adaptive).
+// Tsunami baseline (Variant::Adaptive) — strictly aligned with docs/Baseline/Tsunami’20 Baseline.md.
 //
-// Baseline-level adaptive strategy (per Tsunami’20 baseline writeup):
-//   - Phase 1: always enumerate Tsunami query results to compute exact deg[q]
-//     and W=|J|. While W <= J* (cfg.run.j_star), also materialize join pairs
-//     into an array AllPairs.
-//   - If join finishes with W <= J*: sample directly from AllPairs.
-//   - Otherwise: discard AllPairs and fall back to the two-pass rank sampling
-//     protocol using the precomputed deg[] (no need to re-count).
+// Implements TSUNAMI-Adaptive (write-up §4.3, "writing B"):
+//   Phase 1: always stream TsunamiQuery(Q(q)) to compute exact deg[q] and W=|J|.
+//            While W <= J_star, also materialize join pairs into AllPairs.
+//            Once AllPairs reaches J_star, switch to COUNT_ONLY and free AllPairs.
+//   Phase 2:
+//     - If never switched (W <= J_star): AllPairs is the full join result; sample from it directly.
+//     - Else (W > J_star): reuse deg[] and W from Phase 1 and run only the Pass-2 locate step
+//       (TwoPassRankSampleUsingDeg), avoiding Θ(|J|) memory.
 
 #include "sjs/baselines/tsunami/sampling.h"
 
@@ -34,7 +35,6 @@ class TsunamiAdaptiveBaseline final : public IBaseline<Dim, T> {
                 "TsunamiAdaptiveBaseline uses Point<2*Dim>; increase kMaxSupportedDim or reduce Dim");
 
   using DatasetT = Dataset<Dim, T>;
-  using BoxT = Box<Dim, T>;
 
   Method method() const noexcept override { return Method::Tsunami; }
   Variant variant() const noexcept override { return Variant::Adaptive; }
@@ -47,14 +47,12 @@ class TsunamiAdaptiveBaseline final : public IBaseline<Dim, T> {
     deg_order_.clear();
     mode_ = Mode::Unknown;
     all_pairs_.clear();
-    j_star_used_ = 0;
   }
 
   bool Build(const DatasetT& ds, const Config& cfg, PhaseRecorder* phases, std::string* err) override {
     auto scoped = phases ? phases->Scoped("build") : PhaseRecorder::ScopedPhase(nullptr, "");
     Reset();
-    if (!prep_.Build(ds, cfg, phases, err)) return false;
-    return true;
+    return prep_.Build(ds, cfg, phases, err);
   }
 
   bool Count(const Config& cfg,
@@ -62,7 +60,7 @@ class TsunamiAdaptiveBaseline final : public IBaseline<Dim, T> {
              CountResult* out,
              PhaseRecorder* phases,
              std::string* err) override {
-    (void)rng;  // deterministic
+    (void)rng;  // deterministic counting
     if (!out) {
       if (err) *err = "TsunamiAdaptiveBaseline::Count: out is null";
       return false;
@@ -77,27 +75,11 @@ class TsunamiAdaptiveBaseline final : public IBaseline<Dim, T> {
     auto scoped = phases ? phases->Scoped("phase1_count_and_maybe_enumerate")
                          : PhaseRecorder::ScopedPhase(nullptr, "");
 
-    // Adaptive threshold J* selection (per Tsunami'20 baseline writeup §4).
-    // If j_star is 0, use automatic calculation based on time trade-off:
-    //   J*^time = C * t  (where C is a heuristic constant)
-    // Also apply memory budget constraint: J* <= 100M pairs (default ~800MB for PairId)
-    u64 JSTAR = cfg.run.j_star;
-    if (JSTAR == 0) {
-      // Auto-calculate using time trade-off: J* = C * t
-      // C = 100 is a reasonable default (allows storing pairs for small-medium t)
-      const u64 JSTAR_time = 100ULL * cfg.run.t;
-      // Memory constraint: limit to 100M pairs (~800MB for PairId)
-      const u64 JSTAR_mem = 100'000'000ULL;
-      JSTAR = (JSTAR_time < JSTAR_mem) ? JSTAR_time : JSTAR_mem;
-    }
-    j_star_used_ = JSTAR;  // Store for use in Sample()
+    const u64 JSTAR = cfg.run.j_star;
 
     counted_ = false;
     W_ = 0;
     deg_order_.assign(prep_.QueryOrder().size(), 0ULL);
-    
-    // Note: JSTAR may be auto-calculated above (if cfg.run.j_star was 0),
-    // so we always use the computed JSTAR value here.
     mode_ = (JSTAR > 0) ? Mode::EnumerateAll : Mode::CountOnly;
     all_pairs_.clear();
     if (mode_ == Mode::EnumerateAll) {
@@ -105,20 +87,19 @@ class TsunamiAdaptiveBaseline final : public IBaseline<Dim, T> {
       all_pairs_.reserve(static_cast<usize>(std::min<u64>(JSTAR, 1'000'000ULL)));
     }
 
-    const auto& rel_q = prep_.QueryRel();
     const auto& order = prep_.QueryOrder();
+    const auto& ranges = prep_.WorkloadRanges();
 
     for (usize qi = 0; qi < order.size(); ++qi) {
       const u32 q_idx = order[qi];
-      const BoxT& q = rel_q.boxes[static_cast<usize>(q_idx)];
+      const auto& range = ranges[qi];
 
-      typename detail::TsunamiEmbedding<Dim, T>::RangeBox range;
-      if (!prep_.MakeRangeForQuery(q, &range)) {
+      if (range.IsEmpty()) {
         deg_order_[qi] = 0;
         continue;
       }
 
-      typename detail::TsunamiPreproc<Dim, T>::KD::RangeIter it(&prep_.Index(), range);
+      typename detail::TsunamiPreproc<Dim, T>::IndexT::QueryIter it(&prep_.Index(), range);
 
       u64 deg = 0;
       usize data_pt = 0;
@@ -181,13 +162,14 @@ class TsunamiAdaptiveBaseline final : public IBaseline<Dim, T> {
     }
 
     if (W_ == 0) {
-      return true;
+      return true;  // empty join
     }
 
+    const u64 JSTAR = cfg.run.j_star;
     if (mode_ == Mode::EnumerateAll) {
-      // Small join branch: sample from stored list.
-      if (j_star_used_ == 0) {
-        if (err) *err = "TsunamiAdaptiveBaseline::Sample: internal error (EnumerateAll but j_star_used_==0)";
+      // Small-join branch: AllPairs contains the full join result J.
+      if (JSTAR == 0) {
+        if (err) *err = "TsunamiAdaptiveBaseline::Sample: internal error (EnumerateAll but JSTAR==0)";
         return false;
       }
       if (all_pairs_.size() != static_cast<usize>(W_)) {
@@ -195,7 +177,7 @@ class TsunamiAdaptiveBaseline final : public IBaseline<Dim, T> {
         return false;
       }
 
-      auto scoped = phases ? phases->Scoped("sample_from_all_pairs") : PhaseRecorder::ScopedPhase(nullptr, "");
+      auto scoped2 = phases ? phases->Scoped("sample_from_all_pairs") : PhaseRecorder::ScopedPhase(nullptr, "");
       out->pairs.resize(static_cast<usize>(t));
       for (u64 i = 0; i < t; ++i) {
         const u64 idx = rng->UniformU64(W_);
@@ -204,8 +186,8 @@ class TsunamiAdaptiveBaseline final : public IBaseline<Dim, T> {
       return true;
     }
 
-    // Large join branch: reuse deg[] computed in Phase 1 and run Pass 2 only.
-    auto scoped = phases ? phases->Scoped("fallback_two_pass_rank_sample") : PhaseRecorder::ScopedPhase(nullptr, "");
+    // Large-join branch: reuse deg[] computed in Phase 1 and run Pass-2 locate only.
+    auto scoped2 = phases ? phases->Scoped("fallback_pass2_locate_using_deg") : PhaseRecorder::ScopedPhase(nullptr, "");
     std::vector<PairId> pairs;
     if (!detail::TwoPassRankSampleUsingDeg(prep_, deg_order_, W_, t, rng, &pairs, phases, err)) {
       return false;
@@ -237,10 +219,9 @@ class TsunamiAdaptiveBaseline final : public IBaseline<Dim, T> {
 
   bool counted_ = false;
   u64 W_ = 0;
-  std::vector<u64> deg_order_;      // aligned with prep_.QueryOrder()
+  std::vector<u64> deg_order_;    // aligned with prep_.QueryOrder()
   Mode mode_ = Mode::Unknown;
-  std::vector<PairId> all_pairs_;   // only when mode_==EnumerateAll
-  u64 j_star_used_ = 0;             // JSTAR value actually used (may be auto-calculated)
+  std::vector<PairId> all_pairs_; // only when mode_==EnumerateAll and W_<=JSTAR
 };
 
 }  // namespace tsunami
