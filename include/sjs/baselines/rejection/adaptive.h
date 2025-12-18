@@ -1,22 +1,20 @@
 #pragma once
 // sjs/baselines/rejection/adaptive.h
 //
-// AGR-BoxJoin baseline (Variant::Adaptive).
+// AGR-BoxJoin baseline — Variant::Adaptive (AGR-AS)
 //
-// This follows the adaptive strategy described in "Amagata’25.md" (AGR-AS):
-//   - Build() performs the same preprocessing as the Sampling variant (AGR-S).
-//   - Count() enumerates join pairs until either:
-//       * the stream ends  (|J| <= J*): keep all pairs in memory (AllPairs)
-//         and return the exact join size;
-//       * more than J* pairs are seen (|J| > J*): discard AllPairs and switch
-//         to rejection sampling (AGR-S) for Sample(). Count() returns a pilot
-//         estimate of |J| in this case.
-//   - Sample() does:
-//       * if small join: i.i.d. uniform sampling with replacement from AllPairs
-//       * else: rejection sampling using the prebuilt alias tables
+// Doc-aligned adaptive strategy (docs/Baseline/Amagata’25 Baseline.md v2):
+//  - Preprocess once (same as AGR-S): build M_i, CellMap, (optional) SlabIndex, μ/alias.
+//  - Enumerate true join pairs until either:
+//      * stream ends (|J| <= J*): keep AllPairs and return exact |J|
+//      * more than J* pairs are seen (|J| > J*): clear AllPairs (avoid prefix bias)
+//        and switch to AGR-S for sampling.
+//  - Sample():
+//      * small join: array uniform sampling with replacement from AllPairs
+//      * large join: AGR-S rejection sampling using the already-built alias tables
 //
-// This class is still useful even if you also use the generic adaptive runner
-// in sjs/baselines/runners/adaptive_runner.h.
+// Empty join handling:
+//  - If enumeration finds 0 pairs, return empty and allow Sample() to return empty.
 
 #include "sjs/baselines/rejection/sampling.h"
 
@@ -57,7 +55,6 @@ class RejectionAdaptiveBaseline final : public IBaseline<Dim, T> {
              PhaseRecorder* phases,
              std::string* err) override {
     Reset();
-    // Build the shared preprocessing (cell map + alias).
     if (!st_.BuildIndex(ds, cfg, phases, err)) return false;
     mode_ = Mode::Unknown;
     return true;
@@ -79,59 +76,50 @@ class RejectionAdaptiveBaseline final : public IBaseline<Dim, T> {
 
     auto scoped = phases ? phases->Scoped("adaptive_phase1") : PhaseRecorder::ScopedPhase(nullptr, "");
 
-    // Effective J* bound.
+    // Effective J* bound: obey enum_cap if provided.
     u64 J_star = cfg.run.j_star;
     if (cfg.run.enum_cap > 0) J_star = std::min(J_star, cfg.run.enum_cap);
 
-    // Special-case: J_star==0 still performs a *minimal* enumeration to
-    // distinguish empty join from non-empty join, preventing non-termination.
+    // Special-case: J_star==0 still enumerates minimally to distinguish empty/non-empty,
+    // preventing the "AGR-S on empty join" non-termination scenario.
     const u64 limit = (J_star == 0) ? 1ULL : (J_star + 1ULL);
 
     all_pairs_.clear();
     exact_n_ = 0;
 
-    // Enumerate up to limit pairs.
     auto stream = std::make_unique<detail::RejectionJoinEnumerator<Dim, T>>(&st_);
     PairId p;
     u64 seen = 0;
-    bool hit_limit = false;
+    bool switch_to_sampling = false;
 
     while (stream->Next(&p)) {
       ++seen;
       if (seen <= J_star) {
-        // Store up to J* pairs.
         all_pairs_.push_back(p);
       } else {
-        // We have seen more than J*.
-        hit_limit = true;
+        switch_to_sampling = true;
         break;
       }
       if (seen >= limit) {
-        // For J_star==0, limit==1: stop after finding one pair.
-        if (J_star == 0) {
-          hit_limit = true;  // treat as non-empty and switch to sampling
-        }
+        if (J_star == 0) switch_to_sampling = true;  // found at least one pair
         break;
       }
     }
 
-    if (!hit_limit) {
+    if (!switch_to_sampling) {
       // Fully enumerated (|J| <= J*).
       mode_ = Mode::Enumerate;
       exact_n_ = seen;
-      // In this branch, all_pairs_ holds all pairs (since seen<=J*).
       *out = MakeExactCount(static_cast<u64>(exact_n_));
       return true;
     }
 
-    // Switch to sampling branch.
+    // Switch branch: discard prefix to avoid bias (doc §4.3).
     mode_ = Mode::Sampling;
     all_pairs_.clear();
 
-    // Provide a pilot estimate of |J| (without consuming the caller's RNG
-    // sequence, so Sample() remains reproducible given a seed).
+    // Provide a pilot estimate of |J| using RNG-isolated pilot (doc §5.4).
     if (!rng) {
-      // If rng is missing, fall back to an unknown estimate.
       *out = MakeEstimateCount(std::numeric_limits<long double>::quiet_NaN(),
                               std::numeric_limits<long double>::quiet_NaN(),
                               std::numeric_limits<long double>::quiet_NaN(),
@@ -139,9 +127,8 @@ class RejectionAdaptiveBaseline final : public IBaseline<Dim, T> {
                               0);
       return true;
     }
-
     Rng tmp = *rng;
-    return st_.EstimateCountByPilot(cfg, &tmp, out, phases, err);
+    return st_.EstimateCountByPilot(&tmp, out, phases, err);
   }
 
   bool Sample(const Config& cfg,
@@ -173,8 +160,7 @@ class RejectionAdaptiveBaseline final : public IBaseline<Dim, T> {
     }
 
     if (mode_ == Mode::Enumerate) {
-      // Sample directly from AllPairs.
-      if (all_pairs_.empty()) return true;
+      if (all_pairs_.empty()) return true;  // empty join
       out->pairs.resize(static_cast<usize>(t));
       const u64 N = static_cast<u64>(all_pairs_.size());
       for (u64 i = 0; i < t; ++i) {
@@ -183,46 +169,16 @@ class RejectionAdaptiveBaseline final : public IBaseline<Dim, T> {
       return true;
     }
 
-    // mode_ == Sampling: run rejection sampling (AGR-S).
-    // Since we only switch here after observing >J* pairs (or at least 1 pair
-    // when J*=0), the join is guaranteed non-empty.
-
-    if (st_.mu_sum == 0) {
-      // Defensive: if mu_sum==0, the join must be empty.
-      return true;
-    }
-
-    // Guard against pathological acceptance rates.
-    const detail::RejectionParams<Dim> p = detail::ReadRejectionParams<Dim, T>(*st_.ds, cfg);
-    u64 max_props = p.max_proposals;
-    if (max_props == 0) {
-      long double m = static_cast<long double>(p.max_factor) * static_cast<long double>(t);
-      const long double cap = static_cast<long double>(std::numeric_limits<u64>::max());
-      if (m > cap) m = cap;
-      max_props = static_cast<u64>(m);
-      if (max_props < 1000ULL) max_props = 1000ULL;
-    }
+    // mode_ == Sampling: run AGR-S (join guaranteed non-empty due to switch condition).
+    if (st_.mu_sum == 0) return true;  // defensive; implies join empty
 
     out->pairs.reserve(static_cast<usize>(t));
-
-    u64 props = 0;
     while (out->pairs.size() < static_cast<usize>(t)) {
-      if (max_props > 0 && props >= max_props) {
-        if (err) {
-          *err = "RejectionAdaptiveBaseline::Sample: reached max_proposals; acceptance rate extremely small";
-        }
-        return false;
-      }
-      ++props;
-
       u32 ai = 0, bi = 0;
-      if (!st_.DrawProposal(rng, &ai, &bi)) {
-        return true;
-      }
+      if (!st_.DrawProposal(rng, &ai, &bi)) return true;
       if (!st_.ABox(ai).Intersects(st_.BBox(bi))) continue;
       out->pairs.push_back(st_.MakeOutputPair(ai, bi));
     }
-
     return true;
   }
 

@@ -1,17 +1,21 @@
 #pragma once
 // sjs/baselines/rejection/enum_sampling.h
 //
-// AGR-BoxJoin baseline (Variant::EnumSampling).
+// AGR-BoxJoin baseline — Variant::EnumSampling (AGR-ES)
 //
-// This variant exposes a deterministic join enumerator (grid candidate scan)
-// and performs uniform sampling WITH replacement using two-pass rank sampling
-// over that stream.
+// This variant enumerates the true join J deterministically (grid candidate scan),
+// then performs i.i.d. uniform sampling WITH replacement from that stream
+// using two-pass rank sampling (no need to store AllPairs).
+//
+// Doc alignment:
+//  - Enumeration is exactly the AGR-ES "for r in A, for k in C(r), for s in CellMap[k], if Intersect then emit".
+//  - Sampling is array-uniform-with-replacement, implemented as rank sampling over the deterministic stream.
 //
 // See:
-//   - sjs/baselines/rejection/sampling.h (shared preprocessing + enumerator)
+//   - sjs/baselines/rejection/sampling.h (RejectionState + deterministic enumerator)
 //   - sjs/sampling/rank_sampling.h (generic two-pass rank sampling)
 
-#include "sjs/baselines/rejection/sampling.h"  // provides RejectionState + enumerator
+#include "sjs/baselines/rejection/sampling.h"
 #include "sjs/sampling/rank_sampling.h"
 
 #include <memory>
@@ -40,6 +44,9 @@ class RejectionEnumSamplingBaseline final : public IBaseline<Dim, T> {
              const Config& cfg,
              PhaseRecorder* phases,
              std::string* err) override {
+    // We reuse the same preprocessing builder as AGR-S / AGR-AS.
+    // (Building alias tables is not required for AGR-ES, but harmless and
+    // keeps the codepath consistent.)
     return st_.BuildIndex(ds, cfg, phases, err);
   }
 
@@ -48,6 +55,7 @@ class RejectionEnumSamplingBaseline final : public IBaseline<Dim, T> {
              CountResult* out,
              PhaseRecorder* phases,
              std::string* err) override {
+    (void)cfg;
     (void)rng;  // deterministic
     if (!st_.built) {
       if (err) *err = "RejectionEnumSamplingBaseline::Count: call Build() first";
@@ -61,14 +69,10 @@ class RejectionEnumSamplingBaseline final : public IBaseline<Dim, T> {
     auto scoped = phases ? phases->Scoped("count") : PhaseRecorder::ScopedPhase(nullptr, "");
 
     // Exact count by full enumeration.
-    auto stream = Enumerate(cfg, nullptr, err);
-    if (!stream) return false;
-
+    auto stream = std::make_unique<detail::RejectionJoinEnumerator<Dim, T>>(&st_);
     u64 n = 0;
     PairId p;
-    while (stream->Next(&p)) {
-      ++n;
-    }
+    while (stream->Next(&p)) ++n;
 
     *out = MakeExactCount(n);
     return true;
@@ -97,12 +101,8 @@ class RejectionEnumSamplingBaseline final : public IBaseline<Dim, T> {
     const u64 t = cfg.run.t;
     if (t == 0) return true;
 
-    std::string enum_err;
-    auto stream = Enumerate(cfg, nullptr, &enum_err);
-    if (!stream) {
-      if (err) *err = "RejectionEnumSamplingBaseline::Sample: Enumerate failed: " + enum_err;
-      return false;
-    }
+    // Two-pass rank sampling over deterministic enumerator.
+    auto stream = std::make_unique<detail::RejectionJoinEnumerator<Dim, T>>(&st_);
 
     sampling::RankSamplingInfo info;
     std::vector<PairId> samples;

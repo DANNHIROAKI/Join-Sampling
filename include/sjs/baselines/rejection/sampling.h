@@ -1,41 +1,51 @@
 #pragma once
 // sjs/baselines/rejection/sampling.h
 //
-// AGR-BoxJoin baseline (Amagata'25 style): grid upper bound \mu + alias + rejection.
-// Variant::Sampling (AGR-S).
+// AGR-BoxJoin baseline (Amagata'25-style) — Variant::Sampling (AGR-S)
 //
-// High-level idea
-// ---------------
-// Build():
-//   1) Pick a query side A and an indexed side B (default: A=R, B=S).
-//   2) Compute per-dimension max side length on B: M_i = max_b (hi_i - lo_i).
-//   3) Build a sparse hash grid on rep(b) (default rep(b)=b.lo).
-//   4) For each a in A, compute candidate cells C(a) that intersect
-//      E(a) = \prod_i [lo_i(a) - M_i, hi_i(a)).
-//      Define \mu(a) = \sum_{cell in C(a)} |CellMap[cell]|.
-//      Build AliasCell[a] on those cell sizes.
-//   5) Build global AliasA over all a with \mu(a) > 0.
+// Goal
+// ----
+// Output t i.i.d. uniform (with replacement) samples from the true box-intersection
+// join result:
+//   J = {(r,s) | r in A, s in B, Intersect(r,s)=true}.
 //
-// Sample():
-//   Repeat until t accepted samples:
-//     a ~ AliasA (weight \mu(a))
-//     cell ~ AliasCell[a] (weight cell size)
-//     b ~ Uniform(CellMap[cell])
-//     if Intersects(a,b): accept, output the join pair; else reject.
+// Design summary (matches docs/Baseline/Amagata’25 Baseline.md v2)
+// ---------------------------------------------------------------
+// 1) Half-open boxes: [lo,hi) and strict-intersection predicate.
+// 2) Fix representative point for indexed side B:
+//      rep(s) := lo(s)   (lower-left / minimum corner)   [fixed; no alternatives here]
+// 3) Sparse hash grid on rep(s):
+//      key_i(x) = floor(x_i / g_i).
+// 4) Upper bound construction:
+//      M_i := max_{s in B} (hi_i(s) - lo_i(s))
+//      E(r) := Π_i [lo_i(r) - M_i, hi_i(r))
+//      C(r) := { k in KeysNonEmpty | cell(k) ∩ E(r) != ∅ }   (cell-intersection definition)
+//      μ(r) := Σ_{k in C(r)} |CellMap[k]|
+// 5) Two-level alias sampling over the candidate superset U_prop:
+//      r ~ AliasR  with weight μ(r)
+//      k ~ AliasCell[r] with weight |CellMap[k]|
+//      s ~ Uniform(CellMap[k])
+//      accept iff Intersect(r,s)
 //
-// Correctness sketch:
-//   For any (a,b) such that b lies in a candidate cell of a, the proposal
-//   probability is 1 / \sum_a \mu(a) (a constant). Conditioning on accept
-//   (which is exactly the true intersection predicate) yields uniform sampling
-//   over the true join J. Independent RNG draws per proposal imply i.i.d.
+// Correctness:
+//  - Proposal probability is constant over U_prop: 1 / MuSum, where MuSum=Σ_r μ(r).
+//  - Conditioning on accept yields uniform over J.
+//  - Independent proposals => i.i.d.
 //
-// Notes
-// -----
-// * Geometry uses half-open boxes [lo,hi) as in the project.
-// * This is a baseline: performance depends heavily on how tight \mu is.
-// * Empty-join corner case: if |J|=0 but \sum \mu > 0, pure rejection would
-//   not terminate. We therefore include a configurable maximum-proposals guard
-//   (and the Adaptive variant should be used for robust empty-join handling).
+// Engineering boundary (as in the doc):
+//  - If MuSum==0, then |J|==0 (necessary condition) => return empty.
+//  - If MuSum>0 but |J|==0, AGR-S would not terminate; the Adaptive variant
+//    (AGR-AS) is the recommended safe entry point.
+//
+// Candidate-cell construction (doc §3.8):
+//  - Impl A (Naive): enumerate key hyper-rectangle and hash lookup.
+//  - Impl B (Slab, recommended): iterate only non-empty keys by bucketing on k1.
+//
+// This header supports both; default is Slab.
+//
+// NOTE: This baseline is intentionally "clean": we do NOT support experimental
+// representative points (e.g., center) in this baseline, because the coverage
+// proof (Lemma 1) is tied to rep(s)=lo(s).
 
 #include "sjs/baselines/baseline_api.h"
 
@@ -66,9 +76,22 @@ namespace rejection {
 
 namespace detail {
 
-// --------------------------
-// Extra-map parsing helpers
-// --------------------------
+// ---------------------------------
+// Extra-map parsing helpers (local)
+// ---------------------------------
+
+inline char ToLowerAscii(char c) noexcept {
+  if (c >= 'A' && c <= 'Z') return static_cast<char>(c - 'A' + 'a');
+  return c;
+}
+
+inline bool EqualsIgnoreCase(std::string_view a, std::string_view b) noexcept {
+  if (a.size() != b.size()) return false;
+  for (usize i = 0; i < a.size(); ++i) {
+    if (ToLowerAscii(a[i]) != ToLowerAscii(b[i])) return false;
+  }
+  return true;
+}
 
 inline std::optional<std::string_view> GetExtra(const std::unordered_map<std::string, std::string>& extra,
                                                 std::string_view key) {
@@ -90,19 +113,6 @@ inline bool ParseU64(std::string_view s, u64* out) {
   }
 }
 
-inline bool ParseI64(std::string_view s, i64* out) {
-  if (!out || s.empty()) return false;
-  try {
-    std::size_t idx = 0;
-    long long v = std::stoll(std::string(s), &idx, 10);
-    if (idx != s.size()) return false;
-    *out = static_cast<i64>(v);
-    return true;
-  } catch (...) {
-    return false;
-  }
-}
-
 inline bool ParseDouble(std::string_view s, double* out) {
   if (!out || s.empty()) return false;
   try {
@@ -118,12 +128,13 @@ inline bool ParseDouble(std::string_view s, double* out) {
 
 inline bool ParseBool(std::string_view s, bool* out) {
   if (!out || s.empty()) return false;
-  auto eq = sjs::detail::EqualsIgnoreCase;
-  if (eq(s, "1") || eq(s, "true") || eq(s, "yes") || eq(s, "y") || eq(s, "on")) {
+  if (EqualsIgnoreCase(s, "1") || EqualsIgnoreCase(s, "true") || EqualsIgnoreCase(s, "yes") ||
+      EqualsIgnoreCase(s, "y") || EqualsIgnoreCase(s, "on")) {
     *out = true;
     return true;
   }
-  if (eq(s, "0") || eq(s, "false") || eq(s, "no") || eq(s, "n") || eq(s, "off")) {
+  if (EqualsIgnoreCase(s, "0") || EqualsIgnoreCase(s, "false") || EqualsIgnoreCase(s, "no") ||
+      EqualsIgnoreCase(s, "n") || EqualsIgnoreCase(s, "off")) {
     *out = false;
     return true;
   }
@@ -167,14 +178,13 @@ inline std::string GetStringOr(const std::unordered_map<std::string, std::string
   return def;
 }
 
-// --------------------------
-// Cell-key & hashing (sparse hash grid)
-// --------------------------
+// ---------------------------------
+// Cell key & hashing (sparse grid)
+// ---------------------------------
 
 template <int Dim>
 struct CellKey {
   std::array<i64, Dim> k{};
-
   bool operator==(const CellKey& o) const noexcept { return k == o.k; }
 };
 
@@ -185,7 +195,7 @@ struct CellKeyHash {
     x += 0x9e3779b97f4a7c15ULL;
     x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
     x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
-    x = x ^ (x >> 31);
+    x ^= (x >> 31);
     return x;
   }
 
@@ -200,9 +210,18 @@ struct CellKeyHash {
   }
 };
 
-// --------------------------
+template <int Dim>
+inline bool KeyLexLess(const CellKey<Dim>& a, const CellKey<Dim>& b) noexcept {
+  for (int d = 0; d < Dim; ++d) {
+    if (a.k[d] < b.k[d]) return true;
+    if (b.k[d] < a.k[d]) return false;
+  }
+  return false;
+}
+
+// ---------------------------------
 // Numeric helpers for grid indexing
-// --------------------------
+// ---------------------------------
 
 inline i64 ClampToI64(long double v) noexcept {
   const long double lo = static_cast<long double>(std::numeric_limits<i64>::min());
@@ -212,61 +231,60 @@ inline i64 ClampToI64(long double v) noexcept {
   return static_cast<i64>(v);
 }
 
-inline i64 FloorDiv(long double x, long double g) noexcept {
-  // g must be > 0.
-  return ClampToI64(std::floor(x / g));
-}
+// floor(x/g) with mathematical floor (correct for negative x).
+inline i64 FloorDiv(long double x, long double g) noexcept { return ClampToI64(std::floor(x / g)); }
 
-inline i64 CeilDivMinus1(long double x, long double g) noexcept {
-  // For half-open [*, x): k_max = ceil(x/g) - 1.
-  return ClampToI64(std::ceil(x / g) - 1.0L);
-}
+// For half-open [*, x): k_max = ceil(x/g) - 1.
+inline i64 CeilDivMinus1(long double x, long double g) noexcept { return ClampToI64(std::ceil(x / g) - 1.0L); }
 
-// Representative point for an indexed box (default: lo corner).
-// If center=true, uses the box center.
-// NOTE: The correctness argument (coverage via E(a)) in Amagata'25-style proof
-// assumes rep(b)=lo(b). Center is provided for future experimentation and
-// may require adapting the upper-bound construction.
-template <int Dim, class T>
-inline Point<Dim, T> RepPoint(const Box<Dim, T>& b, bool center) noexcept {
-  if (!center) return b.lo;
-  Point<Dim, T> p;
-  for (int d = 0; d < Dim; ++d) {
-    p.v[d] = static_cast<T>((static_cast<long double>(b.lo.v[d]) + static_cast<long double>(b.hi.v[d])) * 0.5L);
-  }
-  return p;
-}
+// ---------------------------------
+// Parameters (strictly baseline-aligned)
+// ---------------------------------
 
-// --------------------------
-// Parameter bundle
-// --------------------------
+enum class CandidateCellsImpl : u8 {
+  // Doc §3.8 Impl B (recommended): iterate non-empty keys via slab index (bucket by k1).
+  Slab = 0,
+  // Doc §3.8 Impl A: enumerate hyper-rectangle keys and hash lookup.
+  Naive = 1,
+};
 
 template <int Dim>
 struct RejectionParams {
   // Grid cell size per dimension. Must be > 0.
   std::array<double, Dim> g{};
 
-  // If true: index on R and query S (swap sides). Default false (index on S).
+  // If true: swap sides (index on R and query S). Default false (index on S).
   bool swap_sides = false;
 
-  // Representative point choice.
-  bool rep_center = false;
+  // Candidate cell enumeration implementation (doc §3.8). Default Slab.
+  CandidateCellsImpl cand_impl = CandidateCellsImpl::Slab;
 
-  // Count() pilot draws for estimating |J| (Sampling variant).
+  // Pilot draws for estimating |J| (doc §5.4). 0 disables pilot.
   u64 count_draws = 50'000ULL;
-
-  // Maximum proposals allowed in Sample() to avoid infinite loops.
-  // If 0, we use max_factor * t.
-  u64 max_proposals = 0ULL;
-
-  // Default multiplier for max proposals when max_proposals==0.
-  u64 max_factor = 10'000ULL;
 };
 
+// Parse params from cfg (and reject unsupported experimental knobs).
 template <int Dim, class T>
-inline RejectionParams<Dim> ReadRejectionParams(const Dataset<Dim, T>& ds, const Config& cfg) {
+inline bool ReadRejectionParams(const Dataset<Dim, T>& ds,
+                                const Config& cfg,
+                                RejectionParams<Dim>* out,
+                                std::string* err) {
+  if (!out) {
+    if (err) *err = "ReadRejectionParams: out is null";
+    return false;
+  }
   RejectionParams<Dim> p;
   const auto& extra = cfg.run.extra;
+
+  // Strict baseline: reject experimental representative-point knobs if enabled.
+  // (rep(s) must be lo(s) for the coverage proof in the baseline doc.)
+  if (auto v = GetExtra(extra, "rej_rep_center")) {
+    bool b = false;
+    if (ParseBool(*v, &b) && b) {
+      if (err) *err = "AGR-BoxJoin baseline: rej_rep_center=true is not supported (baseline fixes rep(s)=lo(s))";
+      return false;
+    }
+  }
 
   // Side selection
   // Accepted keys:
@@ -274,19 +292,26 @@ inline RejectionParams<Dim> ReadRejectionParams(const Dataset<Dim, T>& ds, const
   //   - rej_index_side = "R" or "S" (which relation is indexed B)
   p.swap_sides = GetBoolOr(extra, "rej_swap", false);
   const std::string idx_side = GetStringOr(extra, "rej_index_side", GetStringOr(extra, "rej_index", "S"));
-  if (sjs::detail::EqualsIgnoreCase(idx_side, "r")) p.swap_sides = true;
-  if (sjs::detail::EqualsIgnoreCase(idx_side, "s")) p.swap_sides = false;
+  if (EqualsIgnoreCase(idx_side, "r")) p.swap_sides = true;
+  if (EqualsIgnoreCase(idx_side, "s")) p.swap_sides = false;
 
-  // Representative point
-  p.rep_center = GetBoolOr(extra, "rej_rep_center", false);
+  // Candidate-cell impl
+  // Accepted keys:
+  //   - rej_cand_impl = "slab" / "naive" / "A" / "B"
+  {
+    const std::string impl = GetStringOr(extra, "rej_cand_impl", "slab");
+    if (EqualsIgnoreCase(impl, "slab") || EqualsIgnoreCase(impl, "b")) {
+      p.cand_impl = CandidateCellsImpl::Slab;
+    } else if (EqualsIgnoreCase(impl, "naive") || EqualsIgnoreCase(impl, "a")) {
+      p.cand_impl = CandidateCellsImpl::Naive;
+    } else {
+      if (err) *err = "ReadRejectionParams: unknown rej_cand_impl (expected slab/naive/A/B)";
+      return false;
+    }
+  }
 
-  // Count pilot
+  // Pilot draws
   p.count_draws = GetU64Or(extra, "rej_count_draws", p.count_draws);
-
-  // Sample guard
-  p.max_proposals = GetU64Or(extra, "rej_max_proposals", p.max_proposals);
-  p.max_factor = GetU64Or(extra, "rej_max_factor", p.max_factor);
-  if (p.max_factor == 0) p.max_factor = 1;
 
   // Grid size defaults: derive from dataset domain.
   const auto dom = ds.Domain();
@@ -295,7 +320,7 @@ inline RejectionParams<Dim> ReadRejectionParams(const Dataset<Dim, T>& ds, const
     // Heuristic default: 64 bins per dimension.
     double gd = 1.0;
     if (w > 0.0L) gd = static_cast<double>(w / 64.0L);
-    if (!(gd > 0.0)) gd = 1.0;
+    if (!(gd > 0.0) || !std::isfinite(gd)) gd = 1.0;
     p.g[d] = gd;
   }
 
@@ -318,12 +343,13 @@ inline RejectionParams<Dim> ReadRejectionParams(const Dataset<Dim, T>& ds, const
     if (!(p.g[d] > 0.0) || !std::isfinite(p.g[d])) p.g[d] = 1.0;
   }
 
-  return p;
+  *out = p;
+  return true;
 }
 
-// --------------------------
-// RejectionState: shared preprocessing + sampling + enumerator support
-// --------------------------
+// ---------------------------------
+// RejectionState: preprocessing + sampling + enumerator support
+// ---------------------------------
 
 template <int Dim, class T>
 struct RejectionState {
@@ -331,14 +357,20 @@ struct RejectionState {
   using RelT = Relation<Dim, T>;
   using BoxT = Box<Dim, T>;
 
-  // Indexed side B is built into CellMap.
   using KeyT = CellKey<Dim>;
   using CellMapT = std::unordered_map<KeyT, std::vector<u32>, CellKeyHash<Dim>>;
 
+  // Slab index entry for doc §3.8 Impl B
+  struct SlabEntry {
+    KeyT key{};
+    const std::vector<u32>* cell = nullptr;  // points into cell_map
+  };
+  using SlabIndexT = std::unordered_map<i64, std::vector<SlabEntry>>;
+
   struct ActiveA {
     u32 a_index = 0;  // index into A->boxes
-    u64 mu = 0;       // \mu(a)
-    std::vector<const std::vector<u32>*> cells;  // candidate cell lists (pointers into cell_map)
+    u64 mu = 0;       // μ(a)
+    std::vector<const std::vector<u32>*> cells;  // pointers into cell_map (candidate cells C(a))
     sampling::AliasTable alias_cells;            // weights = cell sizes
   };
 
@@ -354,9 +386,12 @@ struct RejectionState {
   std::array<T, Dim> M{};  // per-dim max length on B
   CellMapT cell_map;
 
-  std::vector<ActiveA> active_a;
-  sampling::AliasTable alias_a;
-  u64 mu_sum = 0;  // sum over active A of \mu(a)
+  // Optional acceleration for candidate-cell enumeration (doc §3.8 Impl B).
+  SlabIndexT slab_index;
+
+  std::vector<ActiveA> active_a;   // A' = {a | μ(a)>0}
+  sampling::AliasTable alias_a;    // AliasR over active_a with weight μ(a)
+  u64 mu_sum = 0;                  // MuSum = Σ_{a in A} μ(a) (actually over active_a)
 
   // Diagnostics from the last pilot count.
   u64 last_pilot_draws = 0;
@@ -371,6 +406,7 @@ struct RejectionState {
     params = RejectionParams<Dim>{};
     M = {};
     cell_map.clear();
+    slab_index.clear();
     active_a.clear();
     alias_a.Clear();
     mu_sum = 0;
@@ -392,19 +428,18 @@ struct RejectionState {
   const BoxT& ABox(u32 a_index) const { return A->boxes[static_cast<usize>(a_index)]; }
   const BoxT& BBox(u32 b_index) const { return B->boxes[static_cast<usize>(b_index)]; }
 
-  // Compute the cell key for an indexed box b in B.
+  // Compute the cell key for an indexed box b in B using rep(b)=lo(b).
   KeyT KeyOfB(const BoxT& b) const {
     KeyT key;
-    const auto p = RepPoint<Dim, T>(b, params.rep_center);
     for (int d = 0; d < Dim; ++d) {
-      const long double x = static_cast<long double>(p.v[d]);
-      const long double g = static_cast<long double>(params.g[d]);
+      const long double x = static_cast<long double>(b.lo.v[d]);               // rep(b) := lo(b)
+      const long double g = static_cast<long double>(params.g[d]);             // g_i > 0
       key.k[d] = FloorDiv(x, g);
     }
     return key;
   }
 
-  // Candidate cell range for an a-box (half-open interval logic).
+  // Candidate cell index range for E(a)=Π_i [lo_i(a)-M_i, hi_i(a)) (half-open).
   void CandidateRange(const BoxT& a,
                       std::array<i64, Dim>* kmin,
                       std::array<i64, Dim>* kmax) const {
@@ -418,7 +453,7 @@ struct RejectionState {
     }
   }
 
-  // Enumerate all non-empty candidate cells for a (in deterministic lexicographic order).
+  // Enumerate all non-empty candidate cells for a (deterministic order).
   // For each found cell, calls emit(ptr_to_vector).
   template <class EmitFn>
   void ForEachCandidateCell(const BoxT& a, EmitFn&& emit) const {
@@ -431,17 +466,37 @@ struct RejectionState {
       if (mn[d] > mx[d]) return;
     }
 
+    // Impl B (Slab): iterate only non-empty keys by k1 buckets.
+    if (params.cand_impl == CandidateCellsImpl::Slab && !slab_index.empty()) {
+      for (i64 k1 = mn[0]; k1 <= mx[0]; ++k1) {
+        auto it = slab_index.find(k1);
+        if (it == slab_index.end()) continue;
+        const auto& bucket = it->second;
+        for (const SlabEntry& e : bucket) {
+          bool ok = true;
+          for (int d = 1; d < Dim; ++d) {
+            const i64 kd = e.key.k[d];
+            if (kd < mn[d] || kd > mx[d]) {
+              ok = false;
+              break;
+            }
+          }
+          if (!ok) continue;
+          if (e.cell && !e.cell->empty()) emit(e.cell);
+        }
+      }
+      return;
+    }
+
+    // Impl A (Naive): enumerate key hyper-rectangle and lookup cell_map.
     KeyT key;
     std::array<i64, Dim> cur{};
 
-    // Recursive enumeration over dimensions.
     const auto rec = [&](auto&& self, int dim) -> void {
       if (dim == Dim) {
         key.k = cur;
         auto it = cell_map.find(key);
-        if (it != cell_map.end() && !it->second.empty()) {
-          emit(&it->second);
-        }
+        if (it != cell_map.end() && !it->second.empty()) emit(&it->second);
         return;
       }
       for (i64 v = mn[dim]; v <= mx[dim]; ++v) {
@@ -453,14 +508,14 @@ struct RejectionState {
     rec(rec, 0);
   }
 
-  // Build preprocessing structures.
+  // Build preprocessing structures: M_i, CellMap, (optional) SlabIndex, μ/alias tables.
   bool BuildIndex(const DatasetT& ds_in, const Config& cfg, PhaseRecorder* phases, std::string* err) {
     Reset();
 
     auto scoped = phases ? phases->Scoped("build") : PhaseRecorder::ScopedPhase(nullptr, "");
-
     ds = &ds_in;
-    params = ReadRejectionParams<Dim, T>(ds_in, cfg);
+
+    if (!ReadRejectionParams<Dim, T>(ds_in, cfg, &params, err)) return false;
 
     // Choose A/B.
     swapped = params.swap_sides;
@@ -479,7 +534,7 @@ struct RejectionState {
       return false;
     }
 
-    // Compute M_i on B.
+    // (1) Compute M_i on B.
     {
       auto sc = phases ? phases->Scoped("build_M") : PhaseRecorder::ScopedPhase(nullptr, "");
       for (int d = 0; d < Dim; ++d) M[d] = static_cast<T>(0);
@@ -493,7 +548,7 @@ struct RejectionState {
       }
     }
 
-    // Build CellMap on B.
+    // (2) Build CellMap on B using rep(b)=lo(b).
     {
       auto sc = phases ? phases->Scoped("build_cellmap") : PhaseRecorder::ScopedPhase(nullptr, "");
       cell_map.clear();
@@ -503,12 +558,31 @@ struct RejectionState {
         const BoxT& b = B->boxes[i];
         if (b.IsEmpty()) continue;
         const KeyT key = KeyOfB(b);
-        auto& vec = cell_map[key];
-        vec.push_back(static_cast<u32>(i));
+        cell_map[key].push_back(static_cast<u32>(i));
       }
     }
 
-    // Build per-a candidate cells + AliasCell[a] for a with \mu(a) > 0.
+    // (3) Optional SlabIndex (doc §3.8 Impl B).
+    slab_index.clear();
+    if (params.cand_impl == CandidateCellsImpl::Slab) {
+      auto sc = phases ? phases->Scoped("build_slab_index") : PhaseRecorder::ScopedPhase(nullptr, "");
+      slab_index.reserve(std::max<usize>(cell_map.size(), 1));
+      for (const auto& kv : cell_map) {
+        const KeyT& key = kv.first;
+        const auto& vec = kv.second;
+        if (vec.empty()) continue;
+        slab_index[key.k[0]].push_back(SlabEntry{key, &vec});
+      }
+      // Sort each bucket for deterministic enumeration order.
+      for (auto& kv : slab_index) {
+        auto& bucket = kv.second;
+        std::sort(bucket.begin(), bucket.end(), [](const SlabEntry& a, const SlabEntry& b) {
+          return KeyLexLess<Dim>(a.key, b.key);
+        });
+      }
+    }
+
+    // (4) For each a in A: build candidate cells C(a), μ(a), AliasCell[a].
     {
       auto sc = phases ? phases->Scoped("build_mu_alias") : PhaseRecorder::ScopedPhase(nullptr, "");
       active_a.clear();
@@ -525,13 +599,11 @@ struct RejectionState {
         rec.a_index = ai;
         rec.mu = 0;
 
-        // Collect candidate cells and weights.
         std::vector<u64> cell_w;
 
         ForEachCandidateCell(a, [&](const std::vector<u32>* cell) {
-          SJS_DASSERT(cell != nullptr);
+          if (!cell || cell->empty()) return;
           const u64 w = static_cast<u64>(cell->size());
-          if (w == 0) return;
           rec.cells.push_back(cell);
           cell_w.push_back(w);
           rec.mu += w;
@@ -539,7 +611,7 @@ struct RejectionState {
 
         if (rec.mu == 0) continue;
 
-        // Build alias for this a.
+        // Build alias on C(a) with weights |CellMap[k]|.
         std::string aerr;
         if (!rec.alias_cells.BuildFromU64(Span<const u64>(cell_w), &aerr)) {
           if (err) *err = "RejectionState::BuildIndex: AliasCell build failed: " + aerr;
@@ -551,17 +623,17 @@ struct RejectionState {
         active_a.push_back(std::move(rec));
       }
 
-      // If mu_sum==0 => join must be empty.
       if (active_a.empty()) {
+        // By doc §4.0 necessary condition: MuSum==0 => join empty.
         alias_a.Clear();
         built = true;
         return true;
       }
 
-      // Global alias over active A.
+      // (5) Global AliasR over A' with weights μ(a).
       std::string aerr;
       if (!alias_a.BuildFromU64(Span<const u64>(w_a), &aerr)) {
-        if (err) *err = "RejectionState::BuildIndex: AliasA build failed: " + aerr;
+        if (err) *err = "RejectionState::BuildIndex: AliasR build failed: " + aerr;
         return false;
       }
     }
@@ -570,8 +642,8 @@ struct RejectionState {
     return true;
   }
 
-  // Draw one proposal (a_index, b_index) from the candidate superset.
-  // Returns false if mu_sum==0 (no proposals possible).
+  // Draw one proposal (a_index, b_index) from U_prop.
+  // Returns false if MuSum==0 (no proposals possible).
   bool DrawProposal(Rng* rng, u32* out_a_index, u32* out_b_index) const {
     SJS_DASSERT(rng != nullptr);
     SJS_DASSERT(out_a_index != nullptr);
@@ -587,7 +659,7 @@ struct RejectionState {
     const std::vector<u32>* cell = ar.cells[ci];
     SJS_DASSERT(cell != nullptr);
     const u32 n = static_cast<u32>(cell->size());
-    if (n == 0) return false;  // should not happen
+    SJS_DASSERT(n > 0);
 
     const u32 bj = (*cell)[static_cast<usize>(rng->UniformU32(n))];
 
@@ -596,9 +668,9 @@ struct RejectionState {
     return true;
   }
 
-  // Estimate |J| using a fixed number of proposals (pilot) and intersection tests.
-  bool EstimateCountByPilot(const Config& cfg,
-                            Rng* rng,
+  // Pilot estimate of |J| (doc §5.4): |J| = MuSum * p_acc, p_acc ≈ accepts/draws.
+  // IMPORTANT: caller should pass an RNG copy to keep the main RNG stream unchanged.
+  bool EstimateCountByPilot(Rng* rng,
                             CountResult* out,
                             PhaseRecorder* phases,
                             std::string* err) {
@@ -620,9 +692,9 @@ struct RejectionState {
       return true;
     }
 
-    const u64 m = ReadRejectionParams<Dim, T>(*ds, cfg).count_draws;
+    const u64 m = params.count_draws;
     if (m == 0) {
-      // No pilot requested.
+      // Pilot disabled: return "unknown" estimate.
       *out = MakeEstimateCount(std::numeric_limits<long double>::quiet_NaN(),
                               std::numeric_limits<long double>::quiet_NaN(),
                               std::numeric_limits<long double>::quiet_NaN(),
@@ -659,7 +731,7 @@ struct RejectionState {
     const long double se_p = (var > 0.0L) ? std::sqrt(var) : 0.0L;
     const long double se_est = mu * se_p;
 
-    // Normal approximation CI (good when draws is not too small).
+    // Normal approximation CI.
     const long double z = 1.9599639845400542L;  // ~N(0,1) 97.5% quantile
     long double lo = p_hat - z * se_p;
     long double hi = p_hat + z * se_p;
@@ -671,9 +743,9 @@ struct RejectionState {
   }
 };
 
-// --------------------------
+// ---------------------------------
 // Deterministic join enumerator (grid candidate scan)
-// --------------------------
+// ---------------------------------
 
 template <int Dim, class T>
 class RejectionJoinEnumerator final : public IJoinEnumerator {
@@ -700,20 +772,16 @@ class RejectionJoinEnumerator final : public IJoinEnumerator {
     if (!st_ || !st_->built || !st_->A || !st_->B) return false;
 
     while (true) {
-      // Exhausted all A.
-      if (a_pos_ >= st_->A->Size()) return false;
+      if (a_pos_ >= st_->A->Size()) return false;  // exhausted A
 
-      // If no current cell, advance.
       if (cur_cell_ == nullptr) {
         if (!AdvanceCell()) {
-          // Move to next A.
           ++a_pos_;
           PrepareNextA();
           continue;
         }
       }
 
-      // Scan within current cell.
       SJS_DASSERT(cur_cell_ != nullptr);
       while (b_pos_ < cur_cell_->size()) {
         const u32 bi = (*cur_cell_)[b_pos_++];
@@ -728,8 +796,7 @@ class RejectionJoinEnumerator final : public IJoinEnumerator {
         return true;
       }
 
-      // Done with this cell; move to next cell.
-      cur_cell_ = nullptr;
+      cur_cell_ = nullptr;  // done with this cell
     }
   }
 
@@ -742,7 +809,6 @@ class RejectionJoinEnumerator final : public IJoinEnumerator {
     cell_i_ = 0;
     b_pos_ = 0;
 
-    // Find first A with non-empty candidate cells.
     while (st_ && st_->A && a_pos_ < st_->A->Size()) {
       const BoxT& a = st_->A->boxes[a_pos_];
       if (!a.IsEmpty()) {
@@ -765,8 +831,6 @@ class RejectionJoinEnumerator final : public IJoinEnumerator {
     return false;
   }
 
-  void PrepareNextAStub() { (void)0; }
-
   const StateT* st_{nullptr};
   join::JoinStats stats_;
 
@@ -779,9 +843,9 @@ class RejectionJoinEnumerator final : public IJoinEnumerator {
 
 }  // namespace detail
 
-// --------------------------
+// ---------------------------------
 // RejectionSamplingBaseline (AGR-S)
-// --------------------------
+// ---------------------------------
 
 template <int Dim, class T = Scalar>
 class RejectionSamplingBaseline final : public IBaseline<Dim, T> {
@@ -808,8 +872,27 @@ class RejectionSamplingBaseline final : public IBaseline<Dim, T> {
              CountResult* out,
              PhaseRecorder* phases,
              std::string* err) override {
-    // Pilot-based estimate by default.
-    return st_.EstimateCountByPilot(cfg, rng, out, phases, err);
+    (void)cfg;  // cfg already used in Build; pilot uses stored params (count_draws)
+    if (!st_.built) {
+      if (err) *err = "RejectionSamplingBaseline::Count: call Build() first";
+      return false;
+    }
+    if (!out) {
+      if (err) *err = "RejectionSamplingBaseline::Count: out is null";
+      return false;
+    }
+
+    // Doc §5.4: pilot must be RNG-isolated so Sample() remains reproducible.
+    if (!rng) {
+      *out = MakeEstimateCount(std::numeric_limits<long double>::quiet_NaN(),
+                              std::numeric_limits<long double>::quiet_NaN(),
+                              std::numeric_limits<long double>::quiet_NaN(),
+                              std::numeric_limits<long double>::quiet_NaN(),
+                              0);
+      return true;
+    }
+    Rng tmp = *rng;
+    return st_.EstimateCountByPilot(&tmp, out, phases, err);
   }
 
   bool Sample(const Config& cfg,
@@ -835,43 +918,15 @@ class RejectionSamplingBaseline final : public IBaseline<Dim, T> {
     const u64 t = cfg.run.t;
     if (t == 0) return true;
 
-    if (st_.mu_sum == 0) {
-      // Necessary condition for non-empty join.
-      return true;
-    }
-
-    // Proposal guard.
-    const detail::RejectionParams<Dim> p = detail::ReadRejectionParams<Dim, T>(*st_.ds, cfg);
-    u64 max_props = p.max_proposals;
-    if (max_props == 0) {
-      // Default: max_factor * t, clamped.
-      long double m = static_cast<long double>(p.max_factor) * static_cast<long double>(t);
-      const long double cap = static_cast<long double>(std::numeric_limits<u64>::max());
-      if (m > cap) m = cap;
-      max_props = static_cast<u64>(m);
-      // Ensure a small absolute floor so tiny t doesn't set a tiny budget.
-      if (max_props < 1000ULL) max_props = 1000ULL;
-    }
+    // Doc §4.0: MuSum==0 is a necessary condition for empty join.
+    if (st_.mu_sum == 0) return true;
 
     out->pairs.reserve(static_cast<usize>(t));
 
-    u64 props = 0;
+    // AGR-S: repeat proposals until t accepts.
     while (out->pairs.size() < static_cast<usize>(t)) {
-      if (max_props > 0 && props >= max_props) {
-        if (err) {
-          *err = "RejectionSamplingBaseline::Sample: reached max_proposals without collecting enough accepts; "
-                 "acceptance rate may be ~0 (empty join?) or extremely small";
-        }
-        return false;
-      }
-      ++props;
-
       u32 ai = 0, bi = 0;
-      if (!st_.DrawProposal(rng, &ai, &bi)) {
-        // Should only happen if mu_sum==0.
-        return true;
-      }
-
+      if (!st_.DrawProposal(rng, &ai, &bi)) return true;  // should only happen if MuSum==0
       if (!st_.ABox(ai).Intersects(st_.BBox(bi))) continue;
       out->pairs.push_back(st_.MakeOutputPair(ai, bi));
     }
