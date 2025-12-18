@@ -8,8 +8,8 @@
 //   - CSV (for debugging/visualization)
 //
 // Examples:
-//   ./sjs_gen_dataset --dataset_source=synthetic --gen=stripe --dataset=demo \
-//             --n_r=100000 --n_s=100000 --alpha=1e-6 --gen_seed=1 \
+//   ./sjs_gen_dataset --dataset_source=synthetic --gen=stripe --dataset=demo
+//             --n_r=100000 --n_s=100000 --alpha=1e-6 --gen_seed=1
 //             --out_dir=data/demo --write_csv=1
 //
 // Output default files:

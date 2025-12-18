@@ -412,6 +412,7 @@ class TsunamiPreproc {
   }
 
   bool Build(const DatasetT& ds, const Config& cfg, PhaseRecorder* phases, std::string* err) {
+    (void)err;
     auto scoped = phases ? phases->Scoped("tsunami_build") : PhaseRecorder::ScopedPhase(nullptr, "");
 
     Reset();

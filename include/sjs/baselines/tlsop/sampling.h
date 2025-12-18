@@ -454,7 +454,6 @@ class TLSOPIndex {
     }
 
     auto fill_side = [&](const Relation<Dim, T>& rel, bool is_r_side) {
-      const int base = is_r_side ? 0 : 4;
       for (usize idx = 0; idx < rel.boxes.size(); ++idx) {
         const auto& b = rel.boxes[idx];
         if (b.IsEmpty()) continue;

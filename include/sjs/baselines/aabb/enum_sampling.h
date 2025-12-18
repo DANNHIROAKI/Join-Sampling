@@ -40,6 +40,7 @@ class AABBEnumSamplingBaseline final : public IBaseline<Dim, T> {
 
   bool Build(const DatasetT& ds, const Config& cfg, PhaseRecorder* phases, std::string* err) override {
     (void)cfg;
+    (void)err;
     auto scoped = phases ? phases->Scoped("build") : PhaseRecorder::ScopedPhase(nullptr, "");
 
     ds_ = &ds;

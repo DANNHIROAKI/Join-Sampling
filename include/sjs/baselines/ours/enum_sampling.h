@@ -62,6 +62,7 @@ class OursEnumSamplingBaseline final : public IBaseline<Dim, T> {
              CountResult* out,
              PhaseRecorder* phases,
              std::string* err) override {
+    (void)cfg;
     (void)rng;
     if (!built_ || ds_ == nullptr) {
       if (err) *err = "OursEnumSamplingBaseline::Count: call Build() first";

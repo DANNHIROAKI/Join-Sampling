@@ -13,8 +13,8 @@
 //   unchanged.
 //
 // Example (future, after implementing loaders):
-//   ./sjs_convert_realdata --src_r=geojson --in_r=roads.geojson \
-//                         --src_s=geojson --in_s=buildings.geojson \
+//   ./sjs_convert_realdata --src_r=geojson --in_r=roads.geojson
+//                         --src_s=geojson --in_s=buildings.geojson
 //                         --out_r=data/real/roads.bin --out_s=data/real/buildings.bin
 
 #include "sjs/core/logging.h"

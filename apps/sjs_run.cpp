@@ -9,13 +9,13 @@
 // This app is intended to be the basic building block for larger sweeps.
 //
 // Examples:
-//   ./sjs_run --dataset_source=synthetic --gen=stripe --dataset=demo \
-//             --n_r=100000 --n_s=100000 --alpha=1e-6 --gen_seed=1 \
-//             --method=ours --variant=sampling --t=100000 --seed=1 --repeats=3 \
+//   ./sjs_run --dataset_source=synthetic --gen=stripe --dataset=demo
+//             --n_r=100000 --n_s=100000 --alpha=1e-6 --gen_seed=1
+//             --method=ours --variant=sampling --t=100000 --seed=1 --repeats=3
 //             --out_dir=out/demo
 //
-//   ./sjs_run --dataset_source=binary --path_r=data/R.bin --path_s=data/S.bin \
-//             --method=aabb --variant=enum_sampling --t=10000 --enum_cap=500000 \
+//   ./sjs_run --dataset_source=binary --path_r=data/R.bin --path_s=data/S.bin
+//             --method=aabb --variant=enum_sampling --t=10000 --enum_cap=500000
 //             --out_dir=out/bin_case
 
 #include "baselines/baseline_factory_2d.h"

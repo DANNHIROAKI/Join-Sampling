@@ -88,7 +88,7 @@ static void TestChiSquareUniform(TestContext& t) {
 
   CHECK_NEAR(t, r.statistic, 0.0, 1e-12);
   CHECK_NEAR(t, r.p_value, 1.0, 1e-12);
-  CHECK_EQ(t, r.df, 3);
+  CHECK_EQ(t, r.df, 3u);
 }
 
 static void TestKSUniform01(TestContext& t) {

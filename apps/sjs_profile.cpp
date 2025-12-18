@@ -9,9 +9,9 @@
 //   - Did adaptive branch enumerate-all or fallback?
 //
 // Example:
-//   ./sjs_profile --dataset_source=synthetic --gen=stripe --dataset=demo \
-//     --n_r=200000 --n_s=200000 --alpha=1e-6 --gen_seed=1 \
-//     --method=ours --variant=adaptive --t=100000 --seed=1 \
+//   ./sjs_profile --dataset_source=synthetic --gen=stripe --dataset=demo
+//     --n_r=200000 --n_s=200000 --alpha=1e-6 --gen_seed=1
+//     --method=ours --variant=adaptive --t=100000 --seed=1
 //     --out_dir=out/profile_demo
 
 #include "baselines/baseline_factory_2d.h"
