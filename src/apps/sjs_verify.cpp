@@ -198,7 +198,7 @@ inline void PrintUsage() {
 }
 
 inline double RelErr(double est, double truth) {
-  if (!(truth != 0.0)) return std::numeric_limits<double>::quiet_NaN();
+  if (truth == 0.0) return std::numeric_limits<double>::quiet_NaN();
   return (est - truth) / truth;
 }
 
