@@ -180,7 +180,7 @@ class StripeCtrlAlphaGenerator final : public ISyntheticGenerator<Dim, T> {
       detail::SetErr(err, "StripeCtrlAlphaGenerator: gap size g must be > 0");
       return false;
     }
-    if (!((spec.n_s + 1) * g < L)) {
+    if (!(static_cast<double>(spec.n_s + 1) * g < L)) {
       detail::SetErr(err, "StripeCtrlAlphaGenerator: (n_s+1)*g must be < domain_length");
       return false;
     }
@@ -278,14 +278,15 @@ class StripeCtrlAlphaGenerator final : public ISyntheticGenerator<Dim, T> {
     for (u64 j = 0; j < spec.n_s; ++j) {
       BoxT b;
       for (int axis = 0; axis < Dim; ++axis) {
+        const usize axis_idx = static_cast<usize>(axis);
         if (axis == control_axis) {
-          b.lo.v[axis] = static_cast<T>(strip_lo[static_cast<usize>(j)]);
-          b.hi.v[axis] = static_cast<T>(strip_hi[static_cast<usize>(j)]);
+          b.lo.v[axis_idx] = static_cast<T>(strip_lo[static_cast<usize>(j)]);
+          b.hi.v[axis_idx] = static_cast<T>(strip_hi[static_cast<usize>(j)]);
         } else {
           double lo, hi;
           sample_core_interval(axis, &lo, &hi);
-          b.lo.v[axis] = static_cast<T>(lo);
-          b.hi.v[axis] = static_cast<T>(hi);
+          b.lo.v[axis_idx] = static_cast<T>(lo);
+          b.hi.v[axis_idx] = static_cast<T>(hi);
         }
       }
       S.boxes[static_cast<usize>(j)] = b;
@@ -324,8 +325,9 @@ class StripeCtrlAlphaGenerator final : public ISyntheticGenerator<Dim, T> {
         if (axis == control_axis) continue;
         double lo, hi;
         sample_core_interval(axis, &lo, &hi);
-        b.lo.v[axis] = static_cast<T>(lo);
-        b.hi.v[axis] = static_cast<T>(hi);
+        const usize axis_idx = static_cast<usize>(axis);
+        b.lo.v[axis_idx] = static_cast<T>(lo);
+        b.hi.v[axis_idx] = static_cast<T>(hi);
       }
 
       // Control axis interval.
@@ -354,8 +356,9 @@ class StripeCtrlAlphaGenerator final : public ISyntheticGenerator<Dim, T> {
         }
         const double y0 = rng.UniformDouble(lo_y, hi_y);
         const double y1 = y0 + delta;
-        b.lo.v[control_axis] = static_cast<T>(y0);
-        b.hi.v[control_axis] = static_cast<T>(y1);
+        const usize control_axis_idx = static_cast<usize>(control_axis);
+        b.lo.v[control_axis_idx] = static_cast<T>(y0);
+        b.hi.v[control_axis_idx] = static_cast<T>(y1);
       } else {
         if (di > spec.n_s) {
           detail::SetErr(err, "StripeCtrlAlphaGenerator: degree di > n_s (bug)");
@@ -371,8 +374,9 @@ class StripeCtrlAlphaGenerator final : public ISyntheticGenerator<Dim, T> {
           detail::SetErr(err, "StripeCtrlAlphaGenerator: invalid y interval (delta too large?)");
           return false;
         }
-        b.lo.v[control_axis] = static_cast<T>(y0);
-        b.hi.v[control_axis] = static_cast<T>(y1);
+        const usize control_axis_idx = static_cast<usize>(control_axis);
+        b.lo.v[control_axis_idx] = static_cast<T>(y0);
+        b.hi.v[control_axis_idx] = static_cast<T>(y1);
       }
 
       R.boxes[static_cast<usize>(i)] = b;

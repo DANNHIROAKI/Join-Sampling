@@ -70,7 +70,8 @@ inline bool IntersectsBox(const Box<Dim, T>& a,
 
   for (int d = 0; d < Dim; ++d) {
     if (skip_enabled && d == skip_axis) continue;
-    if (!Intersects1D<T>(a.lo.v[d], a.hi.v[d], b.lo.v[d], b.hi.v[d])) return false;
+    const usize d_idx = static_cast<usize>(d);
+    if (!Intersects1D<T>(a.lo.v[d_idx], a.hi.v[d_idx], b.lo.v[d_idx], b.hi.v[d_idx])) return false;
   }
   return true;
 }

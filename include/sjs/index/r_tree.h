@@ -253,7 +253,8 @@ class RTree {
 
     for (usize s0 = 0; s0 < n; s0 += slice_cap) {
       const usize s1 = std::min(n, s0 + slice_cap);
-      std::sort(v.begin() + s0, v.begin() + s1, [](const Ref& a, const Ref& b) {
+      std::sort(v.begin() + static_cast<std::ptrdiff_t>(s0), 
+                v.begin() + static_cast<std::ptrdiff_t>(s1), [](const Ref& a, const Ref& b) {
         const T ay = CenterCoord(a.bbox, 1);
         const T by = CenterCoord(b.bbox, 1);
         if (ay < by) return true;

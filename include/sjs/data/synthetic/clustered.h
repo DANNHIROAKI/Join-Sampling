@@ -66,8 +66,9 @@ class Normal01 {
 template <int Dim, class T>
 inline void ClampPointToDomain(Point<Dim, T>* p, double dom_lo, double dom_hi) {
   for (int i = 0; i < Dim; ++i) {
-    if (p->v[i] < static_cast<T>(dom_lo)) p->v[i] = static_cast<T>(dom_lo);
-    if (p->v[i] > static_cast<T>(dom_hi)) p->v[i] = static_cast<T>(dom_hi);
+    const usize idx = static_cast<usize>(i);
+    if (p->v[idx] < static_cast<T>(dom_lo)) p->v[idx] = static_cast<T>(dom_lo);
+    if (p->v[idx] > static_cast<T>(dom_hi)) p->v[idx] = static_cast<T>(dom_hi);
   }
 }
 
@@ -77,10 +78,11 @@ inline Box<Dim, T> BoxFromCenterWidth(const Point<Dim, T>& c, const Point<Dim, T
                                       double dom_lo, double dom_hi) {
   Box<Dim, T> b;
   for (int axis = 0; axis < Dim; ++axis) {
-    const double width = static_cast<double>(w.v[axis]);
+    const usize axis_idx = static_cast<usize>(axis);
+    const double width = static_cast<double>(w.v[axis_idx]);
     const double half = width * 0.5;
-    double lo = static_cast<double>(c.v[axis]) - half;
-    double hi = static_cast<double>(c.v[axis]) + half;
+    double lo = static_cast<double>(c.v[axis_idx]) - half;
+    double hi = static_cast<double>(c.v[axis_idx]) + half;
 
     // If width exceeds domain, clamp to full domain.
     if (width >= (dom_hi - dom_lo)) {
@@ -109,8 +111,8 @@ inline Box<Dim, T> BoxFromCenterWidth(const Point<Dim, T>& c, const Point<Dim, T
       if (!(hi > lo)) hi = lo + 1e-12;
     }
 
-    b.lo.v[axis] = static_cast<T>(lo);
-    b.hi.v[axis] = static_cast<T>(hi);
+    b.lo.v[axis_idx] = static_cast<T>(lo);
+    b.hi.v[axis_idx] = static_cast<T>(hi);
   }
   return b;
 }
@@ -170,7 +172,8 @@ class ClusteredGenerator final : public ISyntheticGenerator<Dim, T> {
       for (int k = 0; k < K; ++k) {
         PointT c;
         for (int axis = 0; axis < Dim; ++axis) {
-          c.v[axis] = static_cast<T>(rng_centers.UniformDouble(dom_lo, dom_hi));
+          const usize axis_idx = static_cast<usize>(axis);
+          c.v[axis_idx] = static_cast<T>(rng_centers.UniformDouble(dom_lo, dom_hi));
         }
         centers[static_cast<usize>(k)] = c;
       }
@@ -200,18 +203,20 @@ class ClusteredGenerator final : public ISyntheticGenerator<Dim, T> {
 
         // Jitter
         for (int axis = 0; axis < Dim; ++axis) {
+          const usize axis_idx = static_cast<usize>(axis);
           const double jitter = sigma * normal.Next();
-          double v = static_cast<double>(center.v[axis]) + jitter;
+          double v = static_cast<double>(center.v[axis_idx]) + jitter;
           if (v < dom_lo) v = dom_lo;
           if (v > dom_hi) v = dom_hi;
-          center.v[axis] = static_cast<T>(v);
+          center.v[axis_idx] = static_cast<T>(v);
         }
 
         // Width per axis
         PointT w;
         for (int axis = 0; axis < Dim; ++axis) {
+          const usize axis_idx = static_cast<usize>(axis);
           const double wf = rng.UniformDouble(w_min_frac, w_max_frac);
-          w.v[axis] = static_cast<T>(wf * L);
+          w.v[axis_idx] = static_cast<T>(wf * L);
         }
 
         BoxT b = detail::BoxFromCenterWidth<Dim, T>(center, w, dom_lo, dom_hi);
@@ -238,7 +243,8 @@ class ClusteredGenerator final : public ISyntheticGenerator<Dim, T> {
       for (int k = 0; k < K; ++k) {
         PointT c;
         for (int axis = 0; axis < Dim; ++axis) {
-          c.v[axis] = static_cast<T>(rng_centers_s.UniformDouble(dom_lo, dom_hi));
+          const usize axis_idx = static_cast<usize>(axis);
+          c.v[axis_idx] = static_cast<T>(rng_centers_s.UniformDouble(dom_lo, dom_hi));
         }
         centers_s[static_cast<usize>(k)] = c;
       }

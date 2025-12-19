@@ -80,8 +80,9 @@ class UniformGenerator final : public ISyntheticGenerator<Dim, T> {
           const double max_lo = dom_hi - w;
           const double lo = rng.UniformDouble(dom_lo, max_lo);
           const double hi = lo + w;
-          b.lo.v[axis] = static_cast<T>(lo);
-          b.hi.v[axis] = static_cast<T>(hi);
+          const usize axis_idx = static_cast<usize>(axis);
+          b.lo.v[axis_idx] = static_cast<T>(lo);
+          b.hi.v[axis_idx] = static_cast<T>(hi);
         }
         out_rel->boxes[static_cast<usize>(i)] = b;
         out_rel->ids[static_cast<usize>(i)] = static_cast<Id>(i);

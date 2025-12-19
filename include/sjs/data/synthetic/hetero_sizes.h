@@ -124,8 +124,9 @@ class HeteroSizesGenerator final : public ISyntheticGenerator<Dim, T> {
             if (!(hi > lo)) hi = lo + 1e-12;
           }
 
-          b.lo.v[axis] = static_cast<T>(lo);
-          b.hi.v[axis] = static_cast<T>(hi);
+          const usize axis_idx = static_cast<usize>(axis);
+          b.lo.v[axis_idx] = static_cast<T>(lo);
+          b.hi.v[axis_idx] = static_cast<T>(hi);
         }
 
         out_rel->boxes[static_cast<usize>(i)] = b;

@@ -287,8 +287,9 @@ struct GlobalRankEmbedding {
 
     for (int i = 0; i < M; ++i) {
       const int axis = i + 1;
-      const T rhs = q.hi.v[axis];  // R_a(q)
-      const T lhs = q.lo.v[axis];  // L_a(q)
+      const usize axis_idx = static_cast<usize>(axis);
+      const T rhs = q.hi.v[axis_idx];  // R_a(q)
+      const T lhs = q.lo.v[axis_idx];  // L_a(q)
 
       // ub = first position with (value, gid) >= (rhs, LOW)
       const Key k_hi{rhs, LOW};

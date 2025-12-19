@@ -402,7 +402,9 @@ class TsunamiRankEncoding {
     Reset();
     n_data_ = rel_data.Size();
     for (int axis = 0; axis < K; ++axis) {
+      const usize axis_idx = static_cast<usize>(axis);
       BuildAxis(rel_data, axis);
+      (void)axis_idx;  // axis_idx not used here, but needed for consistency
     }
   }
 
@@ -410,8 +412,9 @@ class TsunamiRankEncoding {
   PointK EncodeDataPoint(u32 data_idx) const {
     PointK p;
     for (int axis = 0; axis < K; ++axis) {
-      const u32 r = axes_[axis].rank_of_data_idx[static_cast<usize>(data_idx)];
-      p.v[static_cast<usize>(axis)] = static_cast<T>(r);
+      const usize axis_idx = static_cast<usize>(axis);
+      const u32 r = axes_[axis_idx].rank_of_data_idx[static_cast<usize>(data_idx)];
+      p.v[axis_idx] = static_cast<T>(r);
     }
     return p;
   }
@@ -460,7 +463,11 @@ class TsunamiRankEncoding {
 
  private:
   usize n_data_ = 0;
+  // Suppress sign-conversion warning: K is compile-time constant and always positive
+  #pragma GCC diagnostic push
+  #pragma GCC diagnostic ignored "-Wsign-conversion"
   std::array<Axis, K> axes_{};
+  #pragma GCC diagnostic pop
 
   template <class RelT>
   void BuildAxis(const RelT& rel_data, int axis) {

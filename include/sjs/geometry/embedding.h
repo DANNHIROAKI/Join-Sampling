@@ -48,14 +48,16 @@ struct DomainBounds {
 
   void ExpandToInclude(const Box<Dim, T>& b) noexcept {
     for (int i = 0; i < Dim; ++i) {
-      if (b.lo.v[i] < min_lo.v[i]) min_lo.v[i] = b.lo.v[i];
-      if (b.hi.v[i] > max_hi.v[i]) max_hi.v[i] = b.hi.v[i];
+      const usize idx = static_cast<usize>(i);
+      if (b.lo.v[idx] < min_lo.v[idx]) min_lo.v[idx] = b.lo.v[idx];
+      if (b.hi.v[idx] > max_hi.v[idx]) max_hi.v[idx] = b.hi.v[idx];
     }
   }
 
   bool IsInitialized() const noexcept {
     for (int i = 0; i < Dim; ++i) {
-      if (!(min_lo.v[i] <= max_hi.v[i])) return false;
+      const usize idx = static_cast<usize>(i);
+      if (!(min_lo.v[idx] <= max_hi.v[idx])) return false;
     }
     return true;
   }
@@ -81,8 +83,9 @@ struct DomainBounds {
   static DomainBounds Merge(const DomainBounds& a, const DomainBounds& b) noexcept {
     DomainBounds d;
     for (int i = 0; i < Dim; ++i) {
-      d.min_lo.v[i] = (a.min_lo.v[i] < b.min_lo.v[i]) ? a.min_lo.v[i] : b.min_lo.v[i];
-      d.max_hi.v[i] = (a.max_hi.v[i] > b.max_hi.v[i]) ? a.max_hi.v[i] : b.max_hi.v[i];
+      const usize idx = static_cast<usize>(i);
+      d.min_lo.v[idx] = (a.min_lo.v[idx] < b.min_lo.v[idx]) ? a.min_lo.v[idx] : b.min_lo.v[idx];
+      d.max_hi.v[idx] = (a.max_hi.v[idx] > b.max_hi.v[idx]) ? a.max_hi.v[idx] : b.max_hi.v[idx];
     }
     return d;
   }
@@ -119,8 +122,10 @@ template <int Dim, class T>
 inline EmbeddedPoint<Dim, T> EmbedLowerUpper(const Box<Dim, T>& b) noexcept {
   EmbeddedPoint<Dim, T> p;
   for (int i = 0; i < Dim; ++i) {
-    p.v[i] = b.lo.v[i];
-    p.v[i + Dim] = b.hi.v[i];
+    const usize idx = static_cast<usize>(i);
+    const usize dim_usize = static_cast<usize>(Dim);
+    p.v[idx] = b.lo.v[idx];
+    p.v[idx + dim_usize] = b.hi.v[idx];
   }
   return p;
 }
@@ -142,14 +147,16 @@ inline EmbeddedBox<Dim, T> MakeIntersectQueryRange(const Box<Dim, T>& q,
                                                    const DomainBounds<Dim, T>& domain) noexcept {
   EmbeddedBox<Dim, T> r;
   for (int i = 0; i < Dim; ++i) {
+    const usize idx = static_cast<usize>(i);
+    const usize dim_usize = static_cast<usize>(Dim);
     // lo(r)_i < hi(q)_i
-    r.lo.v[i] = domain.min_lo.v[i];
-    r.hi.v[i] = q.hi.v[i];
+    r.lo.v[idx] = domain.min_lo.v[idx];
+    r.hi.v[idx] = q.hi.v[idx];
 
     // hi(r)_i > lo(q)_i  ==> hi(r)_i >= nextafter(lo(q)_i, +inf)
-    r.lo.v[i + Dim] = NextUp(q.lo.v[i]);
+    r.lo.v[idx + dim_usize] = NextUp(q.lo.v[idx]);
     // hi(r)_i <= max_hi_i  ==> hi(r)_i < nextafter(max_hi_i, +inf)
-    r.hi.v[i + Dim] = NextUp(domain.max_hi.v[i]);
+    r.hi.v[idx + dim_usize] = NextUp(domain.max_hi.v[idx]);
   }
   return r;
 }
@@ -168,11 +175,12 @@ template <int Dim, class T>
 inline EmbeddedPointSkipDim0<Dim, T> EmbedLowerUpperSkipDim0(const Box<Dim, T>& b) noexcept {
   static_assert(Dim >= 2, "EmbedLowerUpperSkipDim0 requires Dim >= 2");
   EmbeddedPointSkipDim0<Dim, T> p;
-  const int k = Dim - 1;
+  const usize k = static_cast<usize>(Dim - 1);
   for (int j = 1; j < Dim; ++j) {
-    const int idx = j - 1;
-    p.v[idx] = b.lo.v[j];
-    p.v[idx + k] = b.hi.v[j];
+    const usize idx = static_cast<usize>(j - 1);
+    const usize j_idx = static_cast<usize>(j);
+    p.v[idx] = b.lo.v[j_idx];
+    p.v[idx + k] = b.hi.v[j_idx];
   }
   return p;
 }
@@ -182,16 +190,17 @@ inline EmbeddedBoxSkipDim0<Dim, T> MakeIntersectQueryRangeSkipDim0(
     const Box<Dim, T>& q, const DomainBounds<Dim, T>& domain) noexcept {
   static_assert(Dim >= 2, "MakeIntersectQueryRangeSkipDim0 requires Dim >= 2");
   EmbeddedBoxSkipDim0<Dim, T> r;
-  const int k = Dim - 1;
+  const usize k = static_cast<usize>(Dim - 1);
   for (int j = 1; j < Dim; ++j) {
-    const int idx = j - 1;
+    const usize idx = static_cast<usize>(j - 1);
+    const usize j_idx = static_cast<usize>(j);
     // lo(r)_j < hi(q)_j
-    r.lo.v[idx] = domain.min_lo.v[j];
-    r.hi.v[idx] = q.hi.v[j];
+    r.lo.v[idx] = domain.min_lo.v[j_idx];
+    r.hi.v[idx] = q.hi.v[j_idx];
 
     // hi(r)_j > lo(q)_j
-    r.lo.v[idx + k] = NextUp(q.lo.v[j]);
-    r.hi.v[idx + k] = NextUp(domain.max_hi.v[j]);
+    r.lo.v[idx + k] = NextUp(q.lo.v[j_idx]);
+    r.hi.v[idx + k] = NextUp(domain.max_hi.v[j_idx]);
   }
   return r;
 }
