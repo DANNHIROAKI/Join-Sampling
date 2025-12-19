@@ -194,7 +194,11 @@ inline std::string GetStringOr(const std::unordered_map<std::string, std::string
 
 template <int Dim>
 struct CellKey {
+  // Suppress sign-conversion warning: Dim is compile-time constant and always positive
+  #pragma GCC diagnostic push
+  #pragma GCC diagnostic ignored "-Wsign-conversion"
   std::array<i64, Dim> k{};
+  #pragma GCC diagnostic pop
   bool operator==(const CellKey& o) const noexcept { return k == o.k; }
 };
 
@@ -261,7 +265,11 @@ enum class CandidateCellsImpl : u8 {
 template <int Dim>
 struct RejectionParams {
   // Grid cell size per dimension. Must be > 0.
+  // Suppress sign-conversion warning: Dim is compile-time constant and always positive
+  #pragma GCC diagnostic push
+  #pragma GCC diagnostic ignored "-Wsign-conversion"
   std::array<double, Dim> g{};
+  #pragma GCC diagnostic pop
 
   // If true: swap sides (index on R and query S). Default false (index on S).
   bool swap_sides = false;
@@ -393,7 +401,11 @@ struct RejectionState {
 
   RejectionParams<Dim> params{};
 
+  // Suppress sign-conversion warning: Dim is compile-time constant and always positive
+  #pragma GCC diagnostic push
+  #pragma GCC diagnostic ignored "-Wsign-conversion"
   std::array<T, Dim> M{};  // per-dim max length on B
+  #pragma GCC diagnostic pop
   CellMapT cell_map;
 
   // Optional acceleration for candidate-cell enumeration (doc §3.8 Impl B).
@@ -450,6 +462,9 @@ struct RejectionState {
   }
 
   // Candidate cell index range for E(a)=Π_i [lo_i(a)-M_i, hi_i(a)) (half-open).
+  // Suppress sign-conversion warning: Dim is compile-time constant and always positive
+  #pragma GCC diagnostic push
+  #pragma GCC diagnostic ignored "-Wsign-conversion"
   void CandidateRange(const BoxT& a,
                       std::array<i64, Dim>* kmin,
                       std::array<i64, Dim>* kmax) const {
@@ -462,13 +477,18 @@ struct RejectionState {
       (*kmax)[d] = CeilDivMinus1(hi, g);
     }
   }
+  #pragma GCC diagnostic pop
 
   // Enumerate all non-empty candidate cells for a (deterministic order).
   // For each found cell, calls emit(ptr_to_vector).
   template <class EmitFn>
   void ForEachCandidateCell(const BoxT& a, EmitFn&& emit) const {
+    // Suppress sign-conversion warning: Dim is compile-time constant and always positive
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Wsign-conversion"
     std::array<i64, Dim> mn{};
     std::array<i64, Dim> mx{};
+    #pragma GCC diagnostic pop
     CandidateRange(a, &mn, &mx);
 
     // Empty range quick check.
