@@ -32,10 +32,20 @@
 //  - Conditioning on accept yields uniform over J.
 //  - Independent proposals => i.i.d.
 //
-// Engineering boundary (as in the doc):
+// Engineering boundary (robust termination):
 //  - If MuSum==0, then |J|==0 (necessary condition) => return empty.
-//  - If MuSum>0 but |J|==0, AGR-S would not terminate; the Adaptive variant
-//    (AGR-AS) is the recommended safe entry point.
+//  - If MuSum>0 but |J|==0 (possible in practice), naive AGR-S would loop forever.
+//    We prevent non-termination while preserving correctness by doing a
+//    deterministic emptiness check *only if we fail to accept for a while*.
+//    If the check proves that |J|==0, we return empty; otherwise we continue
+//    with standard AGR-S sampling.
+//
+//    Knob (run.extra):
+//      rej_max_factor : number of rejected proposals allowed before the
+//                       deterministic empty-join check (default: 10000).
+//
+//  - AGR-AS (Adaptive) remains the recommended entry point when you want
+//    predictable performance on very sparse joins.
 //
 // Candidate-cell construction (doc §3.8):
 //  - Impl A (Naive): enumerate key hyper-rectangle and hash lookup.
@@ -924,10 +934,54 @@ class RejectionSamplingBaseline final : public IBaseline<Dim, T> {
     out->pairs.reserve(static_cast<usize>(t));
 
     // AGR-S: repeat proposals until t accepts.
+    //
+    // Robustness: if MuSum>0 but the true join is empty, naive rejection
+    // sampling would not terminate. We therefore *prove emptiness* (or confirm
+    // non-emptiness) once if we observe too many rejected proposals before the
+    // first accept.
+    const u64 empty_check_after = detail::GetU64Or(cfg.run.extra, "rej_max_factor", 10000);
+
+    auto prove_nonempty_or_empty = [&]() -> bool {
+      // Returns true iff it finds at least one true intersecting pair.
+      // Deterministic scan over the candidate superset U_prop.
+      for (const auto& ar : st_.active_a) {
+        const auto& a = st_.ABox(ar.a_index);
+        for (const std::vector<u32>* cell : ar.cells) {
+          if (!cell || cell->empty()) continue;
+          for (u32 bi : *cell) {
+            if (a.Intersects(st_.BBox(bi))) return true;
+          }
+        }
+      }
+      return false;
+    };
+
+    u64 rejected_before_first_accept = 0;
+    bool checked_empty = false;
+
     while (out->pairs.size() < static_cast<usize>(t)) {
       u32 ai = 0, bi = 0;
       if (!st_.DrawProposal(rng, &ai, &bi)) return true;  // should only happen if MuSum==0
-      if (!st_.ABox(ai).Intersects(st_.BBox(bi))) continue;
+
+      if (!st_.ABox(ai).Intersects(st_.BBox(bi))) {
+        // Still searching for the first accept.
+        if (out->pairs.empty()) {
+          ++rejected_before_first_accept;
+          if (!checked_empty && (empty_check_after == 0 || rejected_before_first_accept >= empty_check_after)) {
+            checked_empty = true;
+            auto sc = phases ? phases->Scoped("sample_empty_check")
+                              : PhaseRecorder::ScopedPhase(nullptr, "");
+            if (!prove_nonempty_or_empty()) {
+              // Certified empty join: return empty sample set.
+              return true;
+            }
+            // Join is non-empty; continue with standard rejection sampling.
+          }
+        }
+        continue;
+      }
+
+      // Accept.
       out->pairs.push_back(st_.MakeOutputPair(ai, bi));
     }
 

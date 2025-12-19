@@ -724,8 +724,12 @@ inline bool ApplyBaseConfigFromJson(const json::Value& root, sjs::Config* cfg, s
         if (json::GetString(*v, &s)) cfg->dataset.name = s;
       }
       if (const json::Value* v = json::Get(*ds, "dim")) {
-        sjs::i32 dim;
-        if (json::GetU64(*v, reinterpret_cast<u64*>(&dim))) cfg->dataset.dim = dim;
+        u64 dim_u64;
+        if (json::GetU64(*v, &dim_u64)) {
+          if (dim_u64 <= static_cast<u64>(std::numeric_limits<sjs::i32>::max())) {
+            cfg->dataset.dim = static_cast<sjs::i32>(dim_u64);
+          }
+        }
       }
       if (const json::Value* v = json::Get(*ds, "path_r")) {
         std::string s;
@@ -1154,6 +1158,95 @@ int main(int argc, char** argv) {
                   }
                 }
 
+
+
+                // Safety guard:
+                // Rejection + Sampling (AGR-S) can be extremely slow on very sparse joins and,
+                // in earlier versions, could non-terminate when |J|==0 but MuSum>0.
+                // For large sweeps we therefore disable this combination here.
+                // Use Variant::Adaptive for the rejection baseline instead.
+                if (method == sjs::Method::Rejection && variant == sjs::Variant::Sampling) {
+                  const std::string note =
+                      "SKIPPED: rejection+sampling is disabled in sjs_sweep; use variant=adaptive.";
+                  SJS_LOG_WARN(note, " dataset=", ds.name,
+                               " t=", static_cast<unsigned long long>(t),
+                               (cfg.dataset.source == sjs::DataSource::Synthetic
+                                    ? " alpha=" + std::to_string(cfg.dataset.synthetic.alpha)
+                                    : std::string("")));
+
+                  // Collect per-repeat placeholders so the summary row stays well-formed.
+                  std::vector<double> wall_ms;
+                  wall_ms.reserve(seeds.size());
+                  std::vector<double> count_vals;
+                  count_vals.reserve(seeds.size());
+                  const double nan = std::numeric_limits<double>::quiet_NaN();
+
+                  for (usize i = 0; i < seeds.size(); ++i) {
+                    const u64 seed = seeds[i];
+                    const double wms = nan;
+                    const double count_value = nan;
+                    wall_ms.push_back(wms);
+                    count_vals.push_back(count_value);
+
+                    total_runs++;
+
+                    // Raw row (marked as failed/skipped).
+                    raw_writer.WriteRowV(
+                        ds.name,
+                        (cfg.dataset.source == sjs::DataSource::Synthetic ? cfg.dataset.synthetic.generator : ""),
+                        (cfg.dataset.source == sjs::DataSource::Synthetic ? cfg.dataset.synthetic.alpha
+                                                                          : std::numeric_limits<double>::quiet_NaN()),
+                        static_cast<unsigned long long>(ds.R.Size()),
+                        static_cast<unsigned long long>(ds.S.Size()),
+                        sjs::ToString(method),
+                        sjs::ToString(variant),
+                        static_cast<unsigned long long>(t),
+                        static_cast<unsigned long long>(i),
+                        static_cast<unsigned long long>(seed),
+                        0,
+                        wms,
+                        count_value,
+                        0,
+                        0,
+                        0,
+                        0ULL,
+                        "",
+                        0ULL,
+                        "{}",
+                        note,
+                        cfg.ToJsonLite(),
+                        (gen_report_ptr ? gen_report_ptr->ToJsonLite() : "{}"));
+                  }
+
+                  // Summary row (ok_rate=0, values likely NaN).
+                  const sjs::Summary wall_sum = sjs::Summarize(wall_ms);
+                  const sjs::Summary cnt_sum = sjs::Summarize(count_vals);
+                  const double ok_rate = 0.0;
+                  const double exact_frac = 0.0;
+
+                  sum_writer.WriteRowV(
+                      ds.name,
+                      (cfg.dataset.source == sjs::DataSource::Synthetic ? cfg.dataset.synthetic.generator : ""),
+                      (cfg.dataset.source == sjs::DataSource::Synthetic ? cfg.dataset.synthetic.alpha
+                                                                        : std::numeric_limits<double>::quiet_NaN()),
+                      static_cast<unsigned long long>(ds.R.Size()),
+                      static_cast<unsigned long long>(ds.S.Size()),
+                      sjs::ToString(method),
+                      sjs::ToString(variant),
+                      static_cast<unsigned long long>(t),
+                      static_cast<unsigned long long>(seeds.size()),
+                      ok_rate,
+                      wall_sum.mean,
+                      wall_sum.stdev,
+                      wall_sum.median,
+                      wall_sum.p95,
+                      cnt_sum.mean,
+                      cnt_sum.stdev,
+                      exact_frac,
+                      note);
+
+                  continue;
+                }
                 // Create baseline.
                 std::string b_err;
                 auto baseline = sjs::baselines::CreateBaseline2D(method, variant, &b_err);
@@ -1194,7 +1287,9 @@ int main(int argc, char** argv) {
 
                   const double wms = sw.ElapsedMillis();
                   wall_ms.push_back(wms);
-                  count_vals.push_back(static_cast<double>(rep_out.count.value));
+                  const double count_value = ok ? static_cast<double>(rep_out.count.value)
+                                                : std::numeric_limits<double>::quiet_NaN();
+                  count_vals.push_back(count_value);
 
                   total_runs++;
                   if (!ok) {
@@ -1221,8 +1316,8 @@ int main(int argc, char** argv) {
                       static_cast<unsigned long long>(seed),
                       (rep_out.ok ? 1 : 0),
                       wms,
-                      static_cast<double>(rep_out.count.value),
-                      (rep_out.count.exact ? 1 : 0),
+                      count_value,
+                      ((rep_out.ok && rep_out.count.exact) ? 1 : 0),
                       (rep_out.used_enumeration ? 1 : 0),
                       (rep_out.enumeration_truncated ? 1 : 0),
                       static_cast<unsigned long long>(rep_out.enumeration_cap),
