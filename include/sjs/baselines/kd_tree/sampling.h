@@ -52,7 +52,10 @@ namespace detail {
 template <int K>
 struct RankPoint {
   static_assert(K >= 1, "RankPoint<K>: K must be >= 1");
-  std::array<u32, K> v{};
+  #pragma GCC diagnostic push
+  #pragma GCC diagnostic ignored "-Wsign-conversion"
+  std::array<u32, static_cast<usize>(K)> v{};
+  #pragma GCC diagnostic pop
 
   u32& operator[](int i) noexcept { return v[static_cast<usize>(i)]; }
   const u32& operator[](int i) const noexcept { return v[static_cast<usize>(i)]; }
@@ -195,8 +198,8 @@ struct GlobalRankEmbedding {
       auto _ = phases ? phases->Scoped("build_rank_arrays") : PhaseRecorder::ScopedPhase(nullptr, "");
       KeyLess less;
       for (int i = 0; i < M; ++i) {
-        A_[i].reserve(nt);
-        B_[i].reserve(nt);
+        A_[static_cast<usize>(i)].reserve(nt);
+        B_[static_cast<usize>(i)].reserve(nt);
       }
 
       // Fill from R.
@@ -205,8 +208,8 @@ struct GlobalRankEmbedding {
         const auto& b = R.boxes[static_cast<usize>(idx)];
         for (int i = 0; i < M; ++i) {
           const int axis = i + 1;  // skip sweep axis 0
-          A_[i].push_back(Key{b.lo.v[axis], gid});
-          B_[i].push_back(Key{b.hi.v[axis], gid});
+          A_[static_cast<usize>(i)].push_back(Key{b.lo.v[static_cast<usize>(axis)], gid});
+          B_[static_cast<usize>(i)].push_back(Key{b.hi.v[static_cast<usize>(axis)], gid});
         }
       }
 
@@ -216,33 +219,34 @@ struct GlobalRankEmbedding {
         const auto& b = S.boxes[static_cast<usize>(idx)];
         for (int i = 0; i < M; ++i) {
           const int axis = i + 1;
-          A_[i].push_back(Key{b.lo.v[axis], gid});
-          B_[i].push_back(Key{b.hi.v[axis], gid});
+          A_[static_cast<usize>(i)].push_back(Key{b.lo.v[static_cast<usize>(axis)], gid});
+          B_[static_cast<usize>(i)].push_back(Key{b.hi.v[static_cast<usize>(axis)], gid});
         }
       }
 
       // Sort and assign ranks to embedded points.
       for (int i = 0; i < M; ++i) {
-        std::sort(A_[i].begin(), A_[i].end(), less);
-        std::sort(B_[i].begin(), B_[i].end(), less);
+        const usize i_usize = static_cast<usize>(i);
+        std::sort(A_[i_usize].begin(), A_[i_usize].end(), less);
+        std::sort(B_[i_usize].begin(), B_[i_usize].end(), less);
 
         // rankA_i -> coordinate i
         for (u32 r = 0; r < n_total_; ++r) {
-          const u32 gid = A_[i][static_cast<usize>(r)].gid;
+          const u32 gid = A_[i_usize][static_cast<usize>(r)].gid;
           if (gid >= 1U && gid <= n_r_) {
             const u32 h = gid - 1U;
-            (*out_pts_r)[static_cast<usize>(h)].v[static_cast<usize>(i)] = r;
+            (*out_pts_r)[static_cast<usize>(h)].v[i_usize] = r;
           } else {
             const u32 h = gid - 1U - n_r_;
             if (h < n_s_) {
-              (*out_pts_s)[static_cast<usize>(h)].v[static_cast<usize>(i)] = r;
+              (*out_pts_s)[static_cast<usize>(h)].v[i_usize] = r;
             }
           }
         }
 
         // rankB_i -> coordinate (i + M)
         for (u32 r = 0; r < n_total_; ++r) {
-          const u32 gid = B_[i][static_cast<usize>(r)].gid;
+          const u32 gid = B_[i_usize][static_cast<usize>(r)].gid;
           if (gid >= 1U && gid <= n_r_) {
             const u32 h = gid - 1U;
             (*out_pts_r)[static_cast<usize>(h)].v[static_cast<usize>(i + M)] = r;
@@ -277,24 +281,26 @@ struct GlobalRankEmbedding {
 
     for (int i = 0; i < M; ++i) {
       const int axis = i + 1;
-      const T rhs = q.hi.v[axis];  // R_a(q)
-      const T lhs = q.lo.v[axis];  // L_a(q)
+      const usize axis_usize = static_cast<usize>(axis);
+      const usize i_usize = static_cast<usize>(i);
+      const T rhs = q.hi.v[axis_usize];  // R_a(q)
+      const T lhs = q.lo.v[axis_usize];  // L_a(q)
 
       // ub = first position with (value, gid) >= (rhs, LOW)
       const Key k_hi{rhs, LOW};
-      const auto it_hi = std::lower_bound(A_[i].begin(), A_[i].end(), k_hi, less);
-      const u32 ub = static_cast<u32>(std::distance(A_[i].begin(), it_hi));
+      const auto it_hi = std::lower_bound(A_[i_usize].begin(), A_[i_usize].end(), k_hi, less);
+      const u32 ub = static_cast<u32>(std::distance(A_[i_usize].begin(), it_hi));
 
       // lb = first position with (value, gid) > (lhs, HIGH)
       const Key k_lo{lhs, HIGH};
-      const auto it_lo = std::upper_bound(B_[i].begin(), B_[i].end(), k_lo, less);
-      const u32 lb = static_cast<u32>(std::distance(B_[i].begin(), it_lo));
+      const auto it_lo = std::upper_bound(B_[i_usize].begin(), B_[i_usize].end(), k_lo, less);
+      const u32 lb = static_cast<u32>(std::distance(B_[i_usize].begin(), it_lo));
 
-      qb.lo[i] = 0;
-      qb.hi[i] = ub;
+      qb.lo[i_usize] = 0;
+      qb.hi[i_usize] = ub;
 
-      qb.lo[i + M] = lb;
-      qb.hi[i + M] = n_total_;
+      qb.lo[static_cast<usize>(i + M)] = lb;
+      qb.hi[static_cast<usize>(i + M)] = n_total_;
     }
 
     if (qb.IsEmpty()) return false;
@@ -303,8 +309,11 @@ struct GlobalRankEmbedding {
   }
 
  private:
+  #pragma GCC diagnostic push
+  #pragma GCC diagnostic ignored "-Wsign-conversion"
   std::array<std::vector<Key>, M> A_{};  // L ranks
   std::array<std::vector<Key>, M> B_{};  // R ranks
+  #pragma GCC diagnostic pop
 
   u32 n_r_ = 0;
   u32 n_s_ = 0;

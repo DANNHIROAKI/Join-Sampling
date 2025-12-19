@@ -334,26 +334,28 @@ inline bool ReadRejectionParams(const Dataset<Dim, T>& ds,
   // Grid size defaults: derive from dataset domain.
   const auto dom = ds.Domain();
   for (int d = 0; d < Dim; ++d) {
-    const long double w = static_cast<long double>(dom.hi.v[d]) - static_cast<long double>(dom.lo.v[d]);
+    const usize d_usize = static_cast<usize>(d);
+    const long double w = static_cast<long double>(dom.hi.v[d_usize]) - static_cast<long double>(dom.lo.v[d_usize]);
     // Heuristic default: 64 bins per dimension.
     double gd = 1.0;
     if (w > 0.0L) gd = static_cast<double>(w / 64.0L);
     if (!(gd > 0.0) || !std::isfinite(gd)) gd = 1.0;
-    p.g[d] = gd;
+    p.g[d_usize] = gd;
   }
 
   // Allow overriding all dims by rej_g.
   if (auto v = GetExtra(extra, "rej_g")) {
     double g_all = 0;
     if (ParseDouble(*v, &g_all) && (g_all > 0.0) && std::isfinite(g_all)) {
-      for (int d = 0; d < Dim; ++d) p.g[d] = g_all;
+      for (int d = 0; d < Dim; ++d) p.g[static_cast<usize>(d)] = g_all;
     }
   }
   // Per-dim overrides: rej_g0, rej_g1, ...
   for (int d = 0; d < Dim; ++d) {
+    const usize d_usize = static_cast<usize>(d);
     const std::string key = "rej_g" + std::to_string(d);
-    double gd = GetDoubleOr(extra, key, p.g[d]);
-    if (gd > 0.0 && std::isfinite(gd)) p.g[d] = gd;
+    double gd = GetDoubleOr(extra, key, p.g[d_usize]);
+    if (gd > 0.0 && std::isfinite(gd)) p.g[d_usize] = gd;
   }
 
   // Final clamp: ensure > 0.
@@ -520,7 +522,10 @@ struct RejectionState {
 
     // Impl A (Naive): enumerate key hyper-rectangle and lookup cell_map.
     KeyT key;
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Wsign-conversion"
     std::array<i64, Dim> cur{};
+    #pragma GCC diagnostic pop
 
     const auto rec = [&](auto&& self, int dim) -> void {
       if (dim == Dim) {
@@ -529,8 +534,8 @@ struct RejectionState {
         if (it != cell_map.end() && !it->second.empty()) emit(&it->second);
         return;
       }
-      for (i64 v = mn[dim]; v <= mx[dim]; ++v) {
-        cur[dim] = v;
+      for (i64 v = mn[static_cast<usize>(dim)]; v <= mx[static_cast<usize>(dim)]; ++v) {
+        cur[static_cast<usize>(dim)] = v;
         self(self, dim + 1);
       }
     };
@@ -567,13 +572,14 @@ struct RejectionState {
     // (1) Compute M_i on B.
     {
       auto sc = phases ? phases->Scoped("build_M") : PhaseRecorder::ScopedPhase(nullptr, "");
-      for (int d = 0; d < Dim; ++d) M[d] = static_cast<T>(0);
+      for (int d = 0; d < Dim; ++d) M[static_cast<usize>(d)] = static_cast<T>(0);
       for (usize i = 0; i < B->boxes.size(); ++i) {
         const BoxT& b = B->boxes[i];
         if (b.IsEmpty()) continue;
         for (int d = 0; d < Dim; ++d) {
-          const T len = static_cast<T>(b.hi.v[d] - b.lo.v[d]);
-          if (len > M[d]) M[d] = len;
+          const usize d_usize = static_cast<usize>(d);
+          const T len = static_cast<T>(b.hi.v[d_usize] - b.lo.v[d_usize]);
+          if (len > M[d_usize]) M[d_usize] = len;
         }
       }
     }

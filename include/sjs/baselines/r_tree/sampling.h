@@ -81,8 +81,8 @@ inline Box<Dim - 1, T> ProjectDropFirst(const Box<Dim, T>& b) noexcept {
   static_assert(Dim >= 2, "ProjectDropFirst requires Dim >= 2");
   Box<Dim - 1, T> out;
   for (int d = 1; d < Dim; ++d) {
-    out.lo.v[d - 1] = b.lo.v[d];
-    out.hi.v[d - 1] = b.hi.v[d];
+    out.lo.v[static_cast<usize>(d - 1)] = b.lo.v[static_cast<usize>(d)];
+    out.hi.v[static_cast<usize>(d - 1)] = b.hi.v[static_cast<usize>(d)];
   }
   return out;
 }

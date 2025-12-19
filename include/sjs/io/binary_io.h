@@ -330,12 +330,12 @@ bool ReadRelationBinary(const std::string& path,
       for (int d = 0; d < Dim; ++d) {
         double x;
         if (!ReadScalar(in, &x, err)) return false;
-        b.lo.v[d] = static_cast<T>(x);
+        b.lo.v[static_cast<usize>(d)] = static_cast<T>(x);
       }
       for (int d = 0; d < Dim; ++d) {
         double x;
         if (!ReadScalar(in, &x, err)) return false;
-        b.hi.v[d] = static_cast<T>(x);
+        b.hi.v[static_cast<usize>(d)] = static_cast<T>(x);
       }
       rel.boxes[static_cast<usize>(i)] = b;
       if (file_has_ids) {
@@ -350,12 +350,12 @@ bool ReadRelationBinary(const std::string& path,
       for (int d = 0; d < Dim; ++d) {
         float x;
         if (!ReadScalar(in, &x, err)) return false;
-        b.lo.v[d] = static_cast<T>(x);
+        b.lo.v[static_cast<usize>(d)] = static_cast<T>(x);
       }
       for (int d = 0; d < Dim; ++d) {
         float x;
         if (!ReadScalar(in, &x, err)) return false;
-        b.hi.v[d] = static_cast<T>(x);
+        b.hi.v[static_cast<usize>(d)] = static_cast<T>(x);
       }
       rel.boxes[static_cast<usize>(i)] = b;
       if (file_has_ids) {

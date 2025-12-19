@@ -294,9 +294,9 @@ class TsunamiIndexStub {
     // Handle degenerate split: if all values equal along axis, split by index.
     bool all_equal = true;
     {
-      const T pivot = points_[indices_[mid]].v[axis];
+      const T pivot = points_[indices_[mid]].v[static_cast<usize>(axis)];
       for (u32 i = begin; i < end; ++i) {
-        if (points_[indices_[i]].v[axis] != pivot) {
+        if (points_[indices_[i]].v[static_cast<usize>(axis)] != pivot) {
           all_equal = false;
           break;
         }
@@ -394,7 +394,10 @@ class TsunamiRankEncoding {
   }
 
   usize n_data() const noexcept { return n_data_; }
+  #pragma GCC diagnostic push
+  #pragma GCC diagnostic ignored "-Wsign-conversion"
   const std::array<Axis, K>& axes() const noexcept { return axes_; }
+  #pragma GCC diagnostic pop
 
   // Build axis ranks from the data-side relation.
   template <class RelT>

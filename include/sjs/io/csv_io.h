@@ -309,7 +309,7 @@ bool ReadBoxesSimple(const std::string& path,
         SetErr(err, "Failed to parse lo coordinate");
         return false;
       }
-      b.lo.v[i] = static_cast<T>(x);
+      b.lo.v[static_cast<usize>(i)] = static_cast<T>(x);
     }
     for (int i = 0; i < Dim; ++i) {
       double x;
@@ -317,7 +317,7 @@ bool ReadBoxesSimple(const std::string& path,
         SetErr(err, "Failed to parse hi coordinate");
         return false;
       }
-      b.hi.v[i] = static_cast<T>(x);
+      b.hi.v[static_cast<usize>(i)] = static_cast<T>(x);
     }
     rel.Add(b, id);
   }
