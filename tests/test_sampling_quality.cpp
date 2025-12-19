@@ -68,7 +68,7 @@ static void TestAliasTableBasic(TestContext& t) {
   const int N = 8000;
   int c0 = 0, c1 = 0;
   for (int i = 0; i < N; ++i) {
-    const sjs::u32 idx = tab.Sample(&rng);
+    const sjs::u32 idx = static_cast<sjs::u32>(tab.Sample(&rng));
     CHECK(t, idx < 2);
     if (idx == 0) ++c0;
     else ++c1;

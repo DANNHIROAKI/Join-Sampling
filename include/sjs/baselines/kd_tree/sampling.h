@@ -531,7 +531,7 @@ class ActiveKDTree {
     std::vector<Assign> asg;
     asg.reserve(static_cast<usize>(t));
     for (u32 j = 0; j < t; ++j) {
-      const u32 p = alias.Sample(rng);
+      const u32 p = static_cast<u32>(alias.Sample(rng));
       asg.push_back(Assign{p, j});
     }
     std::sort(asg.begin(), asg.end(), [](const Assign& a, const Assign& b) {
@@ -823,16 +823,16 @@ class KDJoinEnumerator final : public baselines::IJoinEnumerator {
 
       if (e.kind == join::EventKind::End) {
         if (e.side == join::Side::R) {
-          kd_r_.Deactivate(e.index);
+          kd_r_.Deactivate(static_cast<u32>(e.index));
         } else {
-          kd_s_.Deactivate(e.index);
+          kd_s_.Deactivate(static_cast<u32>(e.index));
         }
         continue;
       }
 
       // START: query opposite active tree and emit candidates.
       cur_side_ = e.side;
-      cur_index_ = e.index;
+      cur_index_ = static_cast<u32>(e.index);
       cur_id_ = e.id;
 
       const BoxT& q = (cur_side_ == join::Side::R)
@@ -1009,8 +1009,8 @@ class KDTreeSamplingBaseline final : public IBaseline<Dim, T> {
       const join::Event& e = events_[ev_i];
 
       if (e.kind == join::EventKind::End) {
-        if (e.side == join::Side::R) kd_r_.Deactivate(e.index);
-        else kd_s_.Deactivate(e.index);
+        if (e.side == join::Side::R) kd_r_.Deactivate(static_cast<u32>(e.index));
+        else kd_s_.Deactivate(static_cast<u32>(e.index));
         continue;
       }
 
@@ -1044,8 +1044,8 @@ class KDTreeSamplingBaseline final : public IBaseline<Dim, T> {
       }
 
       // Activate current.
-      if (e.side == join::Side::R) kd_r_.Activate(e.index);
-      else kd_s_.Activate(e.index);
+      if (e.side == join::Side::R) kd_r_.Activate(static_cast<u32>(e.index));
+      else kd_s_.Activate(static_cast<u32>(e.index));
     }
 
     W_ = W;
@@ -1132,7 +1132,7 @@ class KDTreeSamplingBaseline final : public IBaseline<Dim, T> {
       std::vector<SlotAssign> asg;
       asg.reserve(static_cast<usize>(t));
       for (u32 j = 0; j < t; ++j) {
-        const u32 p = alias.Sample(rng);  // index into nz_sids / nz_w
+        const u32 p = static_cast<u32>(alias.Sample(rng));  // index into nz_sids / nz_w
         const u32 sid = nz_sids[static_cast<usize>(p)];
         asg.push_back(SlotAssign{sid, j});
       }
@@ -1158,8 +1158,8 @@ class KDTreeSamplingBaseline final : public IBaseline<Dim, T> {
         const join::Event& e = events_[ev_i];
 
         if (e.kind == join::EventKind::End) {
-          if (e.side == join::Side::R) kd_r_.Deactivate(e.index);
-          else kd_s_.Deactivate(e.index);
+          if (e.side == join::Side::R) kd_r_.Deactivate(static_cast<u32>(e.index));
+          else kd_s_.Deactivate(static_cast<u32>(e.index));
           continue;
         }
 
@@ -1220,8 +1220,8 @@ class KDTreeSamplingBaseline final : public IBaseline<Dim, T> {
         }
 
         // Activate current.
-        if (e.side == join::Side::R) kd_r_.Activate(e.index);
-        else kd_s_.Activate(e.index);
+        if (e.side == join::Side::R) kd_r_.Activate(static_cast<u32>(e.index));
+        else kd_s_.Activate(static_cast<u32>(e.index));
       }
 
       if (ptr != asg.size()) {

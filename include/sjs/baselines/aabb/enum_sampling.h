@@ -93,7 +93,7 @@ class AABBEnumSamplingBaseline final : public IBaseline<Dim, T> {
     out->weighted = false;
     out->weights.clear();
 
-    const u32 t = cfg.run.t;
+    const u32 t = static_cast<u32>(cfg.run.t);
     if (t == 0) return true;
 
     // --------------------------

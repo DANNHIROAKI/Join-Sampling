@@ -1147,7 +1147,7 @@ class RTreeSamplingBaseline final : public IBaseline<Dim, T> {
       return false;
     }
 
-    const u32 t = cfg.run.t;
+    const u32 t = static_cast<u32>(cfg.run.t);
 
     out->Clear();
     out->with_replacement = true;

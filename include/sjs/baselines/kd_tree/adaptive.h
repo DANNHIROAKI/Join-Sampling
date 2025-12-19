@@ -156,8 +156,8 @@ class KDTreeAdaptiveBaseline final : public IBaseline<Dim, T> {
       const join::Event& e = events_[ev_i];
 
       if (e.kind == join::EventKind::End) {
-        if (e.side == join::Side::R) kd_r_.Deactivate(e.index);
-        else kd_s_.Deactivate(e.index);
+        if (e.side == join::Side::R) kd_r_.Deactivate(static_cast<u32>(e.index));
+        else kd_s_.Deactivate(static_cast<u32>(e.index));
         continue;
       }
 
@@ -214,8 +214,8 @@ class KDTreeAdaptiveBaseline final : public IBaseline<Dim, T> {
       }
 
       // Activate current box in its own KD-tree.
-      if (e.side == join::Side::R) kd_r_.Activate(e.index);
-      else kd_s_.Activate(e.index);
+      if (e.side == join::Side::R) kd_r_.Activate(static_cast<u32>(e.index));
+      else kd_s_.Activate(static_cast<u32>(e.index));
     }
 
     weights_valid_ = true;
@@ -323,7 +323,7 @@ class KDTreeAdaptiveBaseline final : public IBaseline<Dim, T> {
     {
       auto _ = phases ? phases->Scoped("phase2_assign") : PhaseRecorder::ScopedPhase(nullptr, "");
       for (u32 j = 0; j < t; ++j) {
-        const u32 p = alias.Sample(rng);  // index into nz_sids/nz_w
+        const u32 p = static_cast<u32>(alias.Sample(rng));  // index into nz_sids/nz_w
         const u32 sid = nz_sids[static_cast<usize>(p)];
         slots.push_back(SlotAssign{sid, j});
       }
@@ -347,8 +347,8 @@ class KDTreeAdaptiveBaseline final : public IBaseline<Dim, T> {
         const join::Event& e = events_[ev_i];
 
         if (e.kind == join::EventKind::End) {
-          if (e.side == join::Side::R) kd_r_.Deactivate(e.index);
-          else kd_s_.Deactivate(e.index);
+          if (e.side == join::Side::R) kd_r_.Deactivate(static_cast<u32>(e.index));
+          else kd_s_.Deactivate(static_cast<u32>(e.index));
           continue;
         }
 
@@ -406,8 +406,8 @@ class KDTreeAdaptiveBaseline final : public IBaseline<Dim, T> {
         }
 
         // Activate current.
-        if (e.side == join::Side::R) kd_r_.Activate(e.index);
-        else kd_s_.Activate(e.index);
+        if (e.side == join::Side::R) kd_r_.Activate(static_cast<u32>(e.index));
+        else kd_s_.Activate(static_cast<u32>(e.index));
       }
 
       if (ptr != slots.size()) {
