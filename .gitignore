@@ -28,6 +28,7 @@ Testing/
 # IDE metadata
 .vscode/
 .idea/
+.cursor/
 
 # Local datasets
 /data/real/*
