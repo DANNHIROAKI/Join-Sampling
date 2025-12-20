@@ -1,10 +1,6 @@
 
 # SpatialJoinSamplingCpp
 
-A lightweight **C++17** experiment framework for **counting** and drawing **i.i.d. uniform samples (with replacement)** from the result of a **2D spatial join** between two relations of **axis-aligned rectangles**.
-
-This project is designed for SIGMOD-style evaluations: multiple baselines, repeatable runs, sweep harness, and simple output files (CSV/TSV + custom binary).
-
 ## Key points
 
 - Geometry uses **half-open boxes**: `[lo, hi)` on each axis.
