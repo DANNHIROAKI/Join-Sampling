@@ -562,15 +562,21 @@ class DynamicRTree {
   // Quadratic split of node `nid`.
   // The node is split into (nid) and (new_nid). Returns new_nid.
   u32 SplitNode(u32 nid) {
-    Node& n = nodes_[static_cast<usize>(nid)];
-    const bool leaf = n.leaf;
+    // IMPORTANT: NewNode() appends to nodes_ and may reallocate the backing array.
+    // Never keep a Node& reference across a NewNode() call.
+    const usize nid_u = static_cast<usize>(nid);
+    const bool leaf = nodes_[nid_u].leaf;
+    const u32 parent = nodes_[nid_u].parent;
 
     // Take ownership of current children.
-    std::vector<Entry> entries = std::move(n.children);
-    n.children.clear();
-    n.children.reserve(static_cast<usize>(opt_.max_children + 1));
+    std::vector<Entry> entries = std::move(nodes_[nid_u].children);
+    nodes_[nid_u].children.clear();
+    nodes_[nid_u].children.reserve(static_cast<usize>(opt_.max_children + 1));
 
-    const u32 new_nid = NewNode(leaf, n.parent);
+    const u32 new_nid = NewNode(leaf, parent);
+
+    // Re-acquire references AFTER NewNode().
+    Node& n = nodes_[nid_u];
     Node& nn = nodes_[static_cast<usize>(new_nid)];
 
     const u32 N = static_cast<u32>(entries.size());
