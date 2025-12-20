@@ -348,6 +348,72 @@ inline double AutocorrelationHashedPairs(Span<const PairId> samples, int lag = 1
   return Autocorrelation(Span<const double>(x.data(), x.size()), lag);
 }
 
+// KS sanity check for PairId samples against a known (small) oracle universe.
+//
+// IMPORTANT: One-sample KS vs continuous Uniform[0,1) assumes *continuous* support.
+// If we simply hash PairId -> [0,1), the resulting distribution is discrete with
+// at most |U| distinct values, which can lead to systematic rejection (tiny p-values)
+// when the sample size t is large.
+//
+// To obtain a meaningful KS sanity check in EXP-1 settings, we:
+//   1) Order the oracle universe deterministically by a 64-bit hash
+//      (tie-break by (r,s) to make the order total).
+//   2) Map each sampled pair to its rank in that order.
+//   3) Add a small deterministic jitter in [0,1) based on sample index,
+//      then scale by |U| to get values in [0,1).
+//
+// Under a truly uniform sampler over U, these values behave like Uniform[0,1).
+inline KSTestResult KSPairsHashUniform01RankJitter(Span<const PairId> universe,
+                                                   Span<const PairId> samples) {
+  KSTestResult out;
+  if (universe.empty() || samples.empty()) {
+    out.D = 0.0;
+    out.p_value = 1.0;
+    return out;
+  }
+
+  struct Key {
+    u64 h;
+    PairId p;
+  };
+
+  std::vector<Key> keys;
+  keys.reserve(universe.size());
+  for (const auto& p : universe) {
+    keys.push_back(Key{detail::HashPair64(p), p});
+  }
+
+  std::sort(keys.begin(), keys.end(), [](const Key& a, const Key& b) {
+    if (a.h != b.h) return a.h < b.h;
+    if (a.p.r != b.p.r) return a.p.r < b.p.r;
+    return a.p.s < b.p.s;
+  });
+
+  std::unordered_map<PairId, u32, PairIdHash> rank;
+  rank.reserve(universe.size() * 2);
+  for (u32 i = 0; i < static_cast<u32>(keys.size()); ++i) {
+    rank.emplace(keys[i].p, i);
+  }
+
+  const double U = static_cast<double>(universe.size());
+  std::vector<double> u;
+  u.reserve(samples.size());
+
+  for (usize i = 0; i < samples.size(); ++i) {
+    const auto it = rank.find(samples[i]);
+    const double r = (it == rank.end()) ? 0.0 : static_cast<double>(it->second);
+
+    // Deterministic jitter in [0,1), varying per sample index.
+    const u64 j = detail::SplitMix64(0xD1B54A32D192ED03ULL + static_cast<u64>(i));
+    const u64 mant = (j >> 11);  // top 53 bits
+    const double jitter = static_cast<double>(mant) * (1.0 / 9007199254740992.0);  // 2^53
+
+    u.push_back((r + jitter) / U);
+  }
+
+  return KSOneSampleUniform01(std::move(u));
+}
+
 // --------------------------
 // Convenience: evaluate PairId samples vs oracle universe
 // --------------------------

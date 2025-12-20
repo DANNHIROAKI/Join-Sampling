@@ -340,13 +340,11 @@ int main(int argc, char** argv) {
       const double ac1 = sjs::sampling::quality::AutocorrelationHashedPairs(
           sjs::Span<const sjs::PairId>(out.samples.pairs.data(), out.samples.pairs.size()), /*lag=*/1);
 
-      // Hash into [0,1) for KS sanity check.
-      std::vector<double> hashed;
-      hashed.reserve(out.samples.pairs.size());
-      for (const auto& p : out.samples.pairs) {
-        hashed.push_back(sjs::sampling::quality::detail::HashPairToUnit01(p));
-      }
-      const auto ks = sjs::sampling::quality::KSOneSampleUniform01(std::move(hashed));
+      // KS sanity check: map samples into [0,1) using a universe-rank + jitter scheme
+      // to avoid systematic rejection on small discrete universes (see sample_quality.h).
+      const auto ks = sjs::sampling::quality::KSPairsHashUniform01RankJitter(
+          sjs::Span<const sjs::PairId>(universe.data(), universe.size()),
+          sjs::Span<const sjs::PairId>(out.samples.pairs.data(), out.samples.pairs.size()));
 
       std::cout << "quality:\n";
       std::cout << "  missing_in_universe=" << uni.missing_in_universe << "\n";

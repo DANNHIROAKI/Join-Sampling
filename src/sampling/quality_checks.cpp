@@ -89,14 +89,9 @@ std::string EvaluatePairSampleQualityJsonLite(Span<const PairId> universe,
 
   const double ac = quality::AutocorrelationHashedPairs(samples, autocorr_lag);
 
-  // Hash pairs into [0,1) and run a one-sample KS vs Uniform[0,1).
-  // This is a light sanity check for “random-looking” sample order.
-  std::vector<double> hashed;
-  hashed.reserve(samples.size());
-  for (const auto& p : samples) {
-    hashed.push_back(quality::detail::HashPairToUnit01(p));
-  }
-  const quality::KSTestResult ks = quality::KSOneSampleUniform01(std::move(hashed));
+  // KS sanity check: map samples into [0,1) using a universe-rank + jitter scheme
+  // to avoid systematic rejection on small discrete universes (see sample_quality.h).
+  const quality::KSTestResult ks = quality::KSPairsHashUniform01RankJitter(universe, samples);
 
   std::ostringstream oss;
   oss << "{";
