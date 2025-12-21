@@ -142,8 +142,10 @@ class OursEnumSamplingBaseline final : public IBaseline<Dim, T> {
     return true;
   }
 
-  // Provide a deterministic enumerator; for consistency with the rest of the
-  // codebase we return the generic plane-sweep stream wrapper.
+  // Provide a deterministic enumerator.
+  // IMPORTANT: EnumSampling runner uses Enumerate() for BOTH passes; returning
+  // a generic plane sweep here can dominate runtime and make "Ours" look weak
+  // even when its core counting/sampling logic is efficient.
   std::unique_ptr<IJoinEnumerator> Enumerate(const Config& cfg, PhaseRecorder* phases, std::string* err) override {
     (void)cfg;
     (void)phases;
@@ -152,13 +154,7 @@ class OursEnumSamplingBaseline final : public IBaseline<Dim, T> {
       return nullptr;
     }
 
-    join::PlaneSweepOptions opt;
-    opt.axis = 0;
-    opt.side_order = join::SideTieBreak::RBeforeS;
-    opt.skip_axis_check = true;
-
-    const auto* ds = ctx_.dataset();
-    return std::make_unique<detail::PlaneSweepEnumeratorWrapper<Dim, T>>(ds->R, ds->S, opt);
+    return std::make_unique<detail::OursReportJoinEnumerator2D<Dim, T>>(&ctx_);
   }
 
  private:

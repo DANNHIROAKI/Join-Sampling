@@ -155,8 +155,8 @@ class OursAdaptiveBaseline final : public IBaseline<Dim, T> {
         if (W_new > j_star) {
           // Switch to COUNT_ONLY: discard all previously materialized pairs.
           keep_pairs = false;
-          small_pairs_.clear();
-          small_pairs_.shrink_to_fit();
+          // Free memory deterministically (shrink_to_fit is non-binding).
+          std::vector<PairId>().swap(small_pairs_);
         } else {
           // Still within threshold: enumerate this event's pairs and append.
           tmp.clear();
@@ -353,13 +353,10 @@ class OursAdaptiveBaseline final : public IBaseline<Dim, T> {
       return nullptr;
     }
 
-    join::PlaneSweepOptions opt;
-    opt.axis = 0;
-    opt.side_order = join::SideTieBreak::RBeforeS;
-    opt.skip_axis_check = true;
-
-    const auto* ds = ctx_.dataset();
-    return std::make_unique<detail::PlaneSweepEnumeratorWrapper<Dim, T>>(ds->R, ds->S, opt);
+    // IMPORTANT: the project-wide Adaptive runner performs a pilot enumeration
+    // via baseline->Enumerate(). Returning a generic plane sweep here can
+    // dominate runtime on adversarial active-set workloads.
+    return std::make_unique<detail::OursReportJoinEnumerator2D<Dim, T>>(&ctx_);
   }
 
  private:

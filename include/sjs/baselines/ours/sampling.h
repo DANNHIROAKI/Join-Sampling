@@ -33,7 +33,7 @@
 #include "sjs/baselines/baseline_api.h"
 
 #include "sjs/core/assert.h"
-#include "sjs/join/join_enumerator.h"  // for PlaneSweepJoinStream wrapper
+#include "sjs/join/join_enumerator.h"  // optional (kept for debugging / comparison)
 #include "sjs/join/sweep_events.h"
 #include "sjs/sampling/alias_table.h"
 
@@ -880,6 +880,184 @@ class PlaneSweepEnumeratorWrapper final : public baselines::IJoinEnumerator {
   join::PlaneSweepJoinStream<Dim, T> stream_;
 };
 
+// -----------------------------------------------------------------------------
+// OursReportJoinEnumerator2D
+// -----------------------------------------------------------------------------
+// A deterministic join enumerator that follows the same sweep + pattern
+// decomposition used by "Our Method".
+//
+// Why this exists:
+//   The project-wide EnumSampling and Adaptive runners rely on baseline->Enumerate()
+//   and may perform one or two passes over the join stream. Returning a generic
+//   PlaneSweep enumerator here can be catastrophically slow on adversarial cases
+//   (e.g., large active sets), even if the baseline's Count/Sample logic is fast.
+//
+// This enumerator uses the same ActiveIndex2D (stabbing + range-point segtree)
+// to *directly* report true intersections, avoiding O(|active|) scans.
+
+template <int Dim, class T>
+class OursReportJoinEnumerator2D final : public baselines::IJoinEnumerator {
+ public:
+  using Ctx = Ours2DContext<Dim, T>;
+
+  explicit OursReportJoinEnumerator2D(Ctx* ctx) : ctx_(ctx) {
+    static_assert(Dim == 2, "OursReportJoinEnumerator2D is only implemented for Dim=2");
+    SJS_DASSERT(ctx_ != nullptr);
+    Reset();
+  }
+
+  void Reset() override {
+    SJS_DASSERT(ctx_ != nullptr);
+    ctx_->ResetActive();
+
+    pos_ = 0;
+    stage_ = Stage::Scan;
+    tmp_.clear();
+    tmp_i_ = 0;
+
+    active_r_ = 0;
+    active_s_ = 0;
+
+    stats_.Reset();
+    stats_.num_events = static_cast<u64>(ctx_->events().size());
+  }
+
+  bool Next(PairId* out) override {
+    SJS_DASSERT(out != nullptr);
+    SJS_DASSERT(ctx_ != nullptr);
+
+    const auto* ds = ctx_->dataset();
+    SJS_DASSERT(ds != nullptr);
+
+    auto& ar = ctx_->active_r();
+    auto& as = ctx_->active_s();
+
+    const auto& events = ctx_->events();
+    const auto& ylo_r = ctx_->ylo_rank_r();
+    const auto& yhi_r = ctx_->yhi_lb_rank_r();
+    const auto& ylo_s = ctx_->ylo_rank_s();
+    const auto& yhi_s = ctx_->yhi_lb_rank_s();
+
+    while (true) {
+      // If we're in the middle of emitting pairs for the current START event.
+      if (stage_ == Stage::Emit) {
+        if (tmp_i_ < tmp_.size()) {
+          const u32 oh = tmp_[tmp_i_++];
+          if (q_is_r_) {
+            *out = PairId{ds->R.GetId(q_idx_), ds->S.GetId(oh)};
+          } else {
+            *out = PairId{ds->R.GetId(oh), ds->S.GetId(q_idx_)};
+          }
+          ++stats_.output_pairs;
+          ++stats_.candidate_checks;
+          return true;
+        }
+
+        // Finished current buffer; advance to the next pattern or finalize START.
+        if (pat_ == Pattern::A) {
+          // Switch to Pattern B.
+          pat_ = Pattern::B;
+          tmp_.clear();
+          const detail::ActiveIndex2D& other = q_is_r_ ? as : ar;
+          other.ReportB(q_ylo_, q_yhi_, &tmp_);
+          tmp_i_ = 0;
+          continue;
+        }
+
+        // Finished Pattern B: insert q and move on.
+        if (q_is_r_) {
+          ar.Insert(q_handle_, q_ylo_, q_yhi_);
+          ++active_r_;
+          if (active_r_ > stats_.active_max_r) stats_.active_max_r = active_r_;
+        } else {
+          as.Insert(q_handle_, q_ylo_, q_yhi_);
+          ++active_s_;
+          if (active_s_ > stats_.active_max_s) stats_.active_max_s = active_s_;
+        }
+
+        stage_ = Stage::Scan;
+        ++pos_;
+        continue;
+      }
+
+      // Scan events until we find the next START (or reach end).
+      if (pos_ >= events.size()) {
+        // Leave ctx_ in a clean state for safety.
+        ctx_->ResetActive();
+        return false;
+      }
+
+      const auto& ev = events[pos_];
+      const u32 handle = static_cast<u32>(ev.index);
+
+      if (ev.kind == join::EventKind::End) {
+        if (ev.side == join::Side::R) {
+          ar.Erase(handle);
+          SJS_DASSERT(active_r_ > 0);
+          --active_r_;
+        } else {
+          as.Erase(handle);
+          SJS_DASSERT(active_s_ > 0);
+          --active_s_;
+        }
+        ++pos_;
+        continue;
+      }
+
+      // START event: prepare Pattern A buffer, but do NOT insert q yet.
+      q_is_r_ = (ev.side == join::Side::R);
+      q_idx_ = static_cast<u32>(ev.index);
+      q_handle_ = handle;
+      q_ylo_ = q_is_r_ ? ylo_r[ev.index] : ylo_s[ev.index];
+      q_yhi_ = q_is_r_ ? yhi_r[ev.index] : yhi_s[ev.index];
+
+      pat_ = Pattern::A;
+      tmp_.clear();
+      const detail::ActiveIndex2D& other = q_is_r_ ? as : ar;
+      other.ReportA(q_ylo_, &tmp_);
+      tmp_i_ = 0;
+      stage_ = Stage::Emit;
+      // Loop back to emit from tmp_.
+    }
+  }
+
+  const join::JoinStats& Stats() const noexcept override { return stats_; }
+
+ private:
+  enum class Stage : u8 {
+    Scan = 0,
+    Emit = 1,
+  };
+
+  enum class Pattern : u8 {
+    A = 0,
+    B = 1,
+  };
+
+  Ctx* ctx_{nullptr};
+
+  // Iteration state.
+  usize pos_{0};
+  Stage stage_{Stage::Scan};
+  Pattern pat_{Pattern::A};
+
+  // Current START event (q).
+  bool q_is_r_{true};
+  u32 q_idx_{0};
+  u32 q_handle_{0};
+  u32 q_ylo_{0};
+  u32 q_yhi_{0};
+
+  // Buffer of opposite-side handles for the current pattern.
+  std::vector<u32> tmp_;
+  usize tmp_i_{0};
+
+  // Lightweight stats.
+  join::JoinStats stats_;
+  u64 active_r_{0};
+  u64 active_s_{0};
+};
+
 }  // namespace detail
 
 // -----------------------------------------------------------------------------
@@ -1161,13 +1339,10 @@ class OursSamplingBaseline final : public IBaseline<Dim, T> {
       return nullptr;
     }
 
-    join::PlaneSweepOptions opt;
-    opt.axis = 0;
-    opt.side_order = join::SideTieBreak::RBeforeS;
-    opt.skip_axis_check = true;
-
-    const auto* ds = ctx_.dataset();
-    return std::make_unique<detail::PlaneSweepEnumeratorWrapper<Dim, T>>(ds->R, ds->S, opt);
+    // IMPORTANT: return the report-based enumerator (not the generic plane sweep).
+    // EnumSampling / Adaptive runners depend on Enumerate() and would otherwise
+    // measure an unrelated and potentially adversarially slow algorithm.
+    return std::make_unique<detail::OursReportJoinEnumerator2D<Dim, T>>(&ctx_);
   }
 
  private:
