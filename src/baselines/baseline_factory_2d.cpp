@@ -93,6 +93,8 @@ std::unique_ptr<IBaseline<2, Scalar>> CreateBaseline2D(Method method,
           return std::make_unique<ours::OursEnumSamplingBaseline<2, Scalar>>();
         case Variant::Adaptive:
           return std::make_unique<ours::OursAdaptiveBaseline<2, Scalar>>();
+        default:
+          break;
       }
       break;
 
@@ -104,6 +106,8 @@ std::unique_ptr<IBaseline<2, Scalar>> CreateBaseline2D(Method method,
           return std::make_unique<aabb::AABBEnumSamplingBaseline<2, Scalar>>();
         case Variant::Adaptive:
           return std::make_unique<aabb::AABBAdaptiveBaseline<2, Scalar>>();
+        default:
+          break;
       }
       break;
 
@@ -115,6 +119,8 @@ std::unique_ptr<IBaseline<2, Scalar>> CreateBaseline2D(Method method,
           return std::make_unique<interval_tree::IntervalTreeEnumSamplingBaseline<2, Scalar>>();
         case Variant::Adaptive:
           return std::make_unique<interval_tree::IntervalTreeAdaptiveBaseline<2, Scalar>>();
+        default:
+          break;
       }
       break;
 
@@ -126,6 +132,8 @@ std::unique_ptr<IBaseline<2, Scalar>> CreateBaseline2D(Method method,
           return std::make_unique<kd_tree::KDTreeEnumSamplingBaseline<2, Scalar>>();
         case Variant::Adaptive:
           return std::make_unique<kd_tree::KDTreeAdaptiveBaseline<2, Scalar>>();
+        default:
+          break;
       }
       break;
 
@@ -137,6 +145,8 @@ std::unique_ptr<IBaseline<2, Scalar>> CreateBaseline2D(Method method,
           return std::make_unique<r_tree::RTreeEnumSamplingBaseline<2, Scalar>>();
         case Variant::Adaptive:
           return std::make_unique<r_tree::RTreeAdaptiveBaseline<2, Scalar>>();
+        default:
+          break;
       }
       break;
 
@@ -148,6 +158,8 @@ std::unique_ptr<IBaseline<2, Scalar>> CreateBaseline2D(Method method,
           return std::make_unique<range_tree::RangeTreeEnumSamplingBaseline<2, Scalar>>();
         case Variant::Adaptive:
           return std::make_unique<range_tree::RangeTreeAdaptiveBaseline<2, Scalar>>();
+        default:
+          break;
       }
       break;
 
@@ -159,6 +171,8 @@ std::unique_ptr<IBaseline<2, Scalar>> CreateBaseline2D(Method method,
           return std::make_unique<pbsm::PBSMEnumSamplingBaseline<2, Scalar>>();
         case Variant::Adaptive:
           return std::make_unique<pbsm::PBSMAdaptiveBaseline<2, Scalar>>();
+        default:
+          break;
       }
       break;
 
@@ -170,6 +184,8 @@ std::unique_ptr<IBaseline<2, Scalar>> CreateBaseline2D(Method method,
           return std::make_unique<tlsop::TLSOPEnumSamplingBaseline<2, Scalar>>();
         case Variant::Adaptive:
           return std::make_unique<tlsop::TLSOPAdaptiveBaseline<2, Scalar>>();
+        default:
+          break;
       }
       break;
 
@@ -181,6 +197,8 @@ std::unique_ptr<IBaseline<2, Scalar>> CreateBaseline2D(Method method,
           return std::make_unique<sirs::SIRSEnumSamplingBaseline<2, Scalar>>();
         case Variant::Adaptive:
           return std::make_unique<sirs::SIRSAdaptiveBaseline<2, Scalar>>();
+        default:
+          break;
       }
       break;
 
@@ -192,6 +210,8 @@ std::unique_ptr<IBaseline<2, Scalar>> CreateBaseline2D(Method method,
           return std::make_unique<rejection::RejectionEnumSamplingBaseline<2, Scalar>>();
         case Variant::Adaptive:
           return std::make_unique<rejection::RejectionAdaptiveBaseline<2, Scalar>>();
+        default:
+          break;
       }
       break;
     
@@ -203,6 +223,8 @@ std::unique_ptr<IBaseline<2, Scalar>> CreateBaseline2D(Method method,
           return std::make_unique<tsunami::TsunamiEnumSamplingBaseline<2, Scalar>>();
         case Variant::Adaptive:
           return std::make_unique<tsunami::TsunamiAdaptiveBaseline<2, Scalar>>();
+        default:
+          break;
       }
       break;
 

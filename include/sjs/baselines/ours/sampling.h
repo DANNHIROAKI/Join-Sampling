@@ -1193,6 +1193,10 @@ class OursSamplingBaseline final : public IBaseline<Dim, T> {
       return false;
     }
 
+if (cfg.run.t > static_cast<u64>(std::numeric_limits<u32>::max())) {
+  if (err) *err = "OursSamplingBaseline::Sample: run.t too large (must fit in u32)";
+  return false;
+}
     const u32 t = static_cast<u32>(cfg.run.t);
 
     out->Clear();

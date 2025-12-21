@@ -101,7 +101,7 @@ class RangeTree {
     if (range.IsEmpty()) return;
 
     if constexpr (Dim == 1) {
-      RangeQuery1D(range, emit);
+      if (!RangeQuery1D(range, emit)) return;
     } else {
       // x-range -> index range [L,R) in x_order_
       const T xlo = range.lo.v[0];
@@ -114,7 +114,7 @@ class RangeTree {
       const T yhi = range.hi.v[1];
       if (!(ylo < yhi)) return;
 
-      RangeQueryRec(root_, L, R, ylo, yhi, range, emit);
+      if (!RangeQueryRec(root_, L, R, ylo, yhi, range, emit)) return;
     }
   }
 
@@ -267,56 +267,58 @@ class RangeTree {
   }
 
   template <class EmitFn>
-  void RangeQueryRec(u32 node_index,
-                     u32 ql, u32 qr,
-                     T ylo, T yhi,
-                     const BoxT& full_range,
-                     EmitFn& emit) const {
-    const Node& node = nodes_[node_index];
-    if (qr <= node.l || node.r <= ql) return;  // disjoint
-    if (ql <= node.l && node.r <= qr) {
-      // fully covered in x -> use y-list
-      const u32 a = LowerBoundY(node, ylo);
-      const u32 b = LowerBoundY(node, yhi);
-      const u32* base = y_pool_.data() + node.y_off;
-      for (u32 i = a; i < b; ++i) {
-        const u32 idx = base[i];
-        // Fast x check is implicit due to decomposition; y check due to bounds; check other dims.
-        if (PassOtherDims(idx, full_range)) {
-          if (!emit(static_cast<usize>(idx))) return;
-        }
+bool RangeQueryRec(u32 node_index,
+                   u32 ql, u32 qr,
+                   T ylo, T yhi,
+                   const BoxT& full_range,
+                   EmitFn& emit) const {
+  const Node& node = nodes_[node_index];
+  if (qr <= node.l || node.r <= ql) return true;  // disjoint
+  if (ql <= node.l && node.r <= qr) {
+    // fully covered in x -> use y-list
+    const u32 a = LowerBoundY(node, ylo);
+    const u32 b = LowerBoundY(node, yhi);
+    const u32* base = y_pool_.data() + node.y_off;
+    for (u32 i = a; i < b; ++i) {
+      const u32 idx = base[i];
+      // Fast x check is implicit due to decomposition; y check due to bounds; check other dims.
+      if (PassOtherDims(idx, full_range)) {
+        if (!emit(static_cast<usize>(idx))) return false;
       }
-      return;
     }
-
-    if (node.IsLeaf()) {
-      // Leaf with partial overlap: scan its x-range and check full range.
-      for (u32 i = std::max(node.l, ql); i < std::min(node.r, qr); ++i) {
-        const u32 idx = x_order_[i];
-        if (ContainsHalfOpen<Dim, T>(full_range, pts_[idx])) {
-          if (!emit(static_cast<usize>(idx))) return;
-        }
-      }
-      return;
-    }
-
-    RangeQueryRec(node.left, ql, qr, ylo, yhi, full_range, emit);
-    RangeQueryRec(node.right, ql, qr, ylo, yhi, full_range, emit);
+    return true;
   }
+
+  if (node.IsLeaf()) {
+    // Leaf with partial overlap: scan its x-range and check full range.
+    for (u32 i = std::max(node.l, ql); i < std::min(node.r, qr); ++i) {
+      const u32 idx = x_order_[i];
+      if (ContainsHalfOpen<Dim, T>(full_range, pts_[idx])) {
+        if (!emit(static_cast<usize>(idx))) return false;
+      }
+    }
+    return true;
+  }
+
+  if (!RangeQueryRec(node.left, ql, qr, ylo, yhi, full_range, emit)) return false;
+  if (!RangeQueryRec(node.right, ql, qr, ylo, yhi, full_range, emit)) return false;
+  return true;
+}
 
   template <class EmitFn>
-  void RangeQuery1D(const BoxT& range, EmitFn& emit) const {
-    const T xlo = range.lo.v[0];
-    const T xhi = range.hi.v[0];
-    if (!(xlo < xhi)) return;
-    const u32 L = LowerBoundX(xlo);
-    const u32 R = LowerBoundX(xhi);
-    for (u32 i = L; i < R; ++i) {
-      const u32 idx = x_order_[i];
-      // In 1D, x check is enough.
-      if (!emit(static_cast<usize>(idx))) return;
-    }
+bool RangeQuery1D(const BoxT& range, EmitFn& emit) const {
+  const T xlo = range.lo.v[0];
+  const T xhi = range.hi.v[0];
+  if (!(xlo < xhi)) return true;
+  const u32 L = LowerBoundX(xlo);
+  const u32 R = LowerBoundX(xhi);
+  for (u32 i = L; i < R; ++i) {
+    const u32 idx = x_order_[i];
+    // In 1D, x check is enough.
+    if (!emit(static_cast<usize>(idx))) return false;
   }
+  return true;
+}
 };
 
 }  // namespace index

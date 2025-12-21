@@ -18,6 +18,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -323,6 +324,9 @@ struct Config {
     if (dataset.dim <= 0) return fail("dataset.dim must be > 0");
     if (dataset.dim > kMaxSupportedDim) return fail("dataset.dim too large");
     if (run.t == 0) return fail("run.t must be > 0");
+    if (run.t > static_cast<u64>(std::numeric_limits<u32>::max())) {
+      return fail("run.t too large (must fit in u32); reduce t or update baselines to use u64");
+    }
     if (run.repeats == 0) return fail("run.repeats must be > 0");
     if (sys.threads <= 0) return fail("sys.threads must be > 0");
 

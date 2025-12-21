@@ -165,7 +165,7 @@ class IntervalTree {
   void Query(Scalar qlo, Scalar qhi, EmitFn&& emit) const {
     if (!(qlo < qhi)) return;     // empty query
     if (root_ == kNull) return;
-    QueryRec(root_, qlo, qhi, emit);
+    (void)QueryRec(root_, qlo, qhi, emit);
   }
 
  private:
@@ -276,29 +276,31 @@ class IntervalTree {
   }
 
   template <class EmitFn>
-  void QueryRec(u32 node, Scalar qlo, Scalar qhi, EmitFn& emit) const {
-    if (node == kNull) return;
+bool QueryRec(u32 node, Scalar qlo, Scalar qhi, EmitFn& emit) const {
+  if (node == kNull) return true;
 
-    // Prune: if qlo >= max_hi in this subtree, no interval has hi > qlo.
-    if (!(qlo < nodes_[node].max_hi)) return;
+  // Prune: if qlo >= max_hi in this subtree, no interval has hi > qlo.
+  if (!(qlo < nodes_[node].max_hi)) return true;
 
-    const Node& n = nodes_[node];
+  const Node& n = nodes_[node];
 
-    // Explore left first.
-    if (n.left != kNull) {
-      QueryRec(n.left, qlo, qhi, emit);
-    }
-
-    // Check this node.
-    if (detail::Intersects1DHalfOpen<Scalar>(n.lo, n.hi, qlo, qhi)) {
-      if (!emit(static_cast<usize>(node))) return;
-    }
-
-    // Explore right: if this node's lo >= qhi, then all rights have lo >= qhi => cannot overlap.
-    if (n.right != kNull && n.lo < qhi) {
-      QueryRec(n.right, qlo, qhi, emit);
-    }
+  // Explore left first.
+  if (n.left != kNull) {
+    if (!QueryRec(n.left, qlo, qhi, emit)) return false;
   }
+
+  // Check this node.
+  if (detail::Intersects1DHalfOpen<Scalar>(n.lo, n.hi, qlo, qhi)) {
+    if (!emit(static_cast<usize>(node))) return false;
+  }
+
+  // Explore right: if this node's lo >= qhi, then all rights have lo >= qhi => cannot overlap.
+  if (n.right != kNull && n.lo < qhi) {
+    if (!QueryRec(n.right, qlo, qhi, emit)) return false;
+  }
+
+  return true;
+}
 };
 
 // Convenience wrapper: maintain intervals from Box<Dim> projected on one axis.

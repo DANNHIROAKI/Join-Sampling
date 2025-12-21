@@ -1,0 +1,622 @@
+diff -ruN a/apps/sjs_sweep.cpp b/apps/sjs_sweep.cpp
+--- a/apps/sjs_sweep.cpp	2025-12-21 17:42:47.198092367 +0000
++++ b/apps/sjs_sweep.cpp	2025-12-21 17:48:24.493713738 +0000
+@@ -148,9 +148,96 @@
+     if (c == '.') c = '_';
+   }
+   return s;
++
++
++}  // namespace
++
++// --------------------------
++// Path resolution helpers
++// --------------------------
++//
++// Sweep configs typically live under repo_root/config/sweeps/*.json while datasets
++// are referenced as paths relative to the repo root (e.g., data/real/..., data/synthetic/...).
++// Users often run sjs_sweep from a build directory, in which case those relative paths
++// won't resolve under the current working directory.
++//
++// To make sweeps more robust (and keep configs portable), we try the following:
++//   1) Use the path as-is (absolute or relative to CWD).
++//   2) If not found and the path is relative, probe the sweep file directory and its parents:
++//        sweep_dir/path, parent(sweep_dir)/path, ..., up to a small depth.
++//
++// If resolution succeeds, we rewrite cfg.dataset.path_{r,s} to the resolved path.
++inline bool ExistsNoThrow(const fs::path& p) noexcept {
++  try {
++    return fs::exists(p);
++  } catch (...) {
++    return false;
++  }
++}
++
++inline std::string ResolvePathByProbingParents(std::string_view path_sv,
++                                              const fs::path& sweep_dir,
++                                              int max_parents = 8) {
++  fs::path p(std::string(path_sv));
++  if (p.empty()) return std::string(path_sv);
++
++  // Absolute path: nothing to do.
++  if (p.is_absolute()) return p.string();
++
++  // Relative path: first try as-is relative to CWD.
++  if (ExistsNoThrow(p)) return p.string();
++
++  // Probe sweep_dir and its parents.
++  fs::path probe = sweep_dir;
++  for (int i = 0; i < max_parents && !probe.empty(); ++i) {
++    fs::path candidate = (probe / p).lexically_normal();
++    if (ExistsNoThrow(candidate)) return candidate.string();
++    fs::path parent = probe.parent_path();
++    if (parent == probe) break;
++    probe = parent;
++  }
++
++  // Fall back to the original (still relative) path.
++  return p.string();
++}
++
++inline void ResolveDatasetPathsFromSweep(const fs::path& sweep_json_path, sjs::Config* cfg) {
++  if (!cfg) return;
++  if (cfg->dataset.source == sjs::DataSource::Synthetic) return;
++
++  fs::path sweep_abs;
++  fs::path sweep_dir;
++  try {
++    sweep_abs = fs::absolute(sweep_json_path);
++    sweep_dir = sweep_abs.has_parent_path() ? sweep_abs.parent_path() : fs::current_path();
++  } catch (...) {
++    sweep_dir = fs::current_path();
++  }
++
++  const std::string old_r = cfg->dataset.path_r;
++  const std::string old_s = cfg->dataset.path_s;
++
++  if (!cfg->dataset.path_r.empty()) {
++    cfg->dataset.path_r = ResolvePathByProbingParents(cfg->dataset.path_r, sweep_dir);
++  }
++  if (!cfg->dataset.path_s.empty()) {
++    cfg->dataset.path_s = ResolvePathByProbingParents(cfg->dataset.path_s, sweep_dir);
++  }
++
++  if (cfg->dataset.path_r != old_r) {
++    SJS_LOG_INFO("Resolved path_r: '", old_r, "' -> '", cfg->dataset.path_r, "'");
++  }
++  if (cfg->dataset.path_s != old_s) {
++    SJS_LOG_INFO("Resolved path_s: '", old_s, "' -> '", cfg->dataset.path_s, "'");
++  }
+ }
+ 
++namespace {
++
++// --------------------------
++// Dataset load/generate (same logic as sjs_run)
+ // --------------------------
++
+ // Dataset load/generate (same logic as sjs_run)
+ // --------------------------
+ 
+@@ -1023,6 +1110,10 @@
+   if (auto v = args.Get("raw_file")) spec.raw_file = std::string(*v);
+   if (auto v = args.Get("summary_file")) spec.summary_file = std::string(*v);
+ 
++// Improve portability: resolve binary/csv dataset paths relative to the sweep config location.
++// This allows running from a build directory while keeping paths in JSON relative to repo root.
++sjs::apps::ResolveDatasetPathsFromSweep(fs::path(sweep_path), &spec.base);
++
+   if (!spec.base.Validate(&err)) {
+     SJS_LOG_ERROR("Base config validation failed: ", err);
+     return 4;
+@@ -1166,87 +1257,79 @@
+                 // For large sweeps we therefore disable this combination here.
+                 // Use Variant::Adaptive for the rejection baseline instead.
+                 if (method == sjs::Method::Rejection && variant == sjs::Variant::Sampling) {
+-                  const std::string note =
+-                      "SKIPPED: rejection+sampling is disabled in sjs_sweep; use variant=adaptive.";
+-                  SJS_LOG_WARN(note, " dataset=", ds.name,
+-                               " t=", static_cast<unsigned long long>(t),
+-                               (cfg.dataset.source == sjs::DataSource::Synthetic
+-                                    ? " alpha=" + std::to_string(cfg.dataset.synthetic.alpha)
+-                                    : std::string("")));
+-
+-                  // Collect per-repeat placeholders so the summary row stays well-formed.
+-                  std::vector<double> wall_ms;
+-                  wall_ms.reserve(seeds.size());
+-                  std::vector<double> count_vals;
+-                  count_vals.reserve(seeds.size());
+-                  const double nan = std::numeric_limits<double>::quiet_NaN();
+-
+-                  for (usize i = 0; i < seeds.size(); ++i) {
+-                    const u64 seed = seeds[i];
+-                    const double wms = nan;
+-                    const double count_value = nan;
+-                    wall_ms.push_back(wms);
+-                    count_vals.push_back(count_value);
+-
+-                    total_runs++;
+-
+-                    // Raw row (marked as failed/skipped).
+-                    raw_writer.WriteRowV(
+-                        ds.name,
+-                        (cfg.dataset.source == sjs::DataSource::Synthetic ? cfg.dataset.synthetic.generator : ""),
+-                        (cfg.dataset.source == sjs::DataSource::Synthetic ? cfg.dataset.synthetic.alpha
+-                                                                          : std::numeric_limits<double>::quiet_NaN()),
+-                        static_cast<unsigned long long>(ds.R.Size()),
+-                        static_cast<unsigned long long>(ds.S.Size()),
+-                        sjs::ToString(method),
+-                        sjs::ToString(variant),
+-                        static_cast<unsigned long long>(t),
+-                        static_cast<unsigned long long>(i),
+-                        static_cast<unsigned long long>(seed),
+-                        0,
+-                        wms,
+-                        count_value,
+-                        0,
+-                        0,
+-                        0,
+-                        0ULL,
+-                        "",
+-                        0ULL,
+-                        "{}",
+-                        note,
+-                        cfg.ToJsonLite(),
+-                        (gen_report_ptr ? gen_report_ptr->ToJsonLite() : "{}"));
+-                  }
+-
+-                  // Summary row (ok_rate=0, values likely NaN).
+-                  const sjs::Summary wall_sum = sjs::Summarize(wall_ms);
+-                  const sjs::Summary cnt_sum = sjs::Summarize(count_vals);
+-                  const double ok_rate = 0.0;
+-                  const double exact_frac = 0.0;
+-
+-                  sum_writer.WriteRowV(
+-                      ds.name,
+-                      (cfg.dataset.source == sjs::DataSource::Synthetic ? cfg.dataset.synthetic.generator : ""),
+-                      (cfg.dataset.source == sjs::DataSource::Synthetic ? cfg.dataset.synthetic.alpha
+-                                                                        : std::numeric_limits<double>::quiet_NaN()),
+-                      static_cast<unsigned long long>(ds.R.Size()),
+-                      static_cast<unsigned long long>(ds.S.Size()),
+-                      sjs::ToString(method),
+-                      sjs::ToString(variant),
+-                      static_cast<unsigned long long>(t),
+-                      static_cast<unsigned long long>(seeds.size()),
+-                      ok_rate,
+-                      wall_sum.mean,
+-                      wall_sum.stdev,
+-                      wall_sum.median,
+-                      wall_sum.p95,
+-                      cnt_sum.mean,
+-                      cnt_sum.stdev,
+-                      exact_frac,
+-                      note);
++  const std::string note =
++      "SKIPPED: rejection+sampling is disabled in sjs_sweep; use variant=adaptive.";
++  SJS_LOG_WARN(note, " dataset=", ds.name,
++               " t=", static_cast<unsigned long long>(t),
++               (cfg.dataset.source == sjs::DataSource::Synthetic
++                    ? " alpha=" + std::to_string(cfg.dataset.synthetic.alpha)
++                    : std::string("")));
++
++  // IMPORTANT: Do not emit NaN/Inf placeholders into summary stats.
++  // Many downstream tools (CSV readers, plotting scripts) treat NaN/Inf as fatal or
++  // will silently propagate them. For skipped runs we instead:
++  //   - write ok=0 rows in sweep_raw.csv with sentinel numeric values (-1),
++  //   - write a summary row with ok_rate=0 and sentinel numeric values (-1).
++  const double skipped_ms = -1.0;
++  const double skipped_count = -1.0;
++
++  for (usize i = 0; i < seeds.size(); ++i) {
++    const u64 seed = seeds[i];
++    total_runs++;
++
++    raw_writer.WriteRowV(
++        ds.name,
++        (cfg.dataset.source == sjs::DataSource::Synthetic ? cfg.dataset.synthetic.generator : ""),
++        (cfg.dataset.source == sjs::DataSource::Synthetic ? cfg.dataset.synthetic.alpha
++                                                          : std::numeric_limits<double>::quiet_NaN()),
++        static_cast<unsigned long long>(ds.R.Size()),
++        static_cast<unsigned long long>(ds.S.Size()),
++        sjs::ToString(method),
++        sjs::ToString(variant),
++        static_cast<unsigned long long>(t),
++        static_cast<unsigned long long>(i),
++        static_cast<unsigned long long>(seed),
++        0,
++        skipped_ms,
++        skipped_count,
++        0,
++        0,
++        0,
++        0ULL,
++        "",
++        0ULL,
++        "{}",
++        note,
++        cfg.ToJsonLite(),
++        (gen_report_ptr ? gen_report_ptr->ToJsonLite() : "{}"));
++  }
++
++  const double ok_rate = 0.0;
++  const double exact_frac = 0.0;
++
++  sum_writer.WriteRowV(
++      ds.name,
++      (cfg.dataset.source == sjs::DataSource::Synthetic ? cfg.dataset.synthetic.generator : ""),
++      (cfg.dataset.source == sjs::DataSource::Synthetic ? cfg.dataset.synthetic.alpha
++                                                        : std::numeric_limits<double>::quiet_NaN()),
++      static_cast<unsigned long long>(ds.R.Size()),
++      static_cast<unsigned long long>(ds.S.Size()),
++      sjs::ToString(method),
++      sjs::ToString(variant),
++      static_cast<unsigned long long>(t),
++      static_cast<unsigned long long>(seeds.size()),
++      ok_rate,
++      skipped_ms,
++      skipped_ms,
++      skipped_ms,
++      skipped_ms,
++      skipped_count,
++      skipped_count,
++      exact_frac,
++      note);
+ 
+-                  continue;
+-                }
++  continue;
++}
+                 // Create baseline.
+                 std::string b_err;
+                 auto baseline = sjs::baselines::CreateBaseline2D(method, variant, &b_err);
+@@ -1331,7 +1414,19 @@
+ 
+                 // Summary row.
+                 const sjs::Summary wall_sum = sjs::Summarize(wall_ms);
+-                const sjs::Summary cnt_sum = sjs::Summarize(count_vals);
++// Count stats: ignore NaN from failed runs so summary.csv remains numeric.
++std::vector<double> count_vals_finite;
++count_vals_finite.reserve(count_vals.size());
++for (double v : count_vals) {
++  if (std::isfinite(v)) count_vals_finite.push_back(v);
++}
++double cnt_mean = -1.0;
++double cnt_stdev = -1.0;
++if (!count_vals_finite.empty()) {
++  const sjs::Summary cnt_sum = sjs::Summarize(count_vals_finite);
++  cnt_mean = cnt_sum.mean;
++  cnt_stdev = cnt_sum.stdev;
++}
+                 const double ok_rate = (seeds.empty() ? 0.0 : static_cast<double>(ok_in_group) /
+                                                           static_cast<double>(seeds.size()));
+                 const double exact_frac = (seeds.empty() ? 0.0 : static_cast<double>(exact_count) /
+@@ -1353,8 +1448,8 @@
+                     wall_sum.stdev,
+                     wall_sum.median,
+                     wall_sum.p95,
+-                    cnt_sum.mean,
+-                    cnt_sum.stdev,
++                    cnt_mean,
++                    cnt_stdev,
+                     exact_frac,
+                     "");
+               }
+diff -ruN a/include/sjs/baselines/ours/sampling.h b/include/sjs/baselines/ours/sampling.h
+--- a/include/sjs/baselines/ours/sampling.h	2025-12-21 17:42:47.175868813 +0000
++++ b/include/sjs/baselines/ours/sampling.h	2025-12-21 17:44:19.310389163 +0000
+@@ -1193,6 +1193,10 @@
+       return false;
+     }
+ 
++if (cfg.run.t > static_cast<u64>(std::numeric_limits<u32>::max())) {
++  if (err) *err = "OursSamplingBaseline::Sample: run.t too large (must fit in u32)";
++  return false;
++}
+     const u32 t = static_cast<u32>(cfg.run.t);
+ 
+     out->Clear();
+diff -ruN a/include/sjs/core/config.h b/include/sjs/core/config.h
+--- a/include/sjs/core/config.h	2025-12-21 17:42:46.484723400 +0000
++++ b/include/sjs/core/config.h	2025-12-21 17:43:14.095586372 +0000
+@@ -18,6 +18,7 @@
+ #include <cctype>
+ #include <cstdlib>
+ #include <fstream>
++#include <limits>
+ #include <optional>
+ #include <sstream>
+ #include <string>
+@@ -323,6 +324,9 @@
+     if (dataset.dim <= 0) return fail("dataset.dim must be > 0");
+     if (dataset.dim > kMaxSupportedDim) return fail("dataset.dim too large");
+     if (run.t == 0) return fail("run.t must be > 0");
++    if (run.t > static_cast<u64>(std::numeric_limits<u32>::max())) {
++      return fail("run.t too large (must fit in u32); reduce t or update baselines to use u64");
++    }
+     if (run.repeats == 0) return fail("run.repeats must be > 0");
+     if (sys.threads <= 0) return fail("sys.threads must be > 0");
+ 
+diff -ruN a/include/sjs/index/interval_tree.h b/include/sjs/index/interval_tree.h
+--- a/include/sjs/index/interval_tree.h	2025-12-21 17:42:47.219062659 +0000
++++ b/include/sjs/index/interval_tree.h	2025-12-21 17:43:35.101203922 +0000
+@@ -165,7 +165,7 @@
+   void Query(Scalar qlo, Scalar qhi, EmitFn&& emit) const {
+     if (!(qlo < qhi)) return;     // empty query
+     if (root_ == kNull) return;
+-    QueryRec(root_, qlo, qhi, emit);
++    (void)QueryRec(root_, qlo, qhi, emit);
+   }
+ 
+  private:
+@@ -276,29 +276,31 @@
+   }
+ 
+   template <class EmitFn>
+-  void QueryRec(u32 node, Scalar qlo, Scalar qhi, EmitFn& emit) const {
+-    if (node == kNull) return;
++bool QueryRec(u32 node, Scalar qlo, Scalar qhi, EmitFn& emit) const {
++  if (node == kNull) return true;
+ 
+-    // Prune: if qlo >= max_hi in this subtree, no interval has hi > qlo.
+-    if (!(qlo < nodes_[node].max_hi)) return;
++  // Prune: if qlo >= max_hi in this subtree, no interval has hi > qlo.
++  if (!(qlo < nodes_[node].max_hi)) return true;
+ 
+-    const Node& n = nodes_[node];
++  const Node& n = nodes_[node];
+ 
+-    // Explore left first.
+-    if (n.left != kNull) {
+-      QueryRec(n.left, qlo, qhi, emit);
+-    }
++  // Explore left first.
++  if (n.left != kNull) {
++    if (!QueryRec(n.left, qlo, qhi, emit)) return false;
++  }
+ 
+-    // Check this node.
+-    if (detail::Intersects1DHalfOpen<Scalar>(n.lo, n.hi, qlo, qhi)) {
+-      if (!emit(static_cast<usize>(node))) return;
+-    }
++  // Check this node.
++  if (detail::Intersects1DHalfOpen<Scalar>(n.lo, n.hi, qlo, qhi)) {
++    if (!emit(static_cast<usize>(node))) return false;
++  }
+ 
+-    // Explore right: if this node's lo >= qhi, then all rights have lo >= qhi => cannot overlap.
+-    if (n.right != kNull && n.lo < qhi) {
+-      QueryRec(n.right, qlo, qhi, emit);
+-    }
++  // Explore right: if this node's lo >= qhi, then all rights have lo >= qhi => cannot overlap.
++  if (n.right != kNull && n.lo < qhi) {
++    if (!QueryRec(n.right, qlo, qhi, emit)) return false;
+   }
++
++  return true;
++}
+ };
+ 
+ // Convenience wrapper: maintain intervals from Box<Dim> projected on one axis.
+diff -ruN a/include/sjs/index/range_tree.h b/include/sjs/index/range_tree.h
+--- a/include/sjs/index/range_tree.h	2025-12-21 17:42:46.652989053 +0000
++++ b/include/sjs/index/range_tree.h	2025-12-21 17:44:07.870898891 +0000
+@@ -101,7 +101,7 @@
+     if (range.IsEmpty()) return;
+ 
+     if constexpr (Dim == 1) {
+-      RangeQuery1D(range, emit);
++      if (!RangeQuery1D(range, emit)) return;
+     } else {
+       // x-range -> index range [L,R) in x_order_
+       const T xlo = range.lo.v[0];
+@@ -114,7 +114,7 @@
+       const T yhi = range.hi.v[1];
+       if (!(ylo < yhi)) return;
+ 
+-      RangeQueryRec(root_, L, R, ylo, yhi, range, emit);
++      if (!RangeQueryRec(root_, L, R, ylo, yhi, range, emit)) return;
+     }
+   }
+ 
+@@ -267,56 +267,58 @@
+   }
+ 
+   template <class EmitFn>
+-  void RangeQueryRec(u32 node_index,
+-                     u32 ql, u32 qr,
+-                     T ylo, T yhi,
+-                     const BoxT& full_range,
+-                     EmitFn& emit) const {
+-    const Node& node = nodes_[node_index];
+-    if (qr <= node.l || node.r <= ql) return;  // disjoint
+-    if (ql <= node.l && node.r <= qr) {
+-      // fully covered in x -> use y-list
+-      const u32 a = LowerBoundY(node, ylo);
+-      const u32 b = LowerBoundY(node, yhi);
+-      const u32* base = y_pool_.data() + node.y_off;
+-      for (u32 i = a; i < b; ++i) {
+-        const u32 idx = base[i];
+-        // Fast x check is implicit due to decomposition; y check due to bounds; check other dims.
+-        if (PassOtherDims(idx, full_range)) {
+-          if (!emit(static_cast<usize>(idx))) return;
+-        }
++bool RangeQueryRec(u32 node_index,
++                   u32 ql, u32 qr,
++                   T ylo, T yhi,
++                   const BoxT& full_range,
++                   EmitFn& emit) const {
++  const Node& node = nodes_[node_index];
++  if (qr <= node.l || node.r <= ql) return true;  // disjoint
++  if (ql <= node.l && node.r <= qr) {
++    // fully covered in x -> use y-list
++    const u32 a = LowerBoundY(node, ylo);
++    const u32 b = LowerBoundY(node, yhi);
++    const u32* base = y_pool_.data() + node.y_off;
++    for (u32 i = a; i < b; ++i) {
++      const u32 idx = base[i];
++      // Fast x check is implicit due to decomposition; y check due to bounds; check other dims.
++      if (PassOtherDims(idx, full_range)) {
++        if (!emit(static_cast<usize>(idx))) return false;
+       }
+-      return;
+     }
++    return true;
++  }
+ 
+-    if (node.IsLeaf()) {
+-      // Leaf with partial overlap: scan its x-range and check full range.
+-      for (u32 i = std::max(node.l, ql); i < std::min(node.r, qr); ++i) {
+-        const u32 idx = x_order_[i];
+-        if (ContainsHalfOpen<Dim, T>(full_range, pts_[idx])) {
+-          if (!emit(static_cast<usize>(idx))) return;
+-        }
++  if (node.IsLeaf()) {
++    // Leaf with partial overlap: scan its x-range and check full range.
++    for (u32 i = std::max(node.l, ql); i < std::min(node.r, qr); ++i) {
++      const u32 idx = x_order_[i];
++      if (ContainsHalfOpen<Dim, T>(full_range, pts_[idx])) {
++        if (!emit(static_cast<usize>(idx))) return false;
+       }
+-      return;
+     }
+-
+-    RangeQueryRec(node.left, ql, qr, ylo, yhi, full_range, emit);
+-    RangeQueryRec(node.right, ql, qr, ylo, yhi, full_range, emit);
++    return true;
+   }
+ 
++  if (!RangeQueryRec(node.left, ql, qr, ylo, yhi, full_range, emit)) return false;
++  if (!RangeQueryRec(node.right, ql, qr, ylo, yhi, full_range, emit)) return false;
++  return true;
++}
++
+   template <class EmitFn>
+-  void RangeQuery1D(const BoxT& range, EmitFn& emit) const {
+-    const T xlo = range.lo.v[0];
+-    const T xhi = range.hi.v[0];
+-    if (!(xlo < xhi)) return;
+-    const u32 L = LowerBoundX(xlo);
+-    const u32 R = LowerBoundX(xhi);
+-    for (u32 i = L; i < R; ++i) {
+-      const u32 idx = x_order_[i];
+-      // In 1D, x check is enough.
+-      if (!emit(static_cast<usize>(idx))) return;
+-    }
++bool RangeQuery1D(const BoxT& range, EmitFn& emit) const {
++  const T xlo = range.lo.v[0];
++  const T xhi = range.hi.v[0];
++  if (!(xlo < xhi)) return true;
++  const u32 L = LowerBoundX(xlo);
++  const u32 R = LowerBoundX(xhi);
++  for (u32 i = L; i < R; ++i) {
++    const u32 idx = x_order_[i];
++    // In 1D, x check is enough.
++    if (!emit(static_cast<usize>(idx))) return false;
+   }
++  return true;
++}
+ };
+ 
+ }  // namespace index
+diff -ruN a/src/baselines/baseline_factory_2d.cpp b/src/baselines/baseline_factory_2d.cpp
+--- a/src/baselines/baseline_factory_2d.cpp	2025-12-21 17:42:47.212389824 +0000
++++ b/src/baselines/baseline_factory_2d.cpp	2025-12-21 17:48:57.292773297 +0000
+@@ -93,6 +93,8 @@
+           return std::make_unique<ours::OursEnumSamplingBaseline<2, Scalar>>();
+         case Variant::Adaptive:
+           return std::make_unique<ours::OursAdaptiveBaseline<2, Scalar>>();
++        default:
++          break;
+       }
+       break;
+ 
+@@ -104,6 +106,8 @@
+           return std::make_unique<aabb::AABBEnumSamplingBaseline<2, Scalar>>();
+         case Variant::Adaptive:
+           return std::make_unique<aabb::AABBAdaptiveBaseline<2, Scalar>>();
++        default:
++          break;
+       }
+       break;
+ 
+@@ -115,6 +119,8 @@
+           return std::make_unique<interval_tree::IntervalTreeEnumSamplingBaseline<2, Scalar>>();
+         case Variant::Adaptive:
+           return std::make_unique<interval_tree::IntervalTreeAdaptiveBaseline<2, Scalar>>();
++        default:
++          break;
+       }
+       break;
+ 
+@@ -126,6 +132,8 @@
+           return std::make_unique<kd_tree::KDTreeEnumSamplingBaseline<2, Scalar>>();
+         case Variant::Adaptive:
+           return std::make_unique<kd_tree::KDTreeAdaptiveBaseline<2, Scalar>>();
++        default:
++          break;
+       }
+       break;
+ 
+@@ -137,6 +145,8 @@
+           return std::make_unique<r_tree::RTreeEnumSamplingBaseline<2, Scalar>>();
+         case Variant::Adaptive:
+           return std::make_unique<r_tree::RTreeAdaptiveBaseline<2, Scalar>>();
++        default:
++          break;
+       }
+       break;
+ 
+@@ -148,6 +158,8 @@
+           return std::make_unique<range_tree::RangeTreeEnumSamplingBaseline<2, Scalar>>();
+         case Variant::Adaptive:
+           return std::make_unique<range_tree::RangeTreeAdaptiveBaseline<2, Scalar>>();
++        default:
++          break;
+       }
+       break;
+ 
+@@ -159,6 +171,8 @@
+           return std::make_unique<pbsm::PBSMEnumSamplingBaseline<2, Scalar>>();
+         case Variant::Adaptive:
+           return std::make_unique<pbsm::PBSMAdaptiveBaseline<2, Scalar>>();
++        default:
++          break;
+       }
+       break;
+ 
+@@ -170,6 +184,8 @@
+           return std::make_unique<tlsop::TLSOPEnumSamplingBaseline<2, Scalar>>();
+         case Variant::Adaptive:
+           return std::make_unique<tlsop::TLSOPAdaptiveBaseline<2, Scalar>>();
++        default:
++          break;
+       }
+       break;
+ 
+@@ -181,6 +197,8 @@
+           return std::make_unique<sirs::SIRSEnumSamplingBaseline<2, Scalar>>();
+         case Variant::Adaptive:
+           return std::make_unique<sirs::SIRSAdaptiveBaseline<2, Scalar>>();
++        default:
++          break;
+       }
+       break;
+ 
+@@ -192,6 +210,8 @@
+           return std::make_unique<rejection::RejectionEnumSamplingBaseline<2, Scalar>>();
+         case Variant::Adaptive:
+           return std::make_unique<rejection::RejectionAdaptiveBaseline<2, Scalar>>();
++        default:
++          break;
+       }
+       break;
+     
+@@ -203,6 +223,8 @@
+           return std::make_unique<tsunami::TsunamiEnumSamplingBaseline<2, Scalar>>();
+         case Variant::Adaptive:
+           return std::make_unique<tsunami::TsunamiAdaptiveBaseline<2, Scalar>>();
++        default:
++          break;
+       }
+       break;
+ 

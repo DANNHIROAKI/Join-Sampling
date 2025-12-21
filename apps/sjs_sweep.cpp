@@ -148,9 +148,96 @@ inline std::string FormatSci(double x, int prec = 3) {
     if (c == '.') c = '_';
   }
   return s;
-}
+
+
+}  // namespace
 
 // --------------------------
+// Path resolution helpers
+// --------------------------
+//
+// Sweep configs typically live under repo_root/config/sweeps/*.json while datasets
+// are referenced as paths relative to the repo root (e.g., data/real/..., data/synthetic/...).
+// Users often run sjs_sweep from a build directory, in which case those relative paths
+// won't resolve under the current working directory.
+//
+// To make sweeps more robust (and keep configs portable), we try the following:
+//   1) Use the path as-is (absolute or relative to CWD).
+//   2) If not found and the path is relative, probe the sweep file directory and its parents:
+//        sweep_dir/path, parent(sweep_dir)/path, ..., up to a small depth.
+//
+// If resolution succeeds, we rewrite cfg.dataset.path_{r,s} to the resolved path.
+inline bool ExistsNoThrow(const fs::path& p) noexcept {
+  try {
+    return fs::exists(p);
+  } catch (...) {
+    return false;
+  }
+}
+
+inline std::string ResolvePathByProbingParents(std::string_view path_sv,
+                                              const fs::path& sweep_dir,
+                                              int max_parents = 8) {
+  fs::path p(std::string(path_sv));
+  if (p.empty()) return std::string(path_sv);
+
+  // Absolute path: nothing to do.
+  if (p.is_absolute()) return p.string();
+
+  // Relative path: first try as-is relative to CWD.
+  if (ExistsNoThrow(p)) return p.string();
+
+  // Probe sweep_dir and its parents.
+  fs::path probe = sweep_dir;
+  for (int i = 0; i < max_parents && !probe.empty(); ++i) {
+    fs::path candidate = (probe / p).lexically_normal();
+    if (ExistsNoThrow(candidate)) return candidate.string();
+    fs::path parent = probe.parent_path();
+    if (parent == probe) break;
+    probe = parent;
+  }
+
+  // Fall back to the original (still relative) path.
+  return p.string();
+}
+
+inline void ResolveDatasetPathsFromSweep(const fs::path& sweep_json_path, sjs::Config* cfg) {
+  if (!cfg) return;
+  if (cfg->dataset.source == sjs::DataSource::Synthetic) return;
+
+  fs::path sweep_abs;
+  fs::path sweep_dir;
+  try {
+    sweep_abs = fs::absolute(sweep_json_path);
+    sweep_dir = sweep_abs.has_parent_path() ? sweep_abs.parent_path() : fs::current_path();
+  } catch (...) {
+    sweep_dir = fs::current_path();
+  }
+
+  const std::string old_r = cfg->dataset.path_r;
+  const std::string old_s = cfg->dataset.path_s;
+
+  if (!cfg->dataset.path_r.empty()) {
+    cfg->dataset.path_r = ResolvePathByProbingParents(cfg->dataset.path_r, sweep_dir);
+  }
+  if (!cfg->dataset.path_s.empty()) {
+    cfg->dataset.path_s = ResolvePathByProbingParents(cfg->dataset.path_s, sweep_dir);
+  }
+
+  if (cfg->dataset.path_r != old_r) {
+    SJS_LOG_INFO("Resolved path_r: '", old_r, "' -> '", cfg->dataset.path_r, "'");
+  }
+  if (cfg->dataset.path_s != old_s) {
+    SJS_LOG_INFO("Resolved path_s: '", old_s, "' -> '", cfg->dataset.path_s, "'");
+  }
+}
+
+namespace {
+
+// --------------------------
+// Dataset load/generate (same logic as sjs_run)
+// --------------------------
+
 // Dataset load/generate (same logic as sjs_run)
 // --------------------------
 
@@ -1023,6 +1110,10 @@ int main(int argc, char** argv) {
   if (auto v = args.Get("raw_file")) spec.raw_file = std::string(*v);
   if (auto v = args.Get("summary_file")) spec.summary_file = std::string(*v);
 
+// Improve portability: resolve binary/csv dataset paths relative to the sweep config location.
+// This allows running from a build directory while keeping paths in JSON relative to repo root.
+sjs::apps::ResolveDatasetPathsFromSweep(fs::path(sweep_path), &spec.base);
+
   if (!spec.base.Validate(&err)) {
     SJS_LOG_ERROR("Base config validation failed: ", err);
     return 4;
@@ -1166,87 +1257,79 @@ int main(int argc, char** argv) {
                 // For large sweeps we therefore disable this combination here.
                 // Use Variant::Adaptive for the rejection baseline instead.
                 if (method == sjs::Method::Rejection && variant == sjs::Variant::Sampling) {
-                  const std::string note =
-                      "SKIPPED: rejection+sampling is disabled in sjs_sweep; use variant=adaptive.";
-                  SJS_LOG_WARN(note, " dataset=", ds.name,
-                               " t=", static_cast<unsigned long long>(t),
-                               (cfg.dataset.source == sjs::DataSource::Synthetic
-                                    ? " alpha=" + std::to_string(cfg.dataset.synthetic.alpha)
-                                    : std::string("")));
+  const std::string note =
+      "SKIPPED: rejection+sampling is disabled in sjs_sweep; use variant=adaptive.";
+  SJS_LOG_WARN(note, " dataset=", ds.name,
+               " t=", static_cast<unsigned long long>(t),
+               (cfg.dataset.source == sjs::DataSource::Synthetic
+                    ? " alpha=" + std::to_string(cfg.dataset.synthetic.alpha)
+                    : std::string("")));
 
-                  // Collect per-repeat placeholders so the summary row stays well-formed.
-                  std::vector<double> wall_ms;
-                  wall_ms.reserve(seeds.size());
-                  std::vector<double> count_vals;
-                  count_vals.reserve(seeds.size());
-                  const double nan = std::numeric_limits<double>::quiet_NaN();
+  // IMPORTANT: Do not emit NaN/Inf placeholders into summary stats.
+  // Many downstream tools (CSV readers, plotting scripts) treat NaN/Inf as fatal or
+  // will silently propagate them. For skipped runs we instead:
+  //   - write ok=0 rows in sweep_raw.csv with sentinel numeric values (-1),
+  //   - write a summary row with ok_rate=0 and sentinel numeric values (-1).
+  const double skipped_ms = -1.0;
+  const double skipped_count = -1.0;
 
-                  for (usize i = 0; i < seeds.size(); ++i) {
-                    const u64 seed = seeds[i];
-                    const double wms = nan;
-                    const double count_value = nan;
-                    wall_ms.push_back(wms);
-                    count_vals.push_back(count_value);
+  for (usize i = 0; i < seeds.size(); ++i) {
+    const u64 seed = seeds[i];
+    total_runs++;
 
-                    total_runs++;
+    raw_writer.WriteRowV(
+        ds.name,
+        (cfg.dataset.source == sjs::DataSource::Synthetic ? cfg.dataset.synthetic.generator : ""),
+        (cfg.dataset.source == sjs::DataSource::Synthetic ? cfg.dataset.synthetic.alpha
+                                                          : std::numeric_limits<double>::quiet_NaN()),
+        static_cast<unsigned long long>(ds.R.Size()),
+        static_cast<unsigned long long>(ds.S.Size()),
+        sjs::ToString(method),
+        sjs::ToString(variant),
+        static_cast<unsigned long long>(t),
+        static_cast<unsigned long long>(i),
+        static_cast<unsigned long long>(seed),
+        0,
+        skipped_ms,
+        skipped_count,
+        0,
+        0,
+        0,
+        0ULL,
+        "",
+        0ULL,
+        "{}",
+        note,
+        cfg.ToJsonLite(),
+        (gen_report_ptr ? gen_report_ptr->ToJsonLite() : "{}"));
+  }
 
-                    // Raw row (marked as failed/skipped).
-                    raw_writer.WriteRowV(
-                        ds.name,
-                        (cfg.dataset.source == sjs::DataSource::Synthetic ? cfg.dataset.synthetic.generator : ""),
-                        (cfg.dataset.source == sjs::DataSource::Synthetic ? cfg.dataset.synthetic.alpha
-                                                                          : std::numeric_limits<double>::quiet_NaN()),
-                        static_cast<unsigned long long>(ds.R.Size()),
-                        static_cast<unsigned long long>(ds.S.Size()),
-                        sjs::ToString(method),
-                        sjs::ToString(variant),
-                        static_cast<unsigned long long>(t),
-                        static_cast<unsigned long long>(i),
-                        static_cast<unsigned long long>(seed),
-                        0,
-                        wms,
-                        count_value,
-                        0,
-                        0,
-                        0,
-                        0ULL,
-                        "",
-                        0ULL,
-                        "{}",
-                        note,
-                        cfg.ToJsonLite(),
-                        (gen_report_ptr ? gen_report_ptr->ToJsonLite() : "{}"));
-                  }
+  const double ok_rate = 0.0;
+  const double exact_frac = 0.0;
 
-                  // Summary row (ok_rate=0, values likely NaN).
-                  const sjs::Summary wall_sum = sjs::Summarize(wall_ms);
-                  const sjs::Summary cnt_sum = sjs::Summarize(count_vals);
-                  const double ok_rate = 0.0;
-                  const double exact_frac = 0.0;
+  sum_writer.WriteRowV(
+      ds.name,
+      (cfg.dataset.source == sjs::DataSource::Synthetic ? cfg.dataset.synthetic.generator : ""),
+      (cfg.dataset.source == sjs::DataSource::Synthetic ? cfg.dataset.synthetic.alpha
+                                                        : std::numeric_limits<double>::quiet_NaN()),
+      static_cast<unsigned long long>(ds.R.Size()),
+      static_cast<unsigned long long>(ds.S.Size()),
+      sjs::ToString(method),
+      sjs::ToString(variant),
+      static_cast<unsigned long long>(t),
+      static_cast<unsigned long long>(seeds.size()),
+      ok_rate,
+      skipped_ms,
+      skipped_ms,
+      skipped_ms,
+      skipped_ms,
+      skipped_count,
+      skipped_count,
+      exact_frac,
+      note);
 
-                  sum_writer.WriteRowV(
-                      ds.name,
-                      (cfg.dataset.source == sjs::DataSource::Synthetic ? cfg.dataset.synthetic.generator : ""),
-                      (cfg.dataset.source == sjs::DataSource::Synthetic ? cfg.dataset.synthetic.alpha
-                                                                        : std::numeric_limits<double>::quiet_NaN()),
-                      static_cast<unsigned long long>(ds.R.Size()),
-                      static_cast<unsigned long long>(ds.S.Size()),
-                      sjs::ToString(method),
-                      sjs::ToString(variant),
-                      static_cast<unsigned long long>(t),
-                      static_cast<unsigned long long>(seeds.size()),
-                      ok_rate,
-                      wall_sum.mean,
-                      wall_sum.stdev,
-                      wall_sum.median,
-                      wall_sum.p95,
-                      cnt_sum.mean,
-                      cnt_sum.stdev,
-                      exact_frac,
-                      note);
-
-                  continue;
-                }
+  continue;
+}
                 // Create baseline.
                 std::string b_err;
                 auto baseline = sjs::baselines::CreateBaseline2D(method, variant, &b_err);
@@ -1331,7 +1414,19 @@ int main(int argc, char** argv) {
 
                 // Summary row.
                 const sjs::Summary wall_sum = sjs::Summarize(wall_ms);
-                const sjs::Summary cnt_sum = sjs::Summarize(count_vals);
+// Count stats: ignore NaN from failed runs so summary.csv remains numeric.
+std::vector<double> count_vals_finite;
+count_vals_finite.reserve(count_vals.size());
+for (double v : count_vals) {
+  if (std::isfinite(v)) count_vals_finite.push_back(v);
+}
+double cnt_mean = -1.0;
+double cnt_stdev = -1.0;
+if (!count_vals_finite.empty()) {
+  const sjs::Summary cnt_sum = sjs::Summarize(count_vals_finite);
+  cnt_mean = cnt_sum.mean;
+  cnt_stdev = cnt_sum.stdev;
+}
                 const double ok_rate = (seeds.empty() ? 0.0 : static_cast<double>(ok_in_group) /
                                                           static_cast<double>(seeds.size()));
                 const double exact_frac = (seeds.empty() ? 0.0 : static_cast<double>(exact_count) /
@@ -1353,8 +1448,8 @@ int main(int argc, char** argv) {
                     wall_sum.stdev,
                     wall_sum.median,
                     wall_sum.p95,
-                    cnt_sum.mean,
-                    cnt_sum.stdev,
+                    cnt_mean,
+                    cnt_stdev,
                     exact_frac,
                     "");
               }
