@@ -36,6 +36,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -68,7 +69,7 @@ bool RunAdaptiveOnce(IBaseline<Dim, T>* baseline,
   out->t = cfg.run.t;
   out->count = CountResult{};
   out->samples.Clear();
-  out->used_enumeration = true;  // pilot always tries to enumerate unless j_star==0
+  out->used_enumeration = false;  // true iff we sampled from a fully enumerated join list
   out->enumeration_truncated = false;
   out->enumeration_cap = cfg.run.enum_cap;
   out->enumeration_pairs_pass1 = 0;
@@ -159,20 +160,36 @@ bool RunAdaptiveOnce(IBaseline<Dim, T>* baseline,
     pilot_limit = std::min(pilot_limit, enum_cap);
   }
 
+  // Hard safety cap to avoid OOM if j_star/enum_cap are misconfigured.
+  constexpr u64 kMaxPilotStorePairs = 10'000'000ULL;
+  const u64 unclamped_pilot_limit = pilot_limit;
+  bool pilot_limit_clamped = false;
+  if (pilot_limit > kMaxPilotStorePairs) {
+    pilot_limit = kMaxPilotStorePairs;
+    pilot_limit_clamped = true;
+  }
+
   std::vector<PairId> pilot_pairs;
   pilot_pairs.reserve(static_cast<usize>(std::min<u64>(pilot_limit, 1'000'000ULL)));
 
   bool hit_limit = false;
+  bool pilot_oom = false;
   {
     auto _ = out->phases.Scoped("run_pilot_enum_scan");
     stream->Reset();
     PairId p;
-    while (stream->Next(&p)) {
-      pilot_pairs.push_back(p);
-      if (pilot_pairs.size() >= static_cast<usize>(pilot_limit)) {
-        hit_limit = true;
-        break;
+    try {
+      while (stream->Next(&p)) {
+        pilot_pairs.push_back(p);
+        if (pilot_pairs.size() >= static_cast<usize>(pilot_limit)) {
+          hit_limit = true;
+          break;
+        }
       }
+    } catch (const std::bad_alloc&) {
+      // If we cannot store the pilot prefix, fall back to Count+Sample.
+      pilot_oom = true;
+      hit_limit = true;
     }
   }
 
@@ -185,6 +202,7 @@ bool RunAdaptiveOnce(IBaseline<Dim, T>* baseline,
     const u64 N = static_cast<u64>(pilot_pairs.size());
     out->adaptive_branch = "enumerate_all";
     out->count = MakeExactCount(N);
+    out->used_enumeration = true;
 
     out->samples.Clear();
     out->samples.with_replacement = true;
@@ -199,7 +217,13 @@ bool RunAdaptiveOnce(IBaseline<Dim, T>* baseline,
     // Sample uniformly with replacement from the stored join list.
     {
       auto _ = out->phases.Scoped("run_small_join_sample_from_list");
-      out->samples.pairs.resize(static_cast<usize>(t));
+      try {
+        out->samples.pairs.resize(static_cast<usize>(t));
+      } catch (const std::bad_alloc&) {
+        out->error = "Adaptive enumerate_all: cannot allocate output samples (bad_alloc)";
+        if (err) *err = out->error;
+        return false;
+      }
       for (u64 i = 0; i < t; ++i) {
         const u64 idx = rng.UniformU64(N);
         out->samples.pairs[static_cast<usize>(i)] = pilot_pairs[static_cast<usize>(idx)];
@@ -220,13 +244,19 @@ bool RunAdaptiveOnce(IBaseline<Dim, T>* baseline,
     return true;
   }
 
-  // If we hit the limit, we do not know |J| exactly (it might be > j_star or just > enum_cap).
+  // If we hit the limit, we do not know |J| exactly (it might be > j_star, > enum_cap, or
+  // we may have hit a safety cap / memory limit). Fall back to Count+Sample.
   out->adaptive_branch = "fallback_sampling";
-  if (enum_cap > 0 && pilot_limit == enum_cap) {
-    out->enumeration_truncated = true;
+  out->enumeration_truncated = true;  // truncated relative to full join
+
+  if (pilot_oom) {
+    out->note = "pilot enumeration ran out of memory; falling back to Count+Sample";
+  } else if (pilot_limit_clamped) {
+    out->note = "pilot limit clamped from " + std::to_string(unclamped_pilot_limit) +
+                " to " + std::to_string(pilot_limit) +
+                " to avoid OOM; falling back to Count+Sample (decision may be conservative)";
+  } else if (enum_cap > 0 && pilot_limit == enum_cap) {
     out->note = "pilot enumeration truncated by enum_cap; adaptive decision may be conservative";
-  } else {
-    out->enumeration_truncated = true;  // truncated relative to full join
   }
 
   // --------------------------

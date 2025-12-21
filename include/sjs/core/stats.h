@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -116,11 +117,19 @@ struct Summary {
 // Compute Summary from raw samples; makes a sorted copy for quantiles.
 inline Summary Summarize(const std::vector<double>& samples) {
   Summary s;
-  s.n = samples.size();
   if (samples.empty()) return s;
 
+  // Be robust to failed/placeholder measurements: ignore NaN/Inf values.
+  std::vector<double> finite;
+  finite.reserve(samples.size());
+  for (double x : samples) {
+    if (std::isfinite(x)) finite.push_back(x);
+  }
+  s.n = finite.size();
+  if (finite.empty()) return s;
+
   OnlineStats os;
-  for (double x : samples) os.Push(x);
+  for (double x : finite) os.Push(x);
 
   s.mean = os.Mean();
   s.stdev = os.Stddev(/*unbiased=*/true);
@@ -128,7 +137,7 @@ inline Summary Summarize(const std::vector<double>& samples) {
   s.min = os.Min();
   s.max = os.Max();
 
-  std::vector<double> sorted = samples;
+  std::vector<double> sorted = finite;
   std::sort(sorted.begin(), sorted.end());
   s.median = QuantileSorted(sorted, 0.5);
   s.p90 = QuantileSorted(sorted, 0.90);
@@ -136,5 +145,4 @@ inline Summary Summarize(const std::vector<double>& samples) {
   s.p99 = QuantileSorted(sorted, 0.99);
   return s;
 }
-
 }  // namespace sjs

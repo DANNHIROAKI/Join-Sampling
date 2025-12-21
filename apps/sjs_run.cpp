@@ -82,6 +82,24 @@ inline bool EnsureDir(const fs::path& p, std::string* err) {
   }
 }
 
+inline fs::path ResolvePathByWalkingUp(const fs::path& p, int max_up = 6) {
+  if (p.empty()) return p;
+  if (p.is_absolute()) return p;
+  if (fs::exists(p)) return p;
+
+  fs::path base = fs::current_path();
+  for (int i = 0; i < max_up; ++i) {
+    const fs::path cand = base / p;
+    if (fs::exists(cand)) return cand;
+
+    if (!base.has_parent_path()) break;
+    const fs::path parent = base.parent_path();
+    if (parent == base) break;
+    base = parent;
+  }
+  return p;
+}
+
 template <int Dim>
 bool LoadOrGenerateDataset(const sjs::Config& cfg,
                            sjs::Dataset<Dim, sjs::Scalar>* out,
@@ -124,16 +142,19 @@ bool LoadOrGenerateDataset(const sjs::Config& cfg,
     }
     sjs::Relation<Dim, sjs::Scalar> R, S;
     std::string local_err;
+
+    const fs::path path_r = ResolvePathByWalkingUp(fs::path(cfg.dataset.path_r));
+    const fs::path path_s = ResolvePathByWalkingUp(fs::path(cfg.dataset.path_s));
     sjs::binary::RelationFileInfo infoR, infoS;
     sjs::binary::BinaryReadOptions opt;
     opt.generate_ids_if_missing = true;
     opt.drop_empty = false;
-    if (!sjs::binary::ReadRelationBinary<Dim, sjs::Scalar>(cfg.dataset.path_r, &R, &infoR, opt, &local_err)) {
-      SetErr(err, "Failed reading binary R: " + local_err);
+    if (!sjs::binary::ReadRelationBinary<Dim, sjs::Scalar>(path_r.string(), &R, &infoR, opt, &local_err)) {
+      SetErr(err, "Failed reading binary R from " + path_r.string() + ": " + local_err);
       return false;
     }
-    if (!sjs::binary::ReadRelationBinary<Dim, sjs::Scalar>(cfg.dataset.path_s, &S, &infoS, opt, &local_err)) {
-      SetErr(err, "Failed reading binary S: " + local_err);
+    if (!sjs::binary::ReadRelationBinary<Dim, sjs::Scalar>(path_s.string(), &S, &infoS, opt, &local_err)) {
+      SetErr(err, "Failed reading binary S from " + path_s.string() + ": " + local_err);
       return false;
     }
     sjs::Dataset<Dim, sjs::Scalar> ds;
@@ -159,6 +180,9 @@ bool LoadOrGenerateDataset(const sjs::Config& cfg,
     sjs::Relation<Dim, sjs::Scalar> R, S;
     std::string local_err;
 
+    const fs::path path_r = ResolvePathByWalkingUp(fs::path(cfg.dataset.path_r));
+    const fs::path path_s = ResolvePathByWalkingUp(fs::path(cfg.dataset.path_s));
+
     // Simple reader uses sep=',' by default. You can change to TSV by passing --csv_sep=\t.
     char sep = ',';
     if (auto v = cfg.run.extra.find("csv_sep"); v != cfg.run.extra.end()) {
@@ -168,12 +192,12 @@ bool LoadOrGenerateDataset(const sjs::Config& cfg,
       }
     }
 
-    if (!sjs::csv::ReadBoxesSimple<Dim, sjs::Scalar>(cfg.dataset.path_r, &R, sep, /*has_header=*/true, &local_err)) {
-      SetErr(err, "Failed reading CSV R: " + local_err);
+    if (!sjs::csv::ReadBoxesSimple<Dim, sjs::Scalar>(path_r.string(), &R, sep, /*has_header=*/true, &local_err)) {
+      SetErr(err, "Failed reading CSV R from " + path_r.string() + ": " + local_err);
       return false;
     }
-    if (!sjs::csv::ReadBoxesSimple<Dim, sjs::Scalar>(cfg.dataset.path_s, &S, sep, /*has_header=*/true, &local_err)) {
-      SetErr(err, "Failed reading CSV S: " + local_err);
+    if (!sjs::csv::ReadBoxesSimple<Dim, sjs::Scalar>(path_s.string(), &S, sep, /*has_header=*/true, &local_err)) {
+      SetErr(err, "Failed reading CSV S from " + path_s.string() + ": " + local_err);
       return false;
     }
 
@@ -277,6 +301,7 @@ inline void PrintUsage() {
       << "Common flags:\n"
       << "  --method=<ours|aabb|interval_tree|kd_tree|r_tree|range_tree|pbsm|tlsop|sirs|rejection|tsunami>\n"
       << "  --variant=<sampling|enum_sampling|adaptive>\n"
+      << "  --allow_rejection_sampling=0|1   (override safety check; not recommended)\n"
       << "  --t=<num_samples>\n"
       << "  --seed=<seed>           (base seed; repeats add +rep)\n"
       << "  --repeats=<k>\n"
@@ -323,6 +348,21 @@ int main(int argc, char** argv) {
   }
 
   sjs::Logger::Instance().SetConfig(cfg.logging);
+
+  // Keep behavior consistent with sjs_sweep: (rejection, sampling) is disabled by default.
+  bool allow_rejection_sampling = false;
+  if (auto v = args.Get("allow_rejection_sampling")) {
+    const std::string val = std::string(*v);
+    allow_rejection_sampling = (val == "1" || val == "true" || val == "yes");
+  }
+  if (cfg.run.method == sjs::Method::Rejection && cfg.run.variant == sjs::Variant::Sampling &&
+      !allow_rejection_sampling) {
+    SJS_LOG_ERROR("Unsupported combination: method=rejection variant=sampling.");
+    SJS_LOG_ERROR("Note: sjs_sweep skips this combination by default (safety/perf).");
+    SJS_LOG_ERROR("If you really want to run it here, pass --allow_rejection_sampling=1.");
+    return 2;
+  }
+
 
   if (cfg.dataset.dim != 2) {
     SJS_LOG_ERROR("This build currently supports only Dim=2. Got --dim=", cfg.dataset.dim);
@@ -404,7 +444,10 @@ int main(int argc, char** argv) {
 
   // Run repeats.
   std::vector<double> wall_ms_all;
+  std::vector<double> wall_ms_ok;
+  u64 ok_reps = 0;
   wall_ms_all.reserve(static_cast<sjs::usize>(cfg.run.repeats));
+  wall_ms_ok.reserve(static_cast<sjs::usize>(cfg.run.repeats));
 
   for (sjs::u64 rep = 0; rep < cfg.run.repeats; ++rep) {
     const sjs::u64 seed = cfg.run.seed + rep;
@@ -432,6 +475,10 @@ int main(int argc, char** argv) {
 
     const double wall_ms = sw.ElapsedMillis();
     wall_ms_all.push_back(wall_ms);
+    if (ok) {
+      wall_ms_ok.push_back(wall_ms);
+      ++ok_reps;
+    }
 
     if (!ok) {
       SJS_LOG_ERROR("Run failed (rep=", rep, "):", local_err);
@@ -473,8 +520,16 @@ int main(int argc, char** argv) {
   }
 
   // Print a tiny summary to stdout/stderr.
-  const sjs::Summary sum = sjs::Summarize(wall_ms_all);
-  SJS_LOG_INFO("Wall-time summary (ms):", sum.ToJson());
+  const sjs::Summary sum_all = sjs::Summarize(wall_ms_all);
+  SJS_LOG_INFO("Wall-time summary (ms) [all]:", sum_all.ToJson());
+
+  if (!wall_ms_ok.empty()) {
+    const sjs::Summary sum_ok = sjs::Summarize(wall_ms_ok);
+    const double ok_rate = (cfg.run.repeats > 0) ? (static_cast<double>(ok_reps) / static_cast<double>(cfg.run.repeats)) : 0.0;
+    SJS_LOG_INFO("Wall-time summary (ms) [ok-only]:", sum_ok.ToJson(), "ok_rate=", ok_rate);
+  } else {
+    SJS_LOG_WARN("No successful repetitions; ok_rate=0.0");
+  }
 
   SJS_LOG_INFO("Wrote results to:", results_path);
   if (write_samples) {
