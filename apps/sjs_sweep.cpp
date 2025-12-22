@@ -148,7 +148,7 @@ inline std::string FormatSci(double x, int prec = 3) {
     if (c == '.') c = '_';
   }
   return s;
-
+}
 
 }  // namespace
 
@@ -178,7 +178,7 @@ inline bool ExistsNoThrow(const fs::path& p) noexcept {
 inline std::string ResolvePathByProbingParents(std::string_view path_sv,
                                               const fs::path& sweep_dir,
                                               int max_parents = 8) {
-  fs::path p(std::string(path_sv));
+  fs::path p{std::string(path_sv)};
   if (p.empty()) return std::string(path_sv);
 
   // Absolute path: nothing to do.

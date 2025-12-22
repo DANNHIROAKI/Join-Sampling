@@ -6,6 +6,12 @@
 # - Runs ALL methods x variants listed in config/sweeps/sweep_t.json
 # - Writes results to a dedicated output directory under results/
 #
+# This version calls run/plot_exp2.py to generate:
+#   1) runtime vs t (wall median, log-x log-y, upper-only p95)
+#   2) Δruntime vs t (baseline-subtracted, log-x linear-y)
+#   3) sample-phase vs t (median run_sample_ms from phases_json, log-x log-y)
+#   4) ns/sample slopes (CSV)
+#
 # Usage:
 #   bash run/run_exp2.sh
 #
@@ -14,11 +20,7 @@
 #   bash run/run_exp2.sh --config config/sweeps/sweep_t.json
 #   bash run/run_exp2.sh --clean        # remove build dir first
 #   bash run/run_exp2.sh --no-plot      # skip plotting step
-#
-# Notes:
-# - This script is intentionally self-contained ("from zero"):
-#   it configures + builds a Release binary, then runs the sweep.
-# - The sweep config itself controls repeats/seeds and uses single-thread by default.
+#   bash run/run_exp2.sh --no-build     # skip build step
 
 set -euo pipefail
 
@@ -204,82 +206,16 @@ log "Raw     : ${OUT_DIR}/sweep_raw.csv"
 log "Summary : ${OUT_DIR}/sweep_summary.csv"
 
 # ----------------------------
-# (Optional) Plot runtime vs t (log-x, log-y)
+# (Optional) Plot (enhanced)
 # ----------------------------
 if [[ "${DO_PLOT}" -eq 1 ]]; then
   if command -v python3 >/dev/null 2>&1; then
-    export OUT_DIR_PLOT="${OUT_DIR}"
-    log "Generating plots (requires matplotlib). If matplotlib is missing, this step will be skipped."
-    python3 - <<'PY'
-import csv, os
+    PLOT_SCRIPT="${REPO_ROOT}/run/plot_exp2.py"
+    [[ -f "${PLOT_SCRIPT}" ]] || die "Missing plot script: ${PLOT_SCRIPT} (did you create run/plot_exp2.py?)"
 
-out_dir = os.environ["OUT_DIR_PLOT"]
-summary_path = os.path.join(out_dir, "sweep_summary.csv")
-
-try:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-except Exception as e:
-    print(f"[EXP2][PLOT] matplotlib not available; skip plotting. ({e})")
-    raise SystemExit(0)
-
-rows = []
-with open(summary_path, newline="") as f:
-    r = csv.DictReader(f)
-    for row in r:
-        try:
-            ok_rate = float(row.get("ok_rate", "0"))
-        except Exception:
-            ok_rate = 0.0
-        if ok_rate < 1.0:
-            continue
-        rows.append(row)
-
-if not rows:
-    print("[EXP2][PLOT] No successful rows found in sweep_summary.csv; skip plotting.")
-    raise SystemExit(0)
-
-variants = sorted({row["variant"] for row in rows})
-for variant in variants:
-    sub = [row for row in rows if row["variant"] == variant]
-    methods = sorted({row["method"] for row in sub})
-
-    plt.figure()
-    for method in methods:
-        g = [row for row in sub if row["method"] == method]
-        g.sort(key=lambda x: int(float(x["t"])))
-        ts = [int(float(x["t"])) for x in g]
-        ys = [float(x["wall_median_ms"]) for x in g]
-        # p95 errorbar (upper-only). We plot symmetric using (p95 - median) for simplicity.
-        yerr = [max(0.0, float(x["wall_p95_ms"]) - float(x["wall_median_ms"])) for x in g]
-        plt.errorbar(ts, ys, yerr=yerr, marker="o", label=method, linewidth=1)
-
-    plt.xscale("log")
-    plt.yscale("log")
-    plt.xlabel("t (samples)")
-    plt.ylabel("runtime (median ms)")
-    plt.title(f"EXP-2 Runtime vs t ({variant})")
-    plt.legend(fontsize=7)
-    plt.tight_layout()
-
-    out_pdf = os.path.join(out_dir, f"exp2_runtime_vs_t_{variant}.pdf")
-    out_png = os.path.join(out_dir, f"exp2_runtime_vs_t_{variant}.png")
-    plt.savefig(out_pdf)
-    plt.savefig(out_png, dpi=200)
-    plt.close()
-
-    print(f"[EXP2][PLOT] wrote {out_pdf}")
-    print(f"[EXP2][PLOT] wrote {out_png}")
-
-with open(os.path.join(out_dir, "EXP2_README.txt"), "w") as f:
-    f.write("EXP-2 (Runtime vs t)\n")
-    f.write("\nFiles:\n")
-    f.write("  sweep_raw.csv      : one row per run/repeat\n")
-    f.write("  sweep_summary.csv  : aggregated stats per (method,variant,t)\n")
-    f.write("  exp2_runtime_vs_t_<variant>.pdf/.png : plots (log-x, log-y)\n")
-print(f"[EXP2][PLOT] wrote {os.path.join(out_dir,'EXP2_README.txt')}")
-PY
+    log "Generating enhanced plots via: ${PLOT_SCRIPT}"
+    # If matplotlib is missing, plot_exp2.py will skip gracefully.
+    python3 "${PLOT_SCRIPT}" --out_dir "${OUT_DIR}" --t0 1000 --error p95
   else
     log "python3 not found; skipping plot step."
   fi
