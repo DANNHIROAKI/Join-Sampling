@@ -84,7 +84,12 @@ class OursAdaptiveBaseline final : public IBaseline<Dim, T> {
 
     auto scoped = phases ? phases->Scoped("phase1_count_adaptive") : PhaseRecorder::ScopedPhase(nullptr, "");
 
-    const u64 j_star = cfg.run.j_star;
+    // Effective threshold: respect global enum_cap (safety) if enabled.
+    // This prevents materializing more than enum_cap pairs even if j_star is huge.
+    u64 j_star = cfg.run.j_star;
+    if (cfg.run.enum_cap > 0 && j_star > cfg.run.enum_cap) {
+      j_star = cfg.run.enum_cap;
+    }
 
     std::fill(w_total_.begin(), w_total_.end(), 0ULL);
     std::fill(w_a_.begin(), w_a_.end(), 0ULL);

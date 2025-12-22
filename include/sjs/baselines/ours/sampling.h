@@ -38,6 +38,7 @@
 #include "sjs/sampling/alias_table.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -87,16 +88,12 @@ namespace detail {
 //
 // Deletion is O(log m) using swap-delete + backrefs, same as the stabbing tree.
 
+
 class RangePointSegTree {
  public:
-  struct Placement {
-    u32 node = 0;  // segment-tree node index
-    u32 pos = 0;   // position inside nodes_[node].items
-  };
-
   struct Item {
     u32 handle = 0;
-    u32 backref = 0;  // index into handle's placement list
+    u32 backref = 0;  // index into handle's placement list (leaf->root level)
   };
 
   void Init(u32 num_handles, u32 num_ranks) {
@@ -112,11 +109,16 @@ class RangePointSegTree {
     // log2(p_)
     u32 logp = 0;
     for (u32 x = p_; x > 1; x >>= 1) ++logp;
+
     // Path length leaf->root inclusive.
     max_refs_ = static_cast<u32>(logp + 1);
 
     placement_size_.assign(static_cast<usize>(n_handles_), 0);
-    placements_.assign(static_cast<usize>(n_handles_) * static_cast<usize>(max_refs_), Placement{});
+
+    // Store only the position within each node bucket (node index is implicit from rank + level).
+    pos_in_node_.assign(static_cast<usize>(n_handles_) * static_cast<usize>(max_refs_), 0U);
+
+    rank_of_handle_.assign(static_cast<usize>(n_handles_), kInvalidRank);
   }
 
   void Clear() {
@@ -125,20 +127,25 @@ class RangePointSegTree {
     p_ = 0;
     max_refs_ = 0;
     nodes_.clear();
-    placements_.clear();
+    pos_in_node_.clear();
     placement_size_.clear();
+    rank_of_handle_.clear();
   }
 
   // Keep the skeleton but drop all active points.
   void ResetActive() {
     for (auto& n : nodes_) n.items.clear();
     std::fill(placement_size_.begin(), placement_size_.end(), 0U);
+    std::fill(rank_of_handle_.begin(), rank_of_handle_.end(), kInvalidRank);
   }
 
   void Insert(u32 handle, u32 rank) {
     SJS_DASSERT(handle < n_handles_);
     SJS_DASSERT(rank < m_);
     SJS_DASSERT(placement_size_[handle] == 0);
+    SJS_DASSERT(rank_of_handle_[handle] == kInvalidRank);
+
+    rank_of_handle_[handle] = rank;
 
     u32 backref = 0;
     u32 idx = rank + p_;
@@ -154,28 +161,50 @@ class RangePointSegTree {
   void Erase(u32 handle) {
     SJS_DASSERT(handle < n_handles_);
     const u32 sz = placement_size_[handle];
+    if (sz == 0) return;
+
+    const u32 rank = rank_of_handle_[handle];
+    SJS_DASSERT(rank != kInvalidRank);
+    SJS_DASSERT(rank < m_);
+
+    u32 idx = rank + p_;
     for (u32 i = 0; i < sz; ++i) {
-      const Placement p = placements_[PlacementIndex(handle, i)];
-      RemoveFromNode(p.node, p.pos);
+      const u32 pos = pos_in_node_[PlacementIndex(handle, i)];
+      RemoveFromNode(idx, pos);
+      idx >>= 1;
     }
+
     placement_size_[handle] = 0;
+    rank_of_handle_[handle] = kInvalidRank;
   }
 
+  // Allocation-free exact count of active handles in ranks [l, r).
   u64 CountRange(u32 l, u32 r) const {
     if (r <= l || m_ == 0) return 0ULL;
     l = std::min(l, m_);
     r = std::min(r, m_);
     if (r <= l) return 0ULL;
 
-    std::vector<u32> cover;
-    Decompose(l, r, &cover);
+    u32 L = l + p_;
+    u32 R = r + p_;
+
     u64 total = 0;
-    for (u32 node : cover) total += static_cast<u64>(nodes_[node].items.size());
+    while (L < R) {
+      if (L & 1U) total += static_cast<u64>(nodes_[L++].items.size());
+      if (R & 1U) total += static_cast<u64>(nodes_[--R].items.size());
+      L >>= 1;
+      R >>= 1;
+    }
     return total;
   }
 
   // Sample k handles uniformly from ranks in [l, r).
   // Returns false iff the range is empty.
+  //
+  // NOTE: This implementation intentionally avoids building a heap-allocating
+  // alias table for each query. The canonical cover size is <= O(log m) and
+  // in our workloads k per-event is usually small, so a simple prefix-scan
+  // selection is faster and allocation-free.
   bool SampleRange(u32 l, u32 r, u32 k, Rng* rng, std::vector<u32>* out) const {
     SJS_DASSERT(rng != nullptr);
     SJS_DASSERT(out != nullptr);
@@ -189,28 +218,40 @@ class RangePointSegTree {
     r = std::min(r, m_);
     if (r <= l) return false;
 
-    std::vector<u32> cover;
-    std::vector<u64> weights;
-    Decompose(l, r, &cover);
+    // Canonical cover nodes in left-to-right order (size <= 2*log2(p_)+2).
+    std::array<u32, kMaxCoverNodes> cover;
+    const u32 cover_sz = DecomposeOrdered(l, r, &cover);
 
+    // Filter non-empty buckets (weights > 0).
+    std::array<u32, kMaxCoverNodes> nodes;
+    std::array<u64, kMaxCoverNodes> weights;
+    u32 nz = 0;
     u64 total = 0;
-    weights.reserve(cover.size());
-    for (u32 node : cover) {
+
+    for (u32 i = 0; i < cover_sz; ++i) {
+      const u32 node = cover[i];
       const u64 w = static_cast<u64>(nodes_[node].items.size());
-      weights.push_back(w);
+      if (w == 0) continue;
+      SJS_DASSERT(nz < kMaxCoverNodes);
+      nodes[nz] = node;
+      weights[nz] = w;
       total += w;
+      ++nz;
     }
 
-    if (total == 0) return false;
-
-    sampling::AliasTable alias;
-    if (!alias.BuildFromU64(Span<const u64>(weights))) {
-      return false;
-    }
+    if (total == 0 || nz == 0) return false;
 
     for (u32 i = 0; i < k; ++i) {
-      const usize bi = alias.Sample(rng);
-      const u32 node = cover[bi];
+      const u64 x = rng->UniformU64(total);  // in [0,total)
+      u64 cum = 0;
+      u32 bi = 0;
+      for (; bi < nz; ++bi) {
+        cum += weights[bi];
+        if (x < cum) break;
+      }
+      if (bi >= nz) bi = nz - 1;  // defensive
+
+      const u32 node = nodes[bi];
       const auto& bucket = nodes_[node].items;
       SJS_DASSERT(!bucket.empty());
       const u32 pos = rng->UniformU32(static_cast<u32>(bucket.size()));
@@ -227,9 +268,11 @@ class RangePointSegTree {
     r = std::min(r, m_);
     if (r <= l) return;
 
-    std::vector<u32> cover;
-    Decompose(l, r, &cover);
-    for (u32 node : cover) {
+    std::array<u32, kMaxCoverNodes> cover;
+    const u32 cover_sz = DecomposeOrdered(l, r, &cover);
+
+    for (u32 i = 0; i < cover_sz; ++i) {
+      const u32 node = cover[i];
       const auto& bucket = nodes_[node].items;
       for (const auto& it : bucket) out->push_back(it.handle);
     }
@@ -239,6 +282,9 @@ class RangePointSegTree {
   struct Node {
     std::vector<Item> items;
   };
+
+  static constexpr u32 kInvalidRank = std::numeric_limits<u32>::max();
+  static constexpr usize kMaxCoverNodes = 128;
 
   usize PlacementIndex(u32 handle, u32 backref) const {
     return static_cast<usize>(handle) * static_cast<usize>(max_refs_) + static_cast<usize>(backref);
@@ -251,7 +297,7 @@ class RangePointSegTree {
     auto& bucket = nodes_[node].items;
     const u32 pos = static_cast<u32>(bucket.size());
 
-    placements_[PlacementIndex(handle, backref)] = Placement{node, pos};
+    pos_in_node_[PlacementIndex(handle, backref)] = pos;
     bucket.push_back(Item{handle, backref});
   }
 
@@ -265,35 +311,47 @@ class RangePointSegTree {
     if (static_cast<usize>(pos) != last_pos) {
       const Item swapped = bucket[last_pos];
       bucket[pos] = swapped;
-      placements_[PlacementIndex(swapped.handle, swapped.backref)].pos = pos;
+      pos_in_node_[PlacementIndex(swapped.handle, swapped.backref)] = pos;
     }
     bucket.pop_back();
   }
 
   // Canonical cover decomposition of [l,r) (0<=l<=r<=m_).
   // The returned nodes are disjoint and ordered left-to-right.
-  void Decompose(u32 l, u32 r, std::vector<u32>* out) const {
-    out->clear();
-    if (r <= l) return;
+  u32 DecomposeOrdered(u32 l, u32 r, std::array<u32, kMaxCoverNodes>* out) const {
+    SJS_DASSERT(out != nullptr);
+    if (r <= l) return 0;
 
     u32 L = l + p_;
     u32 R = r + p_;
 
-    std::vector<u32> left;
-    std::vector<u32> right;
-    left.reserve(32);
-    right.reserve(32);
+    std::array<u32, kMaxCoverNodes> left;
+    std::array<u32, kMaxCoverNodes> right;
+    u32 lsz = 0;
+    u32 rsz = 0;
 
     while (L < R) {
-      if (L & 1U) left.push_back(L++);
-      if (R & 1U) right.push_back(--R);
+      if (L & 1U) {
+        SJS_DASSERT(lsz < kMaxCoverNodes);
+        left[lsz++] = L++;
+      }
+      if (R & 1U) {
+        SJS_DASSERT(rsz < kMaxCoverNodes);
+        right[rsz++] = --R;
+      }
       L >>= 1;
       R >>= 1;
     }
 
-    out->reserve(left.size() + right.size());
-    out->insert(out->end(), left.begin(), left.end());
-    for (auto it = right.rbegin(); it != right.rend(); ++it) out->push_back(*it);
+    const u32 out_sz = lsz + rsz;
+    SJS_DASSERT(out_sz <= kMaxCoverNodes);
+
+    u32 out_i = 0;
+    for (u32 i = 0; i < lsz; ++i) (*out)[out_i++] = left[i];
+    for (u32 i = 0; i < rsz; ++i) (*out)[out_i++] = right[rsz - 1 - i];
+
+    SJS_DASSERT(out_i == out_sz);
+    return out_sz;
   }
 
   u32 n_handles_{0};
@@ -302,25 +360,18 @@ class RangePointSegTree {
   u32 max_refs_{0};
 
   std::vector<Node> nodes_;               // size 2*p_
-  std::vector<Placement> placements_;     // size n_handles_*max_refs_
+  std::vector<u32> pos_in_node_;          // size n_handles_*max_refs_ (position only)
   std::vector<u32> placement_size_;       // per-handle placement count
+  std::vector<u32> rank_of_handle_;       // per-handle rank (needed to recompute nodes on erase)
 };
 
-// -----------------------------------------------------------------------------
-// StabbingSegTree (Pattern A): dynamic interval stabbing count/sample/report
-// -----------------------------------------------------------------------------
-// Identical to the previous implementation, with an explicit ResetActive().
+
 
 class StabbingSegTree {
  public:
-  struct Placement {
-    u32 node = 0;
-    u32 pos = 0;
-  };
-
   struct Item {
     u32 handle = 0;
-    u32 backref = 0;
+    u32 backref = 0;  // index into handle's placement list
   };
 
   void Init(u32 num_handles, u32 num_points) {
@@ -340,7 +391,13 @@ class StabbingSegTree {
     max_refs_ = static_cast<u32>(2 * logp + 4);
 
     placement_size_.assign(static_cast<usize>(n_handles_), 0);
-    placements_.assign(static_cast<usize>(n_handles_) * static_cast<usize>(max_refs_), Placement{});
+
+    // Store only the position within each node bucket. Node indices for a handle
+    // can be recomputed from the stored [L,R) ranks on erase.
+    pos_in_node_.assign(static_cast<usize>(n_handles_) * static_cast<usize>(max_refs_), 0U);
+
+    lo_rank_.assign(static_cast<usize>(n_handles_), kInvalidRank);
+    hi_rank_.assign(static_cast<usize>(n_handles_), kInvalidRank);
   }
 
   void Clear() {
@@ -349,23 +406,32 @@ class StabbingSegTree {
     p_ = 0;
     max_refs_ = 0;
     nodes_.clear();
-    placements_.clear();
+    pos_in_node_.clear();
     placement_size_.clear();
+    lo_rank_.clear();
+    hi_rank_.clear();
   }
 
   // Keep the skeleton but drop all active intervals.
   void ResetActive() {
     for (auto& n : nodes_) n.items.clear();
     std::fill(placement_size_.begin(), placement_size_.end(), 0U);
+    std::fill(lo_rank_.begin(), lo_rank_.end(), kInvalidRank);
+    std::fill(hi_rank_.begin(), hi_rank_.end(), kInvalidRank);
   }
 
   // Insert interval [L, R) on ranks.
   void Insert(u32 handle, u32 L, u32 R) {
     SJS_DASSERT(handle < n_handles_);
+    SJS_DASSERT(placement_size_[handle] == 0);
+
     if (R <= L || m_ == 0) return;
     L = std::min(L, m_);
     R = std::min(R, m_);
     if (R <= L) return;
+
+    lo_rank_[handle] = L;
+    hi_rank_[handle] = R;
 
     u32 l = L + p_;
     u32 r = R + p_;
@@ -387,11 +453,38 @@ class StabbingSegTree {
   void Erase(u32 handle) {
     SJS_DASSERT(handle < n_handles_);
     const u32 sz = placement_size_[handle];
-    for (u32 i = 0; i < sz; ++i) {
-      const Placement p = placements_[PlacementIndex(handle, i)];
-      RemoveFromNode(p.node, p.pos);
+    if (sz == 0) return;
+
+    const u32 L = lo_rank_[handle];
+    const u32 R = hi_rank_[handle];
+    SJS_DASSERT(L != kInvalidRank && R != kInvalidRank);
+    SJS_DASSERT(R > L);
+
+    u32 l = L + p_;
+    u32 r = R + p_;
+
+    u32 backref = 0;
+    while (l < r) {
+      if (l & 1U) {
+        const u32 pos = pos_in_node_[PlacementIndex(handle, backref)];
+        RemoveFromNode(l, pos);
+        ++backref;
+        ++l;
+      }
+      if (r & 1U) {
+        --r;
+        const u32 pos = pos_in_node_[PlacementIndex(handle, backref)];
+        RemoveFromNode(r, pos);
+        ++backref;
+      }
+      l >>= 1;
+      r >>= 1;
     }
+
+    SJS_DASSERT(backref == sz);
     placement_size_[handle] = 0;
+    lo_rank_[handle] = kInvalidRank;
+    hi_rank_[handle] = kInvalidRank;
   }
 
   u64 Count(u32 q) const {
@@ -414,33 +507,37 @@ class StabbingSegTree {
     if (k == 0) return true;
     if (m_ == 0 || q >= m_) return false;
 
-    // Collect non-empty buckets on root-to-leaf path.
-    std::vector<u32> path_nodes;
-    std::vector<u64> weights;
-    path_nodes.reserve(32);
-    weights.reserve(32);
+    // Collect non-empty buckets on root-to-leaf path (allocation-free).
+    std::array<u32, kMaxPathNodes> path_nodes;
+    std::array<u64, kMaxPathNodes> weights;
+    u32 n = 0;
 
     u32 idx = q + p_;
     u64 total = 0;
     while (idx > 0) {
       const u64 w = static_cast<u64>(nodes_[idx].items.size());
       if (w > 0) {
-        path_nodes.push_back(idx);
-        weights.push_back(w);
+        SJS_DASSERT(n < kMaxPathNodes);
+        path_nodes[n] = idx;
+        weights[n] = w;
         total += w;
+        ++n;
       }
       idx >>= 1;
     }
 
-    if (total == 0) return false;
-
-    sampling::AliasTable alias;
-    if (!alias.BuildFromU64(Span<const u64>(weights))) {
-      return false;
-    }
+    if (total == 0 || n == 0) return false;
 
     for (u32 i = 0; i < k; ++i) {
-      const usize bi = alias.Sample(rng);
+      const u64 x = rng->UniformU64(total);
+      u64 cum = 0;
+      u32 bi = 0;
+      for (; bi < n; ++bi) {
+        cum += weights[bi];
+        if (x < cum) break;
+      }
+      if (bi >= n) bi = n - 1;  // defensive
+
       const u32 node = path_nodes[bi];
       const auto& bucket = nodes_[node].items;
       SJS_DASSERT(!bucket.empty());
@@ -467,6 +564,9 @@ class StabbingSegTree {
     std::vector<Item> items;
   };
 
+  static constexpr u32 kInvalidRank = std::numeric_limits<u32>::max();
+  static constexpr usize kMaxPathNodes = 64;
+
   usize PlacementIndex(u32 handle, u32 backref) const {
     return static_cast<usize>(handle) * static_cast<usize>(max_refs_) + static_cast<usize>(backref);
   }
@@ -480,7 +580,7 @@ class StabbingSegTree {
     auto& bucket = nodes_[node].items;
     const u32 pos = static_cast<u32>(bucket.size());
 
-    placements_[PlacementIndex(handle, sz)] = Placement{node, pos};
+    pos_in_node_[PlacementIndex(handle, sz)] = pos;
     bucket.push_back(Item{handle, sz});
     ++sz;
   }
@@ -495,7 +595,7 @@ class StabbingSegTree {
     if (static_cast<usize>(pos) != last_pos) {
       const Item swapped = bucket[last_pos];
       bucket[pos] = swapped;
-      placements_[PlacementIndex(swapped.handle, swapped.backref)].pos = pos;
+      pos_in_node_[PlacementIndex(swapped.handle, swapped.backref)] = pos;
     }
     bucket.pop_back();
   }
@@ -506,9 +606,12 @@ class StabbingSegTree {
   u32 max_refs_{0};
 
   std::vector<Node> nodes_;
-  std::vector<Placement> placements_;
+  std::vector<u32> pos_in_node_;      // size n_handles_*max_refs_ (position only)
   std::vector<u32> placement_size_;
+  std::vector<u32> lo_rank_;          // stored interval endpoints for erase
+  std::vector<u32> hi_rank_;
 };
+
 
 // -----------------------------------------------------------------------------
 // ActiveIndex2D: per-side wrapper for both patterns
