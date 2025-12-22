@@ -445,7 +445,7 @@ int main(int argc, char** argv) {
   // Run repeats.
   std::vector<double> wall_ms_all;
   std::vector<double> wall_ms_ok;
-  u64 ok_reps = 0;
+  sjs::u64 ok_reps = 0;
   wall_ms_all.reserve(static_cast<sjs::usize>(cfg.run.repeats));
   wall_ms_ok.reserve(static_cast<sjs::usize>(cfg.run.repeats));
 
