@@ -1,48 +1,95 @@
 #!/usr/bin/env bash
+# run/run_exp3.sh
 # ------------------------------------------------------------------------------
-# EXP-3: Runtime vs alpha (RQ3)
+# EXP-3: Runtime vs 密度参数 α (RQ3)
 #
-# Goal:
-#   Sweep density alpha = |J|/(n_r+n_s) from 0 -> 300 using the synthetic
-#   stripe_ctrl_alpha generator, and measure end-to-end runtime for each method
-#   (sampling + adaptive). Also derive the adaptive branch ratio (enumerate vs
-#   fallback_sampling) from sweep_raw.csv.
+# 目标（严格对齐 EXP-3.md）：
+#   - 扫描 alpha = |J|/(n_r+n_s)（synthetic stripe/可控密度条带构造）
+#   - 记录端到端 wall time（median + p95）与 ok_rate
+#   - 从 sweep_raw.csv 导出 adaptive 分支比例（enumerate_all vs fallback）
+#   - （可选）生成 runtime-vs-alpha 与 branch-ratio 图（symlog-x, log-y）
 #
-# Outputs (by default):
-#   results/sweeps/exp3_alpha_<timestamp>/
-#     sweep_raw.csv
-#     sweep_summary.csv
-#     derived/adaptive_branch_ratio.csv
-#     plots/*.png  (if matplotlib is available)
+# 目录规范（对齐你提出的 5 条要求）：
+#   - build:   <repo_root>/build/<build_type_subdir>
+#   - temp:    <repo_root>/run/temp/exp3        （本脚本所有产物先写这里）
+#   - results: <repo_root>/results/raw/exp3     （本脚本结束时覆盖同步到这里）
 #
-# This script is self-contained: it builds the project (Release), runs the sweep,
-# and produces derived tables/plots in one shot.
+# 依赖：cmake, python3 （以及可选 matplotlib 用于画图）
 #
-# Usage:
+# 用法：
 #   bash run/run_exp3.sh
 #
-# Optional overrides (environment variables):
-#   EXP3_CONFIG            : path to a sweep JSON (default: config/sweeps/sweep_alpha.json)
-#   EXP3_OUT_DIR           : output directory (default: results/sweeps/exp3_alpha_<ts>)
-#   EXP3_BUILD_DIR         : build directory (default: build_exp3)
-#   EXP3_JOBS              : build parallelism (default: nproc)
+# 可选环境变量（保持与旧脚本一致 + 增补 build 规范）：
+#   EXP3_CONFIG            : sweep JSON 路径 (默认: config/sweeps/sweep_alpha.json)
+#   EXP3_BUILD_TYPE        : Release|Debug|RelWithDebInfo|MinSizeRel (默认: Release)
+#   EXP3_CLEAN_BUILD=1     : 清理 build/<type> 后重建 (默认: 0)
+#   EXP3_JOBS              : 编译并行度 (默认: nproc)
+#   EXP3_RUN_TESTS=1       : 编译后跑 ctest (默认: 0)
+#   EXP3_PLOT=0            : 跳过画图 (默认: 1)
+#   EXP3_PLOT_ENUM=1       : 画图时包含 enum_sampling 曲线 (默认: 0)
 #
-#   # Override key experiment params WITHOUT editing JSON:
-#   EXP3_NR, EXP3_NS       : set n_r / n_s
-#   EXP3_T                 : set sample size t
-#   EXP3_REPEATS           : set repeats
-#   EXP3_JSTAR             : set adaptive threshold j_star
-#   EXP3_ENUM_CAP          : set enum_cap (0 = no cap)
-#   EXP3_THREADS           : set sys.threads (recommended 1 for fairness)
-#   EXP3_ALPHA_LIST        : comma-separated alpha list, e.g. "0,1,2,3,5,10,30,100,300"
-#   EXP3_METHODS           : comma-separated method list
-#   EXP3_VARIANTS          : comma-separated variant list (default: from config)
-#
-#   EXP3_RUN_TESTS=1       : run ctest after build (default: 0)
-#   EXP3_PLOT=0            : skip plotting even if matplotlib exists (default: 1)
+#   # 不改 JSON 的参数覆盖（由 run/include/exp3_make_effective_sweep_config.py 读取）：
+#   EXP3_NR, EXP3_NS
+#   EXP3_T
+#   EXP3_REPEATS
+#   EXP3_JSTAR
+#   EXP3_ENUM_CAP
+#   EXP3_THREADS           : sys.threads（默认强制 1，保证公平；可显式设为 >1）
+#   EXP3_ALPHA_LIST        : 逗号分隔 alpha 列表（float）
+#   EXP3_METHODS           : 逗号分隔 method 列表
+#   EXP3_VARIANTS          : 逗号分隔 variant 列表
 # ------------------------------------------------------------------------------
 
 set -euo pipefail
+IFS=$'\n\t'
+
+trap 'echo "[EXP3][FATAL] Failed at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
+
+log()  { echo "[EXP3] $*"; }
+die()  { echo "[EXP3][ERROR] $*" >&2; exit 1; }
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"; }
+
+nproc_safe() {
+  if [[ -n "${EXP3_JOBS:-}" ]]; then
+    echo "${EXP3_JOBS}"; return
+  fi
+  if command -v nproc >/dev/null 2>&1; then
+    nproc; return
+  fi
+  if [[ "$(uname -s)" == "Darwin" ]] && command -v sysctl >/dev/null 2>&1; then
+    sysctl -n hw.ncpu 2>/dev/null || echo 4
+    return
+  fi
+  echo 4
+}
+
+build_subdir_from_type() {
+  case "$1" in
+    Release) echo "release";;
+    Debug) echo "debug";;
+    RelWithDebInfo) echo "relwithdebinfo";;
+    MinSizeRel) echo "minsizerel";;
+    *) die "Unsupported EXP3_BUILD_TYPE='$1' (use Release|Debug|RelWithDebInfo|MinSizeRel)";;
+  esac
+}
+
+find_exe() {
+  local build_dir="$1"
+  local name="$2"
+  local p=""
+
+  # Common direct locations
+  if [[ -x "${build_dir}/${name}" ]]; then
+    echo "${build_dir}/${name}"; return
+  fi
+  if [[ -x "${build_dir}/apps/${name}" ]]; then
+    echo "${build_dir}/apps/${name}"; return
+  fi
+
+  p="$(find "${build_dir}" -maxdepth 4 -type f -name "${name}" -perm -111 2>/dev/null | head -n 1 || true)"
+  [[ -n "${p}" ]] || die "Cannot find executable '${name}' under ${build_dir}. Did the build succeed?"
+  echo "${p}"
+}
 
 # -----------------------------
 # Resolve repo root
@@ -51,38 +98,64 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # -----------------------------
-# Dependency checks
+# Paths (fixed by repo policy)
 # -----------------------------
-for cmd in cmake python3; do
-  if ! command -v "${cmd}" >/dev/null 2>&1; then
-    echo "[EXP3][ERROR] Required command not found: ${cmd}" >&2
-    exit 1
-  fi
-done
+BUILD_ROOT="${ROOT_DIR}/build"
+TEMP_DIR="${ROOT_DIR}/run/temp/exp3"
+RESULT_DIR="${ROOT_DIR}/results/raw/exp3"
+INCLUDE_DIR="${ROOT_DIR}/run/include"
 
 # -----------------------------
-# Config & output locations
+# Inputs / switches
 # -----------------------------
 DEFAULT_CONFIG="${ROOT_DIR}/config/sweeps/sweep_alpha.json"
 CONFIG_PATH="${EXP3_CONFIG:-${DEFAULT_CONFIG}}"
-if [[ ! -f "${CONFIG_PATH}" ]]; then
-  echo "[EXP3][ERROR] Sweep config not found: ${CONFIG_PATH}" >&2
-  exit 2
+if [[ "${CONFIG_PATH}" != /* ]]; then
+  CONFIG_PATH="${ROOT_DIR}/${CONFIG_PATH}"
 fi
+[[ -f "${CONFIG_PATH}" ]] || die "Sweep config not found: ${CONFIG_PATH}"
 
-TS="$(date +%Y%m%d_%H%M%S)"
-OUT_DIR="${EXP3_OUT_DIR:-${ROOT_DIR}/results/sweeps/exp3_alpha_${TS}}"
-BUILD_DIR="${EXP3_BUILD_DIR:-${ROOT_DIR}/build_exp3}"
-JOBS="${EXP3_JOBS:-$(command -v nproc >/dev/null 2>&1 && nproc || echo 4)}"
+BUILD_TYPE="${EXP3_BUILD_TYPE:-Release}"
+BUILD_SUBDIR="$(build_subdir_from_type "${BUILD_TYPE}")"
+BUILD_DIR="${BUILD_ROOT}/${BUILD_SUBDIR}"
+
+DO_CLEAN_BUILD="${EXP3_CLEAN_BUILD:-0}"
 RUN_TESTS="${EXP3_RUN_TESTS:-0}"
 DO_PLOT="${EXP3_PLOT:-1}"
+PLOT_ENUM="${EXP3_PLOT_ENUM:-0}"
 
-mkdir -p "${OUT_DIR}"
+JOBS="$(nproc_safe)"
+TS="$(date +%Y%m%d_%H%M%S)"
+
+# Default fairness: single-thread unless user explicitly overrides.
+export EXP3_THREADS="${EXP3_THREADS:-1}"
+
+# -----------------------------
+# Dependency checks
+# -----------------------------
+need_cmd cmake
+need_cmd python3
+need_cmd tee
+need_cmd find
+
+# -----------------------------
+# Init temp dir (all produced files go here first)
+# -----------------------------
+rm -rf "${TEMP_DIR}"
+mkdir -p "${TEMP_DIR}/logs" "${TEMP_DIR}/derived" "${TEMP_DIR}/plots" "${TEMP_DIR}/meta"
+
+log "Repo root   : ${ROOT_DIR}"
+log "Config      : ${CONFIG_PATH}"
+log "Build dir   : ${BUILD_DIR} (type=${BUILD_TYPE})"
+log "Temp dir    : ${TEMP_DIR}"
+log "Result dir  : ${RESULT_DIR} (will be overwritten on success)"
+log "Jobs        : ${JOBS}"
+log "sys.threads : ${EXP3_THREADS} (default=1 for fairness; override by setting EXP3_THREADS)"
 
 # -----------------------------
 # Repro / fairness knobs
 # -----------------------------
-# Keep everything single-threaded unless you explicitly override EXP3_THREADS.
+# Cap common BLAS/OpenMP thread pools for fairness.
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
@@ -90,363 +163,172 @@ export VECLIB_MAXIMUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
 # -----------------------------
-# Build (Release)
+# Manifest (what we ran)
 # -----------------------------
-echo "[EXP3] Building project (Release) ..."
-rm -rf "${BUILD_DIR}"
-cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE=Release
-cmake --build "${BUILD_DIR}" -j "${JOBS}"
+{
+  echo "exp=exp3"
+  echo "timestamp=${TS}"
+  echo "repo_root=${ROOT_DIR}"
+  echo "config=${CONFIG_PATH}"
+  echo "build_type=${BUILD_TYPE}"
+  echo "build_dir=${BUILD_DIR}"
+  echo "jobs=${JOBS}"
+  echo "sys_threads=${EXP3_THREADS}"
+  echo "run_tests=${RUN_TESTS}"
+  echo "plot=${DO_PLOT}"
+  echo "plot_enum_sampling=${PLOT_ENUM}"
+  echo ""
+  echo "uname:"; uname -a || true
+  echo ""
+  echo "cmake:"; cmake --version 2>/dev/null || true
+  echo ""
+  if command -v git >/dev/null 2>&1 && [[ -d "${ROOT_DIR}/.git" ]]; then
+    echo "git:";
+    (cd "${ROOT_DIR}" && git rev-parse HEAD && git status --porcelain) || true
+  fi
+  echo ""
+  echo "EXP3 overrides (env, optional):"
+  echo "  EXP3_NR=${EXP3_NR:-}"
+  echo "  EXP3_NS=${EXP3_NS:-}"
+  echo "  EXP3_T=${EXP3_T:-}"
+  echo "  EXP3_REPEATS=${EXP3_REPEATS:-}"
+  echo "  EXP3_JSTAR=${EXP3_JSTAR:-}"
+  echo "  EXP3_ENUM_CAP=${EXP3_ENUM_CAP:-}"
+  echo "  EXP3_ALPHA_LIST=${EXP3_ALPHA_LIST:-}"
+  echo "  EXP3_METHODS=${EXP3_METHODS:-}"
+  echo "  EXP3_VARIANTS=${EXP3_VARIANTS:-}"
+} > "${TEMP_DIR}/meta/manifest.txt"
+
+# -----------------------------
+# Build
+# -----------------------------
+log "Building project (${BUILD_TYPE}) ..."
+mkdir -p "${BUILD_ROOT}"
+
+if [[ "${DO_CLEAN_BUILD}" == "1" ]]; then
+  log "EXP3_CLEAN_BUILD=1 -> rm -rf ${BUILD_DIR}"
+  rm -rf "${BUILD_DIR}"
+fi
+
+# Configure
+cmake_args=(
+  -S "${ROOT_DIR}"
+  -B "${BUILD_DIR}"
+  -DCMAKE_BUILD_TYPE="${BUILD_TYPE}"
+  -DSJS_BUILD_ROOT_APPS=ON
+)
+if [[ "${RUN_TESTS}" == "1" ]]; then
+  cmake_args+=( -DSJS_BUILD_TESTS=ON )
+fi
+
+cmake "${cmake_args[@]}" 2>&1 | tee "${TEMP_DIR}/logs/cmake_configure.log"
+cmake --build "${BUILD_DIR}" -j "${JOBS}" 2>&1 | tee "${TEMP_DIR}/logs/cmake_build.log"
 
 if [[ "${RUN_TESTS}" == "1" ]]; then
-  echo "[EXP3] Running tests (ctest) ..."
-  (cd "${BUILD_DIR}" && ctest --output-on-failure)
+  need_cmd ctest
+  log "Running tests (ctest) ..."
+  (cd "${BUILD_DIR}" && ctest --output-on-failure) 2>&1 | tee "${TEMP_DIR}/logs/ctest.log"
 fi
 
+SJS_SWEEP="$(find_exe "${BUILD_DIR}" "sjs_sweep")"
+log "Using sjs_sweep: ${SJS_SWEEP}"
+
 # -----------------------------
-# Locate binaries
+# Prepare effective sweep config (JSON) under run/temp/exp3
 # -----------------------------
-SJS_SWEEP=""
-if [[ -x "${BUILD_DIR}/sjs_sweep" ]]; then
-  SJS_SWEEP="${BUILD_DIR}/sjs_sweep"
-elif [[ -x "${ROOT_DIR}/sjs_sweep" ]]; then
-  SJS_SWEEP="${ROOT_DIR}/sjs_sweep"
-else
-  SJS_SWEEP="$(find "${BUILD_DIR}" "${ROOT_DIR}" -maxdepth 3 -type f -name sjs_sweep -perm -111 2>/dev/null | head -n 1 || true)"
+EFFECTIVE_CONFIG="${TEMP_DIR}/sweep_exp3_effective.json"
+[[ -f "${INCLUDE_DIR}/exp3_make_effective_sweep_config.py" ]] || die "Missing: ${INCLUDE_DIR}/exp3_make_effective_sweep_config.py"
+
+python3 "${INCLUDE_DIR}/exp3_make_effective_sweep_config.py" \
+  --in "${CONFIG_PATH}" \
+  --out "${EFFECTIVE_CONFIG}" \
+  --out_dir "${TEMP_DIR}" \
+  2>&1 | tee "${TEMP_DIR}/logs/make_effective_config.log"
+
+# -----------------------------
+# Run sweep
+# -----------------------------
+log "Running sweep (alpha scan) ..."
+SWEEP_LOG="${TEMP_DIR}/logs/exp3_sweep.log"
+
+pushd "${ROOT_DIR}" >/dev/null
+set +e
+"${SJS_SWEEP}" --config="${EFFECTIVE_CONFIG}" 2>&1 | tee "${SWEEP_LOG}"
+rc="${PIPESTATUS[0]}"
+set -e
+popd >/dev/null
+
+if [[ "${rc}" -ne 0 ]]; then
+  die "sjs_sweep failed with exit code ${rc}. See ${SWEEP_LOG}"
 fi
 
-if [[ -z "${SJS_SWEEP}" ]]; then
-  echo "[EXP3][ERROR] Cannot find executable: sjs_sweep" >&2
-  exit 3
+RAW_CSV="${TEMP_DIR}/sweep_raw.csv"
+SUMMARY_CSV="${TEMP_DIR}/sweep_summary.csv"
+
+# Some sweep implementations may nest outputs; fall back to a quick search.
+if [[ ! -f "${RAW_CSV}" ]]; then
+  RAW_CSV_FOUND="$(find "${TEMP_DIR}" -maxdepth 3 -name sweep_raw.csv | head -n 1 || true)"
+  [[ -n "${RAW_CSV_FOUND}" ]] && RAW_CSV="${RAW_CSV_FOUND}"
+fi
+if [[ ! -f "${SUMMARY_CSV}" ]]; then
+  SUMMARY_CSV_FOUND="$(find "${TEMP_DIR}" -maxdepth 3 -name sweep_summary.csv | head -n 1 || true)"
+  [[ -n "${SUMMARY_CSV_FOUND}" ]] && SUMMARY_CSV="${SUMMARY_CSV_FOUND}"
 fi
 
-echo "[EXP3] Using sjs_sweep: ${SJS_SWEEP}"
+[[ -f "${RAW_CSV}" ]] || die "Missing expected output: sweep_raw.csv under ${TEMP_DIR}"
+[[ -f "${SUMMARY_CSV}" ]] || die "Missing expected output: sweep_summary.csv under ${TEMP_DIR}"
+
+log "Sweep done."
+log "  Raw     : ${RAW_CSV}"
+log "  Summary : ${SUMMARY_CSV}"
 
 # -----------------------------
-# Prepare an "effective" sweep JSON (copy + optional overrides)
+# Derive: adaptive branch ratio (from raw)
 # -----------------------------
-EFFECTIVE_CONFIG="${OUT_DIR}/sweep_exp3_effective.json"
+BRANCH_CSV="${TEMP_DIR}/derived/adaptive_branch_ratio.csv"
+[[ -f "${INCLUDE_DIR}/exp3_derive_adaptive_branch_ratio.py" ]] || die "Missing: ${INCLUDE_DIR}/exp3_derive_adaptive_branch_ratio.py"
 
-# Export vars needed by the embedded Python snippets
-export CONFIG_PATH
-export EFFECTIVE_CONFIG
-export OUT_DIR
-
-python3 - <<'PY'
-import json, os, sys
-
-in_path  = os.environ["CONFIG_PATH"]
-out_path = os.environ["EFFECTIVE_CONFIG"]
-out_dir  = os.environ["OUT_DIR"]
-
-def get_env(name):
-    v = os.environ.get(name)
-    return v if v is not None and v != "" else None
-
-def parse_csv_list(s, cast=str):
-    # "a,b,c" -> [cast(a), cast(b), cast(c)]
-    return [cast(x.strip()) for x in s.split(",") if x.strip() != ""]
-
-with open(in_path, "r", encoding="utf-8") as f:
-    spec = json.load(f)
-
-# Always pin output dir to this run.
-spec.setdefault("base", {}).setdefault("output", {})["out_dir"] = out_dir
-
-# --- Optional overrides (no JSON editing needed) ---
-nr = get_env("EXP3_NR")
-ns = get_env("EXP3_NS")
-t  = get_env("EXP3_T")
-rep = get_env("EXP3_REPEATS")
-j_star = get_env("EXP3_JSTAR")
-enum_cap = get_env("EXP3_ENUM_CAP")
-threads = get_env("EXP3_THREADS")
-
-alpha_list = get_env("EXP3_ALPHA_LIST")
-methods    = get_env("EXP3_METHODS")
-variants   = get_env("EXP3_VARIANTS")
-
-# Dataset sizes (synthetic)
-if nr is not None:
-    spec["base"]["dataset"]["synthetic"]["n_r"] = int(nr)
-if ns is not None:
-    spec["base"]["dataset"]["synthetic"]["n_s"] = int(ns)
-
-# Run parameters
-if t is not None:
-    spec["base"]["run"]["t"] = int(t)
-if rep is not None:
-    spec["base"]["run"]["repeats"] = int(rep)
-if j_star is not None:
-    spec["base"]["run"]["j_star"] = int(j_star)
-if enum_cap is not None:
-    spec["base"]["run"]["enum_cap"] = int(enum_cap)
-
-# System threads (fairness)
-if threads is not None:
-    spec["base"].setdefault("sys", {})["threads"] = int(threads)
-
-# Sweep lists
-if alpha_list is not None:
-    # allow floats; store as numbers in JSON
-    spec.setdefault("sweep", {})["alpha"] = parse_csv_list(alpha_list, float)
-if methods is not None:
-    spec.setdefault("sweep", {})["method"] = parse_csv_list(methods, str)
-if variants is not None:
-    spec.setdefault("sweep", {})["variant"] = parse_csv_list(variants, str)
-
-with open(out_path, "w", encoding="utf-8") as f:
-    json.dump(spec, f, indent=2, ensure_ascii=False)
-
-print("[EXP3] Wrote effective sweep config:", out_path)
-PY
-
-
-# -----------------------------
-# Run the sweep
-# -----------------------------
-echo "[EXP3] Running sweep (alpha: 0 -> 300) ..."
-LOG_PATH="${OUT_DIR}/exp3_sweep.log"
-"${SJS_SWEEP}" --config="${EFFECTIVE_CONFIG}" 2>&1 | tee "${LOG_PATH}"
-
-RAW_CSV="${OUT_DIR}/sweep_raw.csv"
-SUMMARY_CSV="${OUT_DIR}/sweep_summary.csv"
-
-if [[ ! -f "${RAW_CSV}" || ! -f "${SUMMARY_CSV}" ]]; then
-  echo "[EXP3][ERROR] Expected outputs not found under: ${OUT_DIR}" >&2
-  echo "  Missing: ${RAW_CSV} or ${SUMMARY_CSV}" >&2
-  exit 4
-fi
-
-echo "[EXP3] Sweep done."
-echo "[EXP3] Raw     : ${RAW_CSV}"
-echo "[EXP3] Summary : ${SUMMARY_CSV}"
-
-# -----------------------------
-# Derive: adaptive branch ratio
-# -----------------------------
-DERIVED_DIR="${OUT_DIR}/derived"
-PLOTS_DIR="${OUT_DIR}/plots"
-mkdir -p "${DERIVED_DIR}" "${PLOTS_DIR}"
-
-BRANCH_CSV="${DERIVED_DIR}/adaptive_branch_ratio.csv"
-export RAW_CSV BRANCH_CSV
-
-python3 - <<'PY'
-import csv, os, math
-from collections import defaultdict
-
-raw_path = os.environ["RAW_CSV"]
-out_path = os.environ["BRANCH_CSV"]
-
-# Group adaptive runs by (dataset,generator,n_r,n_s,method,alpha)
-grp = defaultdict(lambda: {"total":0, "enumerate_all":0, "fallback_sampling":0, "fallback_sampling_no_pilot":0, "other":0})
-
-with open(raw_path, "r", newline="", encoding="utf-8") as f:
-    reader = csv.DictReader(f)
-    required = {"variant","method","alpha","adaptive_branch","ok","dataset","generator","n_r","n_s"}
-    missing = required - set(reader.fieldnames or [])
-    if missing:
-        raise SystemExit(f"[EXP3][ERROR] sweep_raw.csv missing columns: {sorted(missing)}")
-
-    for row in reader:
-        if row["variant"] != "adaptive":
-            continue
-        key = (
-            row["dataset"],
-            row["generator"],
-            row["n_r"],
-            row["n_s"],
-            row["method"],
-            row["alpha"],
-        )
-        g = grp[key]
-        g["total"] += 1
-        b = (row.get("adaptive_branch") or "").strip()
-        if b == "enumerate_all":
-            g["enumerate_all"] += 1
-        elif b == "fallback_sampling":
-            g["fallback_sampling"] += 1
-        elif b == "fallback_sampling_no_pilot":
-            g["fallback_sampling_no_pilot"] += 1
-        else:
-            g["other"] += 1
-
-# Write derived CSV
-fieldnames = [
-    "dataset","generator","n_r","n_s","method","alpha",
-    "runs",
-    "enumerate_all","fallback_sampling","fallback_sampling_no_pilot","other",
-    "enumerate_frac","fallback_frac","fallback_no_pilot_frac","other_frac",
-]
-rows = []
-for (dataset,generator,n_r,n_s,method,alpha), g in grp.items():
-    total = g["total"] or 1
-    rows.append({
-        "dataset": dataset,
-        "generator": generator,
-        "n_r": n_r,
-        "n_s": n_s,
-        "method": method,
-        "alpha": alpha,
-        "runs": g["total"],
-        "enumerate_all": g["enumerate_all"],
-        "fallback_sampling": g["fallback_sampling"],
-        "fallback_sampling_no_pilot": g["fallback_sampling_no_pilot"],
-        "other": g["other"],
-        "enumerate_frac": g["enumerate_all"]/total,
-        "fallback_frac": g["fallback_sampling"]/total,
-        "fallback_no_pilot_frac": g["fallback_sampling_no_pilot"]/total,
-        "other_frac": g["other"]/total,
-    })
-
-# Sort by method then numeric alpha
-def alpha_key(a):
-    try:
-        return float(a)
-    except:
-        return math.inf
-
-rows.sort(key=lambda r: (r["method"], alpha_key(r["alpha"])))
-
-with open(out_path, "w", newline="", encoding="utf-8") as f:
-    w = csv.DictWriter(f, fieldnames=fieldnames)
-    w.writeheader()
-    w.writerows(rows)
-
-print("[EXP3] Wrote adaptive branch ratio:", out_path)
-PY
+python3 "${INCLUDE_DIR}/exp3_derive_adaptive_branch_ratio.py" \
+  --raw "${RAW_CSV}" \
+  --out "${BRANCH_CSV}" \
+  2>&1 | tee "${TEMP_DIR}/logs/derive_branch_ratio.log"
 
 # -----------------------------
 # Optional: plotting (matplotlib)
 # -----------------------------
 if [[ "${DO_PLOT}" == "1" ]]; then
-  export SUMMARY_CSV PLOTS_DIR BRANCH_CSV
-  python3 - <<'PY'
-import os, csv, math
-from collections import defaultdict
+  [[ -f "${INCLUDE_DIR}/exp3_plot.py" ]] || die "Missing: ${INCLUDE_DIR}/exp3_plot.py"
 
-summary_path = os.environ["SUMMARY_CSV"]
-branch_path  = os.environ["BRANCH_CSV"]
-plots_dir    = os.environ["PLOTS_DIR"]
+  plot_args=(
+    --summary "${SUMMARY_CSV}"
+    --branch "${BRANCH_CSV}"
+    --out_dir "${TEMP_DIR}/plots"
+  )
+  if [[ "${PLOT_ENUM}" == "1" ]]; then
+    plot_args+=( --include_enum_sampling )
+  fi
 
-# Try to import matplotlib; if unavailable, just exit gracefully.
-try:
-    import matplotlib.pyplot as plt
-except Exception as e:
-    print("[EXP3] matplotlib not available; skip plotting. (", e, ")")
-    raise SystemExit(0)
-
-# ---------- Plot 1: runtime vs alpha (per method, sampling vs adaptive) ----------
-# Read summary into groups: (method,variant) -> [(alpha, wall_median_ms, wall_p95_ms)]
-series = defaultdict(list)
-with open(summary_path, "r", newline="", encoding="utf-8") as f:
-    rd = csv.DictReader(f)
-    required = {"alpha","method","variant","wall_median_ms","wall_p95_ms","ok_rate"}
-    missing = required - set(rd.fieldnames or [])
-    if missing:
-        raise SystemExit(f"[EXP3][ERROR] sweep_summary.csv missing columns: {sorted(missing)}")
-    for row in rd:
-        # Keep even if ok_rate<1; plot what we have
-        try:
-            a = float(row["alpha"])
-            med = float(row["wall_median_ms"])
-            p95 = float(row["wall_p95_ms"])
-        except:
-            continue
-        series[(row["method"], row["variant"])].append((a, med, p95, float(row.get("ok_rate","1") or "1")))
-
-# Sort points
-for k in list(series.keys()):
-    series[k].sort(key=lambda x: x[0])
-
-methods = sorted({m for (m, v) in series.keys()})
-for m in methods:
-    plt.figure()
-    for v in ["sampling","adaptive","enum_sampling"]:
-        pts = series.get((m,v))
-        if not pts:
-            continue
-        xs = [p[0] for p in pts]
-        ys = [p[1] for p in pts]
-        plt.plot(xs, ys, marker="o", label=v)
-    plt.xscale("symlog", linthresh=0.03)
-    plt.yscale("log")
-    plt.xlabel("alpha = |J|/(n_r+n_s)")
-    plt.ylabel("wall_median_ms (log)")
-    plt.title(f"EXP-3 Runtime vs alpha — {m}")
-    plt.grid(True, which="both", linestyle="--", linewidth=0.5)
-    plt.legend()
-    out = os.path.join(plots_dir, f"runtime_vs_alpha_{m}.png")
-    plt.tight_layout()
-    plt.savefig(out, dpi=200)
-    plt.close()
-    print("[EXP3] Wrote plot:", out)
-
-# Also make an "all methods" plot (may be crowded).
-plt.figure(figsize=(12,7))
-for (m,v), pts in series.items():
-    if v != "sampling":
-        continue
-    xs = [p[0] for p in pts]
-    ys = [p[1] for p in pts]
-    plt.plot(xs, ys, marker="o", label=m)
-plt.xscale("symlog", linthresh=0.03)
-plt.yscale("log")
-plt.xlabel("alpha = |J|/(n_r+n_s)")
-plt.ylabel("wall_median_ms (log)")
-plt.title("EXP-3 Runtime vs alpha — sampling (all methods)")
-plt.grid(True, which="both", linestyle="--", linewidth=0.5)
-plt.legend(ncol=2, fontsize=8)
-out = os.path.join(plots_dir, "runtime_vs_alpha_all_methods_sampling.png")
-plt.tight_layout()
-plt.savefig(out, dpi=200)
-plt.close()
-print("[EXP3] Wrote plot:", out)
-
-# ---------- Plot 2: adaptive branch ratio vs alpha (enumerate_frac) ----------
-branch = defaultdict(list)  # method -> [(alpha, enumerate_frac, fallback_frac)]
-with open(branch_path, "r", newline="", encoding="utf-8") as f:
-    rd = csv.DictReader(f)
-    required = {"method","alpha","enumerate_frac","fallback_frac","fallback_no_pilot_frac"}
-    missing = required - set(rd.fieldnames or [])
-    if missing:
-        raise SystemExit(f"[EXP3][ERROR] adaptive_branch_ratio.csv missing columns: {sorted(missing)}")
-    for row in rd:
-        try:
-            a = float(row["alpha"])
-            enumf = float(row["enumerate_frac"])
-            fallf = float(row["fallback_frac"]) + float(row["fallback_no_pilot_frac"])
-        except:
-            continue
-        branch[row["method"]].append((a, enumf, fallf))
-
-plt.figure(figsize=(12,6))
-for m, pts in sorted(branch.items()):
-    pts.sort(key=lambda x: x[0])
-    xs = [p[0] for p in pts]
-    ys = [p[1] for p in pts]  # enumerate fraction
-    plt.plot(xs, ys, marker="o", label=m)
-plt.xscale("symlog", linthresh=0.03)
-plt.xlabel("alpha = |J|/(n_r+n_s)")
-plt.ylabel("adaptive enumerate fraction")
-plt.title("EXP-3 Adaptive branch ratio vs alpha (enumerate fraction)")
-plt.grid(True, which="both", linestyle="--", linewidth=0.5)
-plt.legend(ncol=2, fontsize=8)
-out = os.path.join(plots_dir, "adaptive_branch_ratio_enumerate_frac.png")
-plt.tight_layout()
-plt.savefig(out, dpi=200)
-plt.close()
-print("[EXP3] Wrote plot:", out)
-PY
+  python3 "${INCLUDE_DIR}/exp3_plot.py" "${plot_args[@]}" \
+    2>&1 | tee "${TEMP_DIR}/logs/plot.log"
+else
+  log "EXP3_PLOT=0 -> skip plotting"
 fi
 
-echo "[EXP3] Done."
-echo "----------------------------------------"
-echo "EXP-3 output directory:"
-echo "  ${OUT_DIR}"
-echo "Key files:"
-echo "  ${RAW_CSV}"
-echo "  ${SUMMARY_CSV}"
-echo "  ${BRANCH_CSV}"
-echo "  ${LOG_PATH}"
-echo "----------------------------------------"
+# -----------------------------
+# Sync to results/raw/exp3 (overwrite old results)
+# -----------------------------
+log "Syncing results to ${RESULT_DIR} (overwrite) ..."
+rm -rf "${RESULT_DIR}"
+mkdir -p "${RESULT_DIR}"
+cp -a "${TEMP_DIR}/." "${RESULT_DIR}/"
+
+log "DONE ✅"
+log "----------------------------------------"
+log "EXP-3 final results directory:"
+log "  ${RESULT_DIR}"
+log "Key files:"
+log "  ${RESULT_DIR}/sweep_raw.csv"
+log "  ${RESULT_DIR}/sweep_summary.csv"
+log "  ${RESULT_DIR}/derived/adaptive_branch_ratio.csv"
+log "  ${RESULT_DIR}/meta/manifest.txt"
+log "----------------------------------------"
