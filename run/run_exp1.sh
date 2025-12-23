@@ -1,96 +1,119 @@
 #!/usr/bin/env bash
 # run/run_exp1.sh
 #
-# EXP-1: Correctness & Sample Quality (RQ1)
-# ---------------------------------------
-# This script runs EXP-1 end-to-end, from zero:
-#   1) Configure + build (Release by default)
-#   2) (Optional) run ctest
-#   3) Run sjs_verify for: method × variant × seeds (repeats)
-#   4) Parse logs into CSV tables:
-#        results/exp1/exp1_quality_raw.csv
-#        results/exp1/exp1_quality_summary.csv
+# EXP-1：Correctness & Sample Quality（对应 RQ1）
 #
-# Usage (from repo root):
+# 本脚本需与 Docs/Experiment/EXP-1.md 的表述/原理/思想严格对齐：
+#   - 在“小规模、可算 oracle”的数据上，用 sjs_verify 做：
+#       method × variant × seed(repeats)
+#   - 输出并汇总采样质量指标：
+#       (1) correctness: missing_in_universe（必须为 0）
+#       (2) uniformity:  χ² / KS p-value（统计意义下不拒绝均匀）
+#       (3) independence: autocorrelation（sanity check，应接近 0）
+#
+# 统一目录规范（对齐你的全局要求）：
+#   1) Build 统一放在 <repo_root>/build/ 下
+#   2) 运行过程中产生的日志/中间文件先写到 <repo_root>/run/temp/exp1/
+#   3) 最终实验结果同步到 <repo_root>/results/raw/exp1/（每次覆盖旧结果）
+#   4) Bash 内嵌的 Python 已剥离到 <repo_root>/run/include/
+#      - 本实验使用：run/include/exp1_parse_verify_logs.py
+#
+# 用法：
 #   bash run/run_exp1.sh
 #
-# Optional overrides (env vars):
-#   CLEAN_BUILD=1            # delete build dir before building
-#   RUN_TESTS=0              # skip ctest
-#   BUILD_TYPE=Release
-#   BUILD_DIR=build
+# 可选环境变量（覆盖默认参数）：
+#   BUILD_TYPE=Release|Debug|RelWithDebInfo|MinSizeRel
+#   CLEAN_BUILD=0|1            (默认 0：不清理 build/<type>)
+#   RUN_TESTS=0|1              (默认 1：运行 ctest)
 #   JOBS=8
-#   OUT_BASE=results/exp1
+#   THREADS=1                  (传给 sjs_verify 的 --threads)
 #
-# EXP1 dataset / sampling knobs:
-#   GEN=stripe              # synthetic generator
-#   NR=2000                 # |R|
-#   NS=2000                 # |S|
-#   ALPHA=1                 # |J| ~= alpha*(NR+NS) for stripe_ctrl_alpha
-#   GEN_SEED=1              # synthetic dataset seed
-#   T=100000                # sample size per run
-#   SEED0=1                 # first run seed
-#   REPEATS=5               # number of runs: SEED0..SEED0+REPEATS-1
+#   # 数据设置（EXP-1 推荐小规模，可算 oracle）
+#   GEN=stripe                 (SYN-CTRL 条带构造；stripe 是 stripe_ctrl_alpha 的 alias)
+#   NR=2000
+#   NS=2000
+#   ALPHA=1                    (alpha = |J|/(NR+NS))
+#   GEN_SEED=1
+#
+#   # 采样设置
+#   T=100000
+#   SEED0=1
+#   REPEATS=5                  (实际 seed=SEED0..SEED0+REPEATS-1)
+#
+#   # oracle / universe 预算（用于 correctness + χ²）
 #   ORACLE_MAX_CHECKS=50000000
 #   ORACLE_COLLECT_LIMIT=1000000
 #   ORACLE_CAP=0
 #
-# Restrict threads for fairness / reproducibility:
-#   OMP_NUM_THREADS=1 etc. are set by default below.
+#   # methods/variants 子集（可选：空格分隔）
+#   METHODS="ours aabb interval_tree"
+#   VARIANTS="sampling enum_sampling"
 #
 set -euo pipefail
+IFS=$'\n\t'
 
-########################################
-# Helpers
-########################################
+trap 'echo -e "[EXP1][FATAL] Failed at line ${LINENO}: ${BASH_COMMAND}" >&2; exit 1' ERR
 
-die() { echo "[run_exp1] ERROR: $*" >&2; exit 1; }
+# --------------------------
+# helpers
+# --------------------------
+log()  { echo -e "[EXP1] $*"; }
+warn() { echo -e "[EXP1][WARN] $*" >&2; }
+die()  { echo -e "[EXP1][FATAL] $*" >&2; exit 1; }
 
 need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+  command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"
 }
 
-detect_jobs() {
-  if [[ -n "${JOBS:-}" ]]; then
-    echo "${JOBS}"
-    return
-  fi
-  if command -v nproc >/dev/null 2>&1; then
-    nproc
-    return
-  fi
-  if command -v sysctl >/dev/null 2>&1; then
-    sysctl -n hw.ncpu 2>/dev/null || echo 4
-    return
-  fi
-  echo 4
+build_subdir_for_type() {
+  local bt="$1"
+  case "${bt}" in
+    Release|release) echo "release" ;;
+    Debug|debug) echo "debug" ;;
+    RelWithDebInfo|relwithdebinfo) echo "relwithdebinfo" ;;
+    MinSizeRel|minsizerel) echo "minsizerel" ;;
+    *) die "Unsupported BUILD_TYPE='${bt}' (expected Release|Debug|RelWithDebInfo|MinSizeRel)" ;;
+  esac
 }
 
-########################################
-# Resolve paths
-########################################
+find_exe() {
+  local build_dir="$1"
+  local name="$2"
+  local c
+  for c in \
+    "${build_dir}/${name}" \
+    "${build_dir}/apps/${name}" \
+    "${build_dir}/src/apps/${name}" \
+    ; do
+    if [[ -x "${c}" ]]; then
+      echo "${c}"
+      return 0
+    fi
+  done
+  return 1
+}
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# Resolve repo root (script lives in <root>/run/run_exp1.sh)
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+EXP_ID="exp1"
 
+# --------------------------
+# Parameters (override via env)
+# --------------------------
 BUILD_TYPE="${BUILD_TYPE:-Release}"
-BUILD_DIR="${BUILD_DIR:-${REPO_ROOT}/build}"
-OUT_BASE="${OUT_BASE:-${REPO_ROOT}/results/exp1}"
-LOG_DIR="${OUT_BASE}/logs"
+CLEAN_BUILD="${CLEAN_BUILD:-0}"
+RUN_TESTS="${RUN_TESTS:-1}"
 
-JOBS_DETECTED="$(detect_jobs)"
-
-########################################
-# EXP-1 parameters (defaults)
-########################################
+JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}"
+THREADS="${THREADS:-1}"
 
 GEN="${GEN:-stripe}"
 NR="${NR:-2000}"
 NS="${NS:-2000}"
 ALPHA="${ALPHA:-1}"
 GEN_SEED="${GEN_SEED:-1}"
-T="${T:-100000}"
 
+T="${T:-100000}"
 SEED0="${SEED0:-1}"
 REPEATS="${REPEATS:-5}"
 
@@ -98,12 +121,9 @@ ORACLE_MAX_CHECKS="${ORACLE_MAX_CHECKS:-50000000}"
 ORACLE_COLLECT_LIMIT="${ORACLE_COLLECT_LIMIT:-1000000}"
 ORACLE_CAP="${ORACLE_CAP:-0}"
 
-RUN_TESTS="${RUN_TESTS:-1}"
-CLEAN_BUILD="${CLEAN_BUILD:-0}"
-
-# Methods / variants in this Dim=2 build (override if you want a subset)
-METHODS_DEFAULT=("ours" "aabb" "interval_tree" "kd_tree" "r_tree" "range_tree" "pbsm" "tlsop" "sirs" "rejection" "tsunami")
-VARIANTS_DEFAULT=("sampling" "enum_sampling" "adaptive")
+# Methods / variants in this Dim=2 build
+METHODS_DEFAULT=(ours aabb interval_tree kd_tree r_tree range_tree pbsm tlsop sirs rejection tsunami)
+VARIANTS_DEFAULT=(sampling enum_sampling adaptive)
 
 # Allow overriding METHODS / VARIANTS as space-separated strings
 if [[ -n "${METHODS:-}" ]]; then
@@ -118,68 +138,94 @@ else
   VARIANTS_ARR=("${VARIANTS_DEFAULT[@]}")
 fi
 
-########################################
-# Preflight
-########################################
+# --------------------------
+# Paths (统一：build / run/temp / results/raw)
+# --------------------------
+BUILD_SUBDIR="$(build_subdir_for_type "${BUILD_TYPE}")"
+BUILD_DIR="${ROOT}/build/${BUILD_SUBDIR}"
 
+TEMP_ROOT="${ROOT}/run/temp/${EXP_ID}"
+TEMP_LOG_DIR="${TEMP_ROOT}/logs"
+
+RESULT_ROOT="${ROOT}/results/raw/${EXP_ID}"
+
+RUN_INCLUDE_DIR="${ROOT}/run/include"
+PY_PARSER="${RUN_INCLUDE_DIR}/exp1_parse_verify_logs.py"
+
+DATASET_NAME="exp1_${GEN}_nr${NR}_ns${NS}_a${ALPHA}_g${GEN_SEED}"
+
+# --------------------------
+# preflight
+# --------------------------
 need_cmd cmake
 need_cmd python3
-
-mkdir -p "${OUT_BASE}" "${LOG_DIR}"
+need_cmd tee
+if [[ "${RUN_TESTS}" == "1" ]]; then
+  need_cmd ctest
+fi
+[[ -f "${PY_PARSER}" ]] || die "Missing python parser: ${PY_PARSER} (required by rule #4: no embedded Python in bash)"
 
 # Thread caps (fairness + reproducibility)
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
+export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-1}"
 
-########################################
-# Build (from scratch)
-########################################
+log "Repo root:        ${ROOT}"
+log "Build dir:        ${BUILD_DIR} (BUILD_TYPE=${BUILD_TYPE}, CLEAN_BUILD=${CLEAN_BUILD})"
+log "Temp dir:         ${TEMP_ROOT}"
+log "Results dir:      ${RESULT_ROOT} (will overwrite)"
+log "Parser:           ${PY_PARSER}"
+log "Params: JOBS=${JOBS} THREADS=${THREADS} RUN_TESTS=${RUN_TESTS}"
+log "Params: GEN=${GEN} NR=${NR} NS=${NS} ALPHA=${ALPHA} GEN_SEED=${GEN_SEED}"
+log "Params: T=${T} SEED0=${SEED0} REPEATS=${REPEATS}"
+log "Params: ORACLE_MAX_CHECKS=${ORACLE_MAX_CHECKS} ORACLE_COLLECT_LIMIT=${ORACLE_COLLECT_LIMIT} ORACLE_CAP=${ORACLE_CAP}"
+log "Params: METHODS=${METHODS_ARR[*]}"
+log "Params: VARIANTS=${VARIANTS_ARR[*]}"
 
-echo "[run_exp1] Repo root: ${REPO_ROOT}"
-echo "[run_exp1] Build dir: ${BUILD_DIR} (type=${BUILD_TYPE}, jobs=${JOBS_DETECTED})"
-echo "[run_exp1] Output dir: ${OUT_BASE}"
+# Reset temp/results (覆盖旧结果)
+rm -rf "${TEMP_ROOT}"
+mkdir -p "${TEMP_LOG_DIR}"
 
-if [[ "${CLEAN_BUILD}" == "1" ]]; then
-  echo "[run_exp1] CLEAN_BUILD=1 -> rm -rf ${BUILD_DIR}"
-  rm -rf "${BUILD_DIR}"
-fi
+rm -rf "${RESULT_ROOT}"
+mkdir -p "${RESULT_ROOT}"
 
-cmake -S "${REPO_ROOT}" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE="${BUILD_TYPE}"
-cmake --build "${BUILD_DIR}" -j "${JOBS_DETECTED}"
-
-if [[ "${RUN_TESTS}" == "1" ]]; then
-  echo "[run_exp1] Running tests (ctest)..."
-  ctest --test-dir "${BUILD_DIR}" --output-on-failure
+# Guard: ensure oracle is feasible (EXP-1 必须小规模)
+if [[ "${NR}" =~ ^[0-9]+$ && "${NS}" =~ ^[0-9]+$ && "${ORACLE_MAX_CHECKS}" =~ ^[0-9]+$ ]]; then
+  ORACLE_CHECKS=$(( NR * NS ))
+  if (( ORACLE_CHECKS > ORACLE_MAX_CHECKS )); then
+    die "NR*NS=${ORACLE_CHECKS} exceeds ORACLE_MAX_CHECKS=${ORACLE_MAX_CHECKS}. Reduce NR/NS or raise ORACLE_MAX_CHECKS."
+  fi
 else
-  echo "[run_exp1] RUN_TESTS=0 -> skip ctest"
+  log "Note: NR/NS/ORACLE_MAX_CHECKS not all integers; skipping NR*NS<=ORACLE_MAX_CHECKS guard."
 fi
 
-SJS_VERIFY="${SJS_VERIFY:-${BUILD_DIR}/sjs_verify}"
-[[ -x "${SJS_VERIFY}" ]] || die "sjs_verify not found or not executable at: ${SJS_VERIFY}"
-
-########################################
-# Manifest (what we ran)
-########################################
-
-DATASET_NAME="exp1_${GEN}_nr${NR}_ns${NS}_a${ALPHA}_g${GEN_SEED}"
-MANIFEST="${OUT_BASE}/MANIFEST.txt"
-
+# Record environment + resolved config (先写 temp，最后同步到 results/raw/exp1)
 {
   echo "EXP-1 manifest"
   echo "-------------"
-  echo "repo_root=${REPO_ROOT}"
-  echo "build_dir=${BUILD_DIR}"
-  echo "build_type=${BUILD_TYPE}"
-  echo "jobs=${JOBS_DETECTED}"
+  echo "date: $(date -Is || date)"
+  echo "uname: $(uname -a || true)"
+  echo "cmake: $(cmake --version | head -n1 || true)"
+  if command -v git >/dev/null 2>&1 && [[ -d "${ROOT}/.git" ]]; then
+    echo "git_head: $(git -C "${ROOT}" rev-parse --short HEAD || true)"
+    echo "git_status:"
+    git -C "${ROOT}" status --porcelain || true
+  fi
+  echo ""
+  echo "paths:"
+  echo "  repo_root=${ROOT}"
+  echo "  build_dir=${BUILD_DIR}"
+  echo "  temp_dir=${TEMP_ROOT}"
+  echo "  results_dir=${RESULT_ROOT}"
   echo ""
   echo "dataset_source=synthetic"
+  echo "dataset_label=${DATASET_NAME}"
   echo "gen=${GEN}"
-  echo "dataset=${DATASET_NAME}"
   echo "n_r=${NR}"
   echo "n_s=${NS}"
-  echo "alpha=${ALPHA}"
+  echo "alpha=${ALPHA}   # alpha=|J|/(n_r+n_s)"
   echo "gen_seed=${GEN_SEED}"
   echo ""
   echo "t=${T}"
@@ -192,278 +238,105 @@ MANIFEST="${OUT_BASE}/MANIFEST.txt"
   echo ""
   echo "methods=${METHODS_ARR[*]}"
   echo "variants=${VARIANTS_ARR[*]}"
-} > "${MANIFEST}"
+  echo ""
+  echo "thread_caps:"
+  echo "  OMP_NUM_THREADS=${OMP_NUM_THREADS}"
+  echo "  OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS}"
+  echo "  MKL_NUM_THREADS=${MKL_NUM_THREADS}"
+  echo "  NUMEXPR_NUM_THREADS=${NUMEXPR_NUM_THREADS}"
+  echo "  VECLIB_MAXIMUM_THREADS=${VECLIB_MAXIMUM_THREADS}"
+  echo "  THREADS(flag)=${THREADS}"
+} > "${TEMP_ROOT}/MANIFEST.txt"
 
-########################################
-# Run EXP-1 (method × variant)
-########################################
+# --------------------------
+# Build
+# --------------------------
+log "Step 1/3: Configure + build"
+if [[ "${CLEAN_BUILD}" == "1" ]]; then
+  log "CLEAN_BUILD=1 -> rm -rf ${BUILD_DIR}"
+  rm -rf "${BUILD_DIR}"
+fi
 
-FAIL_FILE="${OUT_BASE}/FAILURES.txt"
+cmake -S "${ROOT}" -B "${BUILD_DIR}" \
+  -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+  -DSJS_BUILD_ROOT_APPS=ON \
+  -DSJS_BUILD_TESTS=ON \
+  2>&1 | tee "${TEMP_LOG_DIR}/cmake_configure.log"
+
+cmake --build "${BUILD_DIR}" -j "${JOBS}" 2>&1 | tee "${TEMP_LOG_DIR}/cmake_build.log"
+
+if [[ "${RUN_TESTS}" == "1" ]]; then
+  log "Step 2/3: Run tests (ctest)"
+  ctest --test-dir "${BUILD_DIR}" --output-on-failure 2>&1 | tee "${TEMP_LOG_DIR}/ctest.log"
+else
+  log "Step 2/3: RUN_TESTS=0 -> skip ctest"
+fi
+
+SJS_VERIFY="$(find_exe "${BUILD_DIR}" "sjs_verify" || true)"
+[[ -n "${SJS_VERIFY}" && -x "${SJS_VERIFY}" ]] || die "sjs_verify not found under build dir: ${BUILD_DIR}"
+
+# --------------------------
+# Run EXP-1 (method × variant × seed)
+# --------------------------
+log "Step 3/3: Run sjs_verify for method×variant with repeats (seeds)"
+
+FAIL_FILE="${TEMP_ROOT}/FAILURES.txt"
 : > "${FAIL_FILE}"
-
-echo "[run_exp1] Dataset label: ${DATASET_NAME}"
-echo "[run_exp1] NR=${NR} NS=${NS} ALPHA=${ALPHA} T=${T} SEED0=${SEED0} REPEATS=${REPEATS}"
-echo "[run_exp1] oracle_max_checks=${ORACLE_MAX_CHECKS} oracle_collect_limit=${ORACLE_COLLECT_LIMIT} oracle_cap=${ORACLE_CAP}"
-echo "[run_exp1] Manifest written to: ${MANIFEST}"
 
 total_jobs=0
 failed_jobs=0
 
 for m in "${METHODS_ARR[@]}"; do
   for v in "${VARIANTS_ARR[@]}"; do
-    total_jobs=$((total_jobs+1))
-    log="${LOG_DIR}/${m}__${v}.log"
+    total_jobs=$((total_jobs + 1))
+    log_file="${TEMP_LOG_DIR}/${m}__${v}.log"
 
-    echo "[run_exp1] (${total_jobs}) method=${m} variant=${v}"
-    echo "           log=${log}"
+    log "(${total_jobs}) method=${m} variant=${v} -> ${log_file}"
 
-    # Run and capture log. Keep going even if one combo fails.
+    # Keep going even if one combo fails (failures are recorded & surfaced).
     if ! "${SJS_VERIFY}" \
       --dataset_source=synthetic --gen="${GEN}" --dataset="${DATASET_NAME}" \
       --n_r="${NR}" --n_s="${NS}" --alpha="${ALPHA}" --gen_seed="${GEN_SEED}" \
       --method="${m}" --variant="${v}" --t="${T}" --seed="${SEED0}" --repeats="${REPEATS}" \
+      --threads="${THREADS}" \
       --oracle_max_checks="${ORACLE_MAX_CHECKS}" --oracle_collect_limit="${ORACLE_COLLECT_LIMIT}" --oracle_cap="${ORACLE_CAP}" \
-      > "${log}" 2>&1
+      > "${log_file}" 2>&1
     then
       rc=$?
-      failed_jobs=$((failed_jobs+1))
-      echo "[run_exp1] FAIL rc=${rc} method=${m} variant=${v} log=${log}" | tee -a "${FAIL_FILE}"
+      failed_jobs=$((failed_jobs + 1))
+      echo "[EXP1] FAIL rc=${rc} method=${m} variant=${v} log=${log_file}" | tee -a "${FAIL_FILE}" >&2
       continue
     fi
   done
 done
 
-########################################
-# Parse logs -> CSV tables
-########################################
+# Parse logs -> CSV tables (no embedded Python; call run/include/*.py)
+log "Parsing logs -> CSV (written to temp)"
+python3 "${PY_PARSER}" \
+  --log_dir "${TEMP_LOG_DIR}" \
+  --out_dir "${TEMP_ROOT}" \
+  --fail_file "${FAIL_FILE}" \
+  2>&1 | tee "${TEMP_LOG_DIR}/parse_logs.log"
 
-echo "[run_exp1] Parsing logs -> CSV ..."
+# --------------------------
+# Sync: temp → results/raw/exp1 (覆盖旧结果)
+# --------------------------
+log "Syncing artifacts to ${RESULT_ROOT} (overwrite)"
 
-python3 - <<'PY' "${LOG_DIR}" "${OUT_BASE}"
-import csv, glob, os, re, statistics, sys
+# results/raw/exp1 当前已是空目录；直接整体复制即可
+cp -a "${TEMP_ROOT}/." "${RESULT_ROOT}/"
 
-log_dir = sys.argv[1]
-out_base = sys.argv[2]
-fail_path = os.path.join(out_base, "FAILURES.txt")
-
-logs = sorted(glob.glob(os.path.join(log_dir, "*.log")))
-
-# Regex patterns that match sjs_verify output
-re_run = re.compile(r"^---- run rep=(\d+)\s+seed=(\d+)\s+----$")
-re_method = re.compile(r"^method=([^\s]+)\s+variant=([^\s]+)\s+t=(\d+)\s*$")
-re_count = re.compile(r"^count=([0-9.eE+-]+)\s+\((exact|est)\)\s+oracle=([0-9.eE+-]+)\s+rel_err=([0-9.eE+-]+)\s*$")
-re_samples = re.compile(r"^samples=(\d+)\s*$")
-re_failed = re.compile(r"^FAILED:\s*(.*)$")
-re_quality_skipped = re.compile(r"^quality:\s*skipped\b")
-re_missing = re.compile(r"^\s+missing_in_universe=([0-9.eE+-]+)\s*$")
-re_chi2 = re.compile(r"^\s+chi2_stat=.*\s+p_value=([0-9.eE+-]+)\s*$")
-re_ac1 = re.compile(r"^\s+autocorr_hash_lag1=([0-9.eE+-]+)\s*$")
-re_ks = re.compile(r"^\s+ks_hash_uniform01\s+D=.*\s+p=([0-9.eE+-]+)\s*$")
-
-rows = []
-
-def push_row(cur):
-    if not cur:
-        return
-    cur.setdefault("status", "OK")
-    rows.append(cur)
-
-# Parse each log file
-for path in logs:
-    base = os.path.basename(path)
-    # filename: <method>__<variant>.log
-    m_guess, v_guess = "", ""
-    if "__" in base:
-        m_guess = base.split("__", 1)[0]
-        v_guess = base.split("__", 1)[1].rsplit(".", 1)[0]
-
-    cur = None
-    saw_any_run = False
-
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            line = line.rstrip("\n")
-
-            m = re_run.match(line)
-            if m:
-                saw_any_run = True
-                # flush previous run record
-                push_row(cur)
-                cur = {
-                    "method": m_guess,
-                    "variant": v_guess,
-                    "rep": int(m.group(1)),
-                    "seed": int(m.group(2)),
-                    "log_file": base,
-                    "status": "OK",
-                }
-                continue
-
-            if cur is None:
-                continue  # ignore prologue before first run
-
-            m = re_failed.match(line)
-            if m:
-                cur["status"] = "FAILED"
-                cur["error"] = m.group(1).strip()
-                continue
-
-            m = re_method.match(line)
-            if m:
-                cur["method"] = m.group(1)
-                cur["variant"] = m.group(2)
-                cur["t"] = int(m.group(3))
-                continue
-
-            m = re_count.match(line)
-            if m:
-                cur["count"] = float(m.group(1))
-                cur["count_kind"] = m.group(2)
-                cur["oracle"] = float(m.group(3))
-                cur["rel_err"] = float(m.group(4))
-                continue
-
-            m = re_samples.match(line)
-            if m:
-                cur["samples"] = int(m.group(1))
-                continue
-
-            if re_quality_skipped.match(line):
-                cur["status"] = "QUALITY_SKIPPED"
-                continue
-
-            m = re_missing.match(line)
-            if m:
-                cur["missing_in_universe"] = float(m.group(1))
-                continue
-
-            m = re_chi2.match(line)
-            if m:
-                cur["chi2_p"] = float(m.group(1))
-                continue
-
-            m = re_ac1.match(line)
-            if m:
-                cur["autocorr_lag1"] = float(m.group(1))
-                continue
-
-            m = re_ks.match(line)
-            if m:
-                cur["ks_p"] = float(m.group(1))
-                continue
-
-    push_row(cur)
-
-    # If a log has no "---- run ..." blocks at all, keep a placeholder row.
-    if not saw_any_run:
-        rows.append({
-            "method": m_guess,
-            "variant": v_guess,
-            "rep": "",
-            "seed": "",
-            "log_file": base,
-            "status": "NO_RUN_BLOCKS",
-        })
-
-# Incorporate top-level failures (non-zero exit codes) so they appear in the CSV too.
-if os.path.exists(fail_path):
-    with open(fail_path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            line = line.strip()
-            m = re.search(r"rc=(\d+)\s+method=([^\s]+)\s+variant=([^\s]+)\s+log=(.+)$", line)
-            if not m:
-                continue
-            rc = int(m.group(1))
-            method = m.group(2)
-            variant = m.group(3)
-            log = os.path.basename(m.group(4))
-            rows.append({
-                "method": method,
-                "variant": variant,
-                "rep": "",
-                "seed": "",
-                "log_file": log,
-                "status": "FAILED_CREATE_OR_ARGS",
-                "exit_code": rc,
-            })
-
-# Write raw table
-raw_csv = os.path.join(out_base, "exp1_quality_raw.csv")
-os.makedirs(out_base, exist_ok=True)
-
-all_fields = sorted({k for r in rows for k in r.keys()})
-with open(raw_csv, "w", newline="", encoding="utf-8") as f:
-    w = csv.DictWriter(f, fieldnames=all_fields)
-    w.writeheader()
-    for r in rows:
-        w.writerow(r)
-
-# Summary (median by method×variant over OK + QUALITY_SKIPPED)
-def median(vals):
-    vals = [v for v in vals if v is not None and v != "" and (not isinstance(v, float) or v == v)]
-    return statistics.median(vals) if vals else ""
-
-summary_csv = os.path.join(out_base, "exp1_quality_summary.csv")
-keys = sorted(set((r.get("method",""), r.get("variant","")) for r in rows))
-
-with open(summary_csv, "w", newline="", encoding="utf-8") as f:
-    fields = [
-        "method","variant","n_rows",
-        "n_ok","n_failed","n_failed_create_or_args","n_quality_skipped","n_no_run_blocks",
-        "t_median","oracle_median","rel_err_median",
-        "missing_median","chi2_p_median","ks_p_median","autocorr_median"
-    ]
-    w = csv.DictWriter(f, fieldnames=fields)
-    w.writeheader()
-
-    for method, variant in keys:
-        grp = [r for r in rows if r.get("method")==method and r.get("variant")==variant]
-        n_rows = len(grp)
-        n_ok = sum(1 for r in grp if r.get("status")=="OK")
-        n_failed = sum(1 for r in grp if r.get("status")=="FAILED")
-        n_fc = sum(1 for r in grp if r.get("status")=="FAILED_CREATE_OR_ARGS")
-        n_qs = sum(1 for r in grp if r.get("status")=="QUALITY_SKIPPED")
-        n_nrb = sum(1 for r in grp if r.get("status")=="NO_RUN_BLOCKS")
-
-        w.writerow({
-            "method": method,
-            "variant": variant,
-            "n_rows": n_rows,
-            "n_ok": n_ok,
-            "n_failed": n_failed,
-            "n_failed_create_or_args": n_fc,
-            "n_quality_skipped": n_qs,
-            "n_no_run_blocks": n_nrb,
-            "t_median": median([r.get("t") for r in grp]),
-            "oracle_median": median([r.get("oracle") for r in grp]),
-            "rel_err_median": median([r.get("rel_err") for r in grp]),
-            "missing_median": median([r.get("missing_in_universe") for r in grp]),
-            "chi2_p_median": median([r.get("chi2_p") for r in grp]),
-            "ks_p_median": median([r.get("ks_p") for r in grp]),
-            "autocorr_median": median([r.get("autocorr_lag1") for r in grp]),
-        })
-
-print("[run_exp1] Wrote:", raw_csv)
-print("[run_exp1] Wrote:", summary_csv)
-
-# Quick sanity: missing should be 0 when quality is computed.
-bad_missing = [r for r in rows if r.get("status")=="OK" and float(r.get("missing_in_universe", 0.0) or 0.0) != 0.0]
-if bad_missing:
-    print("[run_exp1] WARNING: missing_in_universe != 0 found in", len(bad_missing), "OK runs (correctness failure).")
-PY
-
-########################################
-# Final report
-########################################
-
-echo "[run_exp1] Done."
-echo "[run_exp1] Logs:   ${LOG_DIR}/*.log"
-echo "[run_exp1] Tables: ${OUT_BASE}/exp1_quality_raw.csv"
-echo "               ${OUT_BASE}/exp1_quality_summary.csv"
-echo "[run_exp1] Manifest: ${MANIFEST}"
+log "EXP-1 DONE"
+log "Artifacts:"
+log "  - Results: ${RESULT_ROOT}"
+log "  - Logs:    ${RESULT_ROOT}/logs"
+log "  - Tables:  ${RESULT_ROOT}/exp1_quality_raw.csv"
+log "             ${RESULT_ROOT}/exp1_quality_summary.csv"
+log "  - Manifest:${RESULT_ROOT}/MANIFEST.txt"
+log "  - Temp:    ${TEMP_ROOT}"
 
 if [[ "${failed_jobs}" -gt 0 ]]; then
-  echo "[run_exp1] WARNING: ${failed_jobs}/${total_jobs} (method×variant) jobs failed to run. See ${FAIL_FILE}" >&2
+  warn "${failed_jobs}/${total_jobs} (method×variant) jobs failed. See ${RESULT_ROOT}/FAILURES.txt"
   exit 2
 fi
 
