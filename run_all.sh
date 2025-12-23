@@ -20,7 +20,7 @@
 #   RUN_EXPS="exp0 exp1 exp2"            # subset (default: exp0..exp7)
 
 set -euo pipefail
-IFS=$'\n\t'
+IFS=$' \n\t'
 
 trap 'echo -e "[run_all][FATAL] Failed at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
 
