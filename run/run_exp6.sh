@@ -3,53 +3,105 @@
 #
 # EXP-6 (RQ6): Adaptivity effectiveness on an (alpha, t) grid.
 #
-# This script is "from zero": it will
-#   1) configure + build (Release by default)
-#   2) generate an EXP-6 sweep JSON config (self-contained)
-#   3) run sjs_sweep over (alpha, t) × {sampling, enum_sampling, adaptive}
-#   4) produce two figures per method:
-#        - phase diagram (winner per grid point)
-#        - ratio heatmap = T(adaptive) / min(T(sampling), T(enum_sampling))
+# Aligned with EXP-6.md:
+#   - Data: synthetic "stripe" (alias of stripe_ctrl_alpha), where
+#       alpha = |J| / (n_r + n_s)  and  |J| = round(alpha * (n_r+n_s))
+#   - Sweep: a grid over (alpha, t)
+#   - Compare variants (fixed): sampling vs enum_sampling vs adaptive
+#   - Metric: end-to-end wall time (summary uses median/p95 + ok_rate)
+#   - Artifacts: sweep_raw.csv, sweep_summary.csv, phase/ratio heatmaps
 #
-# Usage (from repo root):
+# Repo-wide runner conventions (your 5 requirements):
+#   1) Experiment logic/params align with EXP-6.md (RQ6 intent)
+#   2) Build output under: <repo_root>/build/<build_type>/
+#   3) Final results under: <repo_root>/results/raw/exp6  (OVERWRITE each run)
+#   4) No embedded python in this bash: python lives under <repo_root>/run/include/
+#   5) All generated configs/logs/etc are written to: <repo_root>/run/temp/exp6
+#      and copied to results/raw/exp6 on success.
+#
+# Usage:
 #   bash run/run_exp6.sh
 #
-# Optional environment overrides (examples):
-#   EXP6_N=200000 EXP6_REPEATS=5 bash run/run_exp6.sh
-#   EXP6_METHODS="ours,kd_tree" EXP6_ALPHAS="0.01,0.1,1,10" bash run/run_exp6.sh
+# Common overrides (env vars):
+#   EXP6_BUILD_TYPE=Release|Debug|RelWithDebInfo|MinSizeRel
+#   EXP6_CLEAN_BUILD=0|1
+#   EXP6_RUN_TESTS=0|1
+#   EXP6_BUILD_JOBS=8
 #
-# Notes:
-#   - The sweep uses the synthetic generator "stripe" (alias of stripe_ctrl_alpha),
-#     so alpha controls |J| exactly (paper-friendly).
-#   - By default we run single-thread (fairness) and disable correctness verification.
-#   - Enum-based modes can be very slow at large alpha; adjust EXP6_ALPHAS if needed.
-
+#   # Dataset size
+#   EXP6_N=200000                 # sets n_r=n_s=EXP6_N
+#   EXP6_N_R=100000 EXP6_N_S=100000
+#   EXP6_GEN_SEED=1
+#
+#   # Grid sweep
+#   EXP6_ALPHAS="0.01,0.03,0.1,0.3,1,3,10,30"
+#   EXP6_TS="1000,3000,10000,30000,100000,300000,1000000"
+#
+#   # Which methods to include (comma-separated)
+#   EXP6_METHODS="ours,kd_tree,r_tree"
+#
+#   # Run controls
+#   EXP6_REPEATS=3
+#   EXP6_RUN_SEED=1
+#   EXP6_THREADS=1
+#   EXP6_J_STAR=1000000
+#   EXP6_ENUM_CAP=0
+#
 set -euo pipefail
 IFS=$'\n\t'
 
-# --------------------------
-# Helpers
-# --------------------------
+trap 'echo -e "[EXP6][FATAL] Failed at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
 
-die() { echo "[EXP6][ERROR] $*" >&2; exit 1; }
+# --------------------------
+# helpers
+# --------------------------
+log() { echo "[EXP6] $*"; }
+die() { echo "[EXP6][FATAL] $*" >&2; exit 1; }
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
 }
 
-cpu_count() {
+nproc_safe() {
   if command -v nproc >/dev/null 2>&1; then
     nproc
-  elif command -v sysctl >/dev/null 2>&1; then
-    sysctl -n hw.ncpu
+  elif command -v getconf >/dev/null 2>&1; then
+    getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4
+  elif [[ "$(uname -s)" == "Darwin" ]] && command -v sysctl >/dev/null 2>&1; then
+    sysctl -n hw.ncpu 2>/dev/null || echo 4
   else
     echo 4
   fi
 }
 
-trim_spaces() { echo "$1" | tr -d '[:space:]'; }
+lower() {
+  echo "$1" | tr '[:upper:]' '[:lower:]'
+}
 
-json_array_numbers() {
+build_subdir_from_type() {
+  local t="$1"
+  case "$t" in
+    Release) echo "release";;
+    Debug) echo "debug";;
+    RelWithDebInfo) echo "relwithdebinfo";;
+    MinSizeRel) echo "minsizerel";;
+    *) lower "$t";;
+  esac
+}
+
+trim_spaces() {
+  echo "$1" | tr -d '[:space:]'
+}
+
+json_bool() {
+  case "$(trim_spaces "$1")" in
+    1|true|TRUE|True|yes|YES|y|Y) echo "true";;
+    0|false|FALSE|False|no|NO|n|N) echo "false";;
+    *) echo "false";;
+  esac
+}
+
+json_array_numbers_from_csv() {
   local s
   s="$(trim_spaces "$1")"
   IFS=',' read -r -a arr <<< "$s"
@@ -65,7 +117,7 @@ json_array_numbers() {
   echo "$out"
 }
 
-json_array_strings() {
+json_array_strings_from_csv() {
   local s
   s="$(trim_spaces "$1")"
   IFS=',' read -r -a arr <<< "$s"
@@ -81,63 +133,59 @@ json_array_strings() {
   echo "$out"
 }
 
-json_bool() {
-  case "$(trim_spaces "$1")" in
-    1|true|TRUE|True|yes|YES|y|Y) echo "true" ;;
-    0|false|FALSE|False|no|NO|n|N) echo "false" ;;
-    *) echo "false" ;;
-  esac
-}
+resolve_exe() {
+  local name="$1"
+  local root="$2"
 
-find_exe() {
-  local build_dir="$1"
-  local name="$2"
+  local candidates=(
+    "$root/$name"
+    "$root/apps/$name"
+    "$root/bin/$name"
+    "$root/src/apps/$name"
+  )
 
-  if [[ -x "${build_dir}/${name}" ]]; then
-    echo "${build_dir}/${name}"
-    return 0
-  fi
+  for p in "${candidates[@]}"; do
+    if [[ -x "$p" ]]; then
+      echo "$p"
+      return 0
+    fi
+  done
 
-  local f=""
-  f="$(find "${build_dir}" -maxdepth 4 -type f -name "${name}" -perm -111 2>/dev/null | head -n 1 || true)"
-  if [[ -n "$f" ]]; then
-    echo "$f"
-    return 0
-  fi
-
-  return 1
+  local found
+  found="$(find "$root" -maxdepth 4 -type f -name "$name" -perm -111 2>/dev/null | head -n 1 || true)"
+  [[ -n "$found" && -x "$found" ]] || return 1
+  echo "$found"
 }
 
 # --------------------------
-# Locate repo root
+# locate repo root
 # --------------------------
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # --------------------------
-# Dependencies
+# deps
 # --------------------------
-
 need_cmd cmake
 need_cmd python3
-need_cmd awk
-need_cmd sed
+need_cmd tee
 need_cmd find
+need_cmd awk
 
 # --------------------------
-# Parameters (override via env)
+# parameters (override via env)
 # --------------------------
 
 # Build
-EXP6_BUILD_DIR="${EXP6_BUILD_DIR:-${ROOT_DIR}/build}"
 EXP6_BUILD_TYPE="${EXP6_BUILD_TYPE:-Release}"
-EXP6_BUILD_JOBS="${EXP6_BUILD_JOBS:-$(cpu_count)}"
-EXP6_CLEAN_BUILD="${EXP6_CLEAN_BUILD:-0}"   # 1 -> rm -rf build dir before configure
-EXP6_RUN_TESTS="${EXP6_RUN_TESTS:-0}"       # 1 -> ctest after build
+EXP6_BUILD_JOBS="${EXP6_BUILD_JOBS:-$(nproc_safe)}"
+EXP6_CLEAN_BUILD="${EXP6_CLEAN_BUILD:-0}"
+EXP6_RUN_TESTS="${EXP6_RUN_TESTS:-0}"
+
+BUILD_SUBDIR="$(build_subdir_from_type "${EXP6_BUILD_TYPE}")"
+BUILD_DIR="${EXP6_BUILD_DIR:-${ROOT_DIR}/build/${BUILD_SUBDIR}}"
 
 # Dataset (synthetic stripe)
-# If EXP6_N is provided, it overrides both n_r and n_s.
 EXP6_N="${EXP6_N:-}"
 EXP6_N_R="${EXP6_N_R:-100000}"
 EXP6_N_S="${EXP6_N_S:-100000}"
@@ -145,10 +193,9 @@ if [[ -n "${EXP6_N}" ]]; then
   EXP6_N_R="${EXP6_N}"
   EXP6_N_S="${EXP6_N}"
 fi
-
 EXP6_GEN_SEED="${EXP6_GEN_SEED:-1}"
 
-# Generator params (match stripe_ctrl_alpha defaults unless overridden)
+# Generator params (stripe_ctrl_alpha)
 EXP6_CONTROL_AXIS="${EXP6_CONTROL_AXIS:-1}"
 EXP6_CORE_LO="${EXP6_CORE_LO:-0.45}"
 EXP6_CORE_HI="${EXP6_CORE_HI:-0.55}"
@@ -162,10 +209,10 @@ EXP6_SWAP_SIDES="${EXP6_SWAP_SIDES:-false}"
 EXP6_ALPHAS="${EXP6_ALPHAS:-0.01,0.03,0.1,0.3,1,3,10,30}"
 EXP6_TS="${EXP6_TS:-1000,3000,10000,30000,100000,300000,1000000}"
 
-# Which methods to run (comma-separated). Default: ours only (fastest to iterate).
+# Methods to run
 EXP6_METHODS="${EXP6_METHODS:-ours}"
 
-# Variants are fixed for EXP-6 (compare three modes)
+# Variants are fixed for EXP-6; allow override only for debugging.
 EXP6_VARIANTS="${EXP6_VARIANTS:-sampling,enum_sampling,adaptive}"
 
 # Run control
@@ -173,35 +220,46 @@ EXP6_REPEATS="${EXP6_REPEATS:-3}"
 EXP6_RUN_SEED="${EXP6_RUN_SEED:-1}"
 EXP6_THREADS="${EXP6_THREADS:-1}"
 
-# Adaptive threshold & enumeration safety cap
+# Adaptive / enumeration knobs
 EXP6_J_STAR="${EXP6_J_STAR:-1000000}"
 EXP6_ENUM_CAP="${EXP6_ENUM_CAP:-0}"
 
-# Output
-EXP6_OUT_DIR="${EXP6_OUT_DIR:-${ROOT_DIR}/results/sweeps/exp6_alpha_t}"
-EXP6_CLEAN_RESULTS="${EXP6_CLEAN_RESULTS:-0}"  # 1 -> remove EXP6_OUT_DIR before run
+# --------------------------
+# directories (fixed per repo convention)
+# --------------------------
+TEMP_ROOT="${ROOT_DIR}/run/temp/exp6"
+META_DIR="${TEMP_ROOT}/meta"
+LOG_DIR="${TEMP_ROOT}/logs"
+FIGS_DIR="${TEMP_ROOT}/figs"
+
+FINAL_OUT="${ROOT_DIR}/results/raw/exp6"
+
+PLOT_HELPER="${ROOT_DIR}/run/include/exp6_plot.py"
+
+# Clean temp every run (keeps runs deterministic + avoids stale artifacts)
+rm -rf "${TEMP_ROOT}"
+mkdir -p "${META_DIR}" "${LOG_DIR}" "${FIGS_DIR}"
+
+# Ensure results/raw exists
+mkdir -p "${ROOT_DIR}/results/raw"
 
 # --------------------------
-# Prepare dirs
+# fairness / reproducibility
 # --------------------------
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-${EXP6_THREADS}}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-${EXP6_THREADS}}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-${EXP6_THREADS}}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-${EXP6_THREADS}}"
+export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-${EXP6_THREADS}}"
 
-GEN_DIR="${ROOT_DIR}/run/_generated"
-mkdir -p "${GEN_DIR}"
-
-if [[ "${EXP6_CLEAN_RESULTS}" == "1" ]]; then
-  echo "[EXP6] Cleaning results dir: ${EXP6_OUT_DIR}"
-  rm -rf "${EXP6_OUT_DIR}"
-fi
-mkdir -p "${EXP6_OUT_DIR}"
-mkdir -p "${EXP6_OUT_DIR}/logs"
-mkdir -p "${EXP6_OUT_DIR}/figs"
-
-# Record manifest (for reproducibility)
+# --------------------------
+# manifest + sysinfo
+# --------------------------
 {
-  echo "timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  echo "timestamp=$(date -Is)"
   echo "root_dir=${ROOT_DIR}"
-  echo "build_dir=${EXP6_BUILD_DIR}"
   echo "build_type=${EXP6_BUILD_TYPE}"
+  echo "build_dir=${BUILD_DIR}"
   echo "methods=${EXP6_METHODS}"
   echo "variants=${EXP6_VARIANTS}"
   echo "alphas=${EXP6_ALPHAS}"
@@ -214,6 +272,14 @@ mkdir -p "${EXP6_OUT_DIR}/figs"
   echo "threads=${EXP6_THREADS}"
   echo "j_star=${EXP6_J_STAR}"
   echo "enum_cap=${EXP6_ENUM_CAP}"
+  echo "stripe.control_axis=${EXP6_CONTROL_AXIS}"
+  echo "stripe.core_lo=${EXP6_CORE_LO}"
+  echo "stripe.core_hi=${EXP6_CORE_HI}"
+  echo "stripe.gap_factor=${EXP6_GAP_FACTOR}"
+  echo "stripe.delta_factor=${EXP6_DELTA_FACTOR}"
+  echo "stripe.shuffle_strips=${EXP6_SHUFFLE_STRIPS}"
+  echo "stripe.shuffle_r=${EXP6_SHUFFLE_R}"
+  echo "stripe.swap_sides=${EXP6_SWAP_SIDES}"
   if command -v git >/dev/null 2>&1 && git -C "${ROOT_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     echo "git_sha=$(git -C "${ROOT_DIR}" rev-parse HEAD)"
     echo "git_dirty=$(git -C "${ROOT_DIR}" status --porcelain | wc -l | awk '{print $1}')"
@@ -221,47 +287,56 @@ mkdir -p "${EXP6_OUT_DIR}/figs"
     echo "git_sha=unknown"
     echo "git_dirty=unknown"
   fi
-} > "${EXP6_OUT_DIR}/manifest.txt"
+} > "${META_DIR}/manifest.txt"
+
+{
+  echo "date: $(date -Is)"
+  uname -a || true
+  echo
+  cmake --version || true
+  echo
+  if command -v g++ >/dev/null 2>&1; then g++ --version || true; fi
+  if command -v clang++ >/dev/null 2>&1; then clang++ --version || true; fi
+} > "${META_DIR}/sysinfo.txt"
 
 # --------------------------
-# Build (from zero)
+# build
 # --------------------------
-
 if [[ "${EXP6_CLEAN_BUILD}" == "1" ]]; then
-  echo "[EXP6] Cleaning build dir: ${EXP6_BUILD_DIR}"
-  rm -rf "${EXP6_BUILD_DIR}"
+  log "Cleaning build dir: ${BUILD_DIR}"
+  rm -rf "${BUILD_DIR}"
 fi
 
-echo "[EXP6] Configuring (CMake, ${EXP6_BUILD_TYPE}) ..."
-cmake -S "${ROOT_DIR}" -B "${EXP6_BUILD_DIR}" -DCMAKE_BUILD_TYPE="${EXP6_BUILD_TYPE}"
+log "Configuring (CMake, ${EXP6_BUILD_TYPE}) -> ${BUILD_DIR}"
+cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE="${EXP6_BUILD_TYPE}" \
+  2>&1 | tee "${LOG_DIR}/cmake_configure.log"
 
-echo "[EXP6] Building (jobs=${EXP6_BUILD_JOBS}) ..."
-cmake --build "${EXP6_BUILD_DIR}" -j "${EXP6_BUILD_JOBS}"
+log "Building (jobs=${EXP6_BUILD_JOBS})"
+cmake --build "${BUILD_DIR}" -j "${EXP6_BUILD_JOBS}" \
+  2>&1 | tee "${LOG_DIR}/cmake_build.log"
 
 if [[ "${EXP6_RUN_TESTS}" == "1" ]]; then
-  echo "[EXP6] Running tests (ctest) ..."
-  (cd "${EXP6_BUILD_DIR}" && ctest --output-on-failure)
+  log "Running tests (ctest)"
+  (cd "${BUILD_DIR}" && ctest --output-on-failure) 2>&1 | tee "${LOG_DIR}/ctest.log"
 fi
 
-# Find sjs_sweep
-SJS_SWEEP="$(find_exe "${EXP6_BUILD_DIR}" "sjs_sweep" || true)"
-[[ -n "${SJS_SWEEP}" ]] || die "Could not find built executable: sjs_sweep under ${EXP6_BUILD_DIR}"
-echo "[EXP6] Using sjs_sweep: ${SJS_SWEEP}"
+SJS_SWEEP="$(resolve_exe sjs_sweep "${BUILD_DIR}" || true)"
+[[ -n "${SJS_SWEEP}" ]] || die "Could not find executable 'sjs_sweep' under: ${BUILD_DIR}"
+log "Using sjs_sweep: ${SJS_SWEEP}"
 
 # --------------------------
-# Generate sweep config JSON (self-contained)
+# generate sweep config (JSON) -> run/temp/exp6
 # --------------------------
-
-ALPHAS_JSON="$(json_array_numbers "${EXP6_ALPHAS}")"
-TS_JSON="$(json_array_numbers "${EXP6_TS}")"
-METHODS_JSON="$(json_array_strings "${EXP6_METHODS}")"
-VARIANTS_JSON="$(json_array_strings "${EXP6_VARIANTS}")"
+ALPHAS_JSON="$(json_array_numbers_from_csv "${EXP6_ALPHAS}")"
+TS_JSON="$(json_array_numbers_from_csv "${EXP6_TS}")"
+METHODS_JSON="$(json_array_strings_from_csv "${EXP6_METHODS}")"
+VARIANTS_JSON="$(json_array_strings_from_csv "${EXP6_VARIANTS}")"
 
 SHUFFLE_STRIPS_JSON="$(json_bool "${EXP6_SHUFFLE_STRIPS}")"
 SHUFFLE_R_JSON="$(json_bool "${EXP6_SHUFFLE_R}")"
 SWAP_SIDES_JSON="$(json_bool "${EXP6_SWAP_SIDES}")"
 
-CONFIG_PATH="${GEN_DIR}/exp6_alpha_t.json"
+CONFIG_PATH="${TEMP_ROOT}/exp6_alpha_t.json"
 
 cat > "${CONFIG_PATH}" <<EOF
 {
@@ -303,7 +378,7 @@ cat > "${CONFIG_PATH}" <<EOF
     },
 
     "output": {
-      "out_dir": "${EXP6_OUT_DIR}"
+      "out_dir": "${TEMP_ROOT}"
     },
 
     "logging": {
@@ -329,212 +404,54 @@ cat > "${CONFIG_PATH}" <<EOF
 }
 EOF
 
-# Keep a copy next to results for provenance
-cp -f "${CONFIG_PATH}" "${EXP6_OUT_DIR}/exp6_alpha_t.json"
-
-echo "[EXP6] Generated sweep config: ${CONFIG_PATH}"
-echo "[EXP6] Output dir: ${EXP6_OUT_DIR}"
+log "Wrote sweep config: ${CONFIG_PATH}"
 
 # --------------------------
-# Run sweep
+# run sweep
 # --------------------------
+SWEEP_LOG="${LOG_DIR}/sjs_sweep.log"
+log "Running sweep (this can take a while depending on methods/grid)"
+log "Log: ${SWEEP_LOG}"
 
-LOG_FILE="${EXP6_OUT_DIR}/logs/sjs_sweep_$(date +"%Y%m%d_%H%M%S").log"
-echo "[EXP6] Running sweep ..."
-echo "[EXP6] Log: ${LOG_FILE}"
-
-# Run from ROOT_DIR so relative paths (if any) resolve as expected.
 (
   cd "${ROOT_DIR}"
   "${SJS_SWEEP}" --config="${CONFIG_PATH}"
-) 2>&1 | tee "${LOG_FILE}"
+) 2>&1 | tee "${SWEEP_LOG}"
 
-SUMMARY_CSV="${EXP6_OUT_DIR}/sweep_summary.csv"
-RAW_CSV="${EXP6_OUT_DIR}/sweep_raw.csv"
-
-[[ -f "${SUMMARY_CSV}" ]] || die "Missing expected output: ${SUMMARY_CSV}"
+RAW_CSV="${TEMP_ROOT}/sweep_raw.csv"
+SUMMARY_CSV="${TEMP_ROOT}/sweep_summary.csv"
 [[ -f "${RAW_CSV}" ]] || die "Missing expected output: ${RAW_CSV}"
+[[ -f "${SUMMARY_CSV}" ]] || die "Missing expected output: ${SUMMARY_CSV}"
 
-echo "[EXP6] Sweep done."
-echo "  raw:     ${RAW_CSV}"
-echo "  summary: ${SUMMARY_CSV}"
+log "Sweep done."
+log "  raw:     ${RAW_CSV}"
+log "  summary: ${SUMMARY_CSV}"
 
 # --------------------------
-# Plot (phase diagram + ratio heatmap)
+# plot (phase + ratio + adaptive_branch heatmap)
 # --------------------------
+[[ -f "${PLOT_HELPER}" ]] || die "Missing plot helper: ${PLOT_HELPER} (expected under run/include/)"
 
-PLOT_PY="${GEN_DIR}/plot_exp6.py"
-cat > "${PLOT_PY}" <<'PY'
-import csv
-import math
-import os
-import sys
-from collections import defaultdict
+log "Plotting via: ${PLOT_HELPER}"
+python3 "${PLOT_HELPER}" \
+  --summary_csv "${SUMMARY_CSV}" \
+  --raw_csv "${RAW_CSV}" \
+  --out_dir "${FIGS_DIR}" \
+  2>&1 | tee "${LOG_DIR}/plot.log"
 
-def ffloat(x, default=math.nan):
-    try:
-        return float(x)
-    except Exception:
-        return default
+# --------------------------
+# finalize -> results/raw/exp6 (overwrite)
+# --------------------------
+log "Copying artifacts to final results dir (overwrite): ${FINAL_OUT}"
+rm -rf "${FINAL_OUT}"
+mkdir -p "${FINAL_OUT}"
+cp -a "${TEMP_ROOT}/." "${FINAL_OUT}/"
 
-def fint(x, default=None):
-    try:
-        return int(x)
-    except Exception:
-        return default
-
-def read_summary(path):
-    with open(path, newline="") as f:
-        r = csv.DictReader(f)
-        return list(r)
-
-def unique_sorted(vals, key=None):
-    s = sorted(set(vals), key=key)
-    return s
-
-def write_matrix_csv(path, row_labels, col_labels, matrix):
-    with open(path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["alpha\\t"] + list(col_labels))
-        for i, a in enumerate(row_labels):
-            w.writerow([a] + list(matrix[i]))
-
-def main():
-    if len(sys.argv) < 3:
-        print("Usage: plot_exp6.py <sweep_summary.csv> <out_dir_figs>", file=sys.stderr)
-        sys.exit(2)
-
-    summary_csv = sys.argv[1]
-    figs_dir = sys.argv[2]
-    os.makedirs(figs_dir, exist_ok=True)
-
-    rows = read_summary(summary_csv)
-    if not rows:
-        print(f"Empty summary: {summary_csv}", file=sys.stderr)
-        sys.exit(1)
-
-    # Expect these columns (from sjs_sweep):
-    # alpha, t, method, variant, ok_rate, wall_median_ms
-    # We'll be robust if extra columns exist.
-    parsed = []
-    for r in rows:
-        a = ffloat(r.get("alpha"))
-        t = fint(r.get("t"))
-        method = r.get("method", "")
-        variant = r.get("variant", "")
-        ok_rate = ffloat(r.get("ok_rate"), 0.0)
-        wall_median_ms = ffloat(r.get("wall_median_ms"))
-        parsed.append((method, a, t, variant, ok_rate, wall_median_ms))
-
-    methods = unique_sorted([m for (m, *_rest) in parsed if m])
-
-    # Try importing matplotlib only if needed
-    try:
-        import matplotlib.pyplot as plt
-    except Exception as e:
-        print("[plot_exp6] matplotlib not available. Will write CSV matrices only.")
-        plt = None
-
-    for method in methods:
-        sub = [(a, t, v, ok, tm) for (m, a, t, v, ok, tm) in parsed if m == method]
-        if not sub:
-            continue
-
-        alphas = unique_sorted([a for (a, *_rest) in sub], key=float)
-        ts = unique_sorted([t for (_a, t, *_rest) in sub], key=int)
-
-        # time[(alpha,t,variant)] = median_ms if ok_rate==1 else NaN
-        time = {}
-        for a, t, v, ok, tm in sub:
-            if ok >= 1.0:
-                time[(a, t, v)] = tm
-            else:
-                time[(a, t, v)] = math.nan
-
-        # Build matrices: winner (0/1/2) and ratio
-        variants = ["sampling", "enum_sampling", "adaptive"]
-
-        winner_mat = [[-1 for _ in ts] for _ in alphas]
-        ratio_mat = [[math.nan for _ in ts] for _ in alphas]
-
-        for i, a in enumerate(alphas):
-            for j, t in enumerate(ts):
-                vals = []
-                for v in variants:
-                    vals.append(time.get((a, t, v), math.nan))
-
-                # winner among available finite vals
-                best_idx = -1
-                best_val = math.inf
-                for k, x in enumerate(vals):
-                    if x is None or math.isnan(x):
-                        continue
-                    if x < best_val:
-                        best_val = x
-                        best_idx = k
-                winner_mat[i][j] = best_idx
-
-                # ratio
-                adaptive = vals[2]
-                denom = math.inf
-                for x in (vals[0], vals[1]):
-                    if x is None or math.isnan(x):
-                        continue
-                    denom = min(denom, x)
-                if adaptive is not None and not math.isnan(adaptive) and denom != math.inf:
-                    ratio_mat[i][j] = adaptive / denom
-                else:
-                    ratio_mat[i][j] = math.nan
-
-        # Write CSV matrices (always)
-        winner_csv = os.path.join(figs_dir, f"exp6_phase_winner_{method}.csv")
-        ratio_csv  = os.path.join(figs_dir, f"exp6_ratio_{method}.csv")
-        write_matrix_csv(winner_csv, [str(a) for a in alphas], [str(t) for t in ts], winner_mat)
-        write_matrix_csv(ratio_csv,  [str(a) for a in alphas], [str(t) for t in ts], ratio_mat)
-
-        if plt is None:
-            print(f"[plot_exp6] Wrote CSV only (no PNG): {winner_csv}, {ratio_csv}")
-            continue
-
-        # Phase diagram (imshow)
-        plt.figure()
-        plt.imshow(winner_mat, aspect="auto", interpolation="nearest")
-        plt.yticks(range(len(alphas)), [str(a) for a in alphas])
-        plt.xticks(range(len(ts)), [str(t) for t in ts], rotation=45, ha="right")
-        plt.xlabel("t")
-        plt.ylabel("alpha")
-        plt.title(f"EXP-6 Phase diagram (winner: 0 sampling / 1 enum_sampling / 2 adaptive) — method={method}")
-        plt.colorbar()
-        plt.tight_layout()
-        plt.savefig(os.path.join(figs_dir, f"exp6_phase_{method}.png"), dpi=200)
-
-        # Ratio heatmap
-        plt.figure()
-        plt.imshow(ratio_mat, aspect="auto", interpolation="nearest")
-        plt.yticks(range(len(alphas)), [str(a) for a in alphas])
-        plt.xticks(range(len(ts)), [str(t) for t in ts], rotation=45, ha="right")
-        plt.xlabel("t")
-        plt.ylabel("alpha")
-        plt.title(f"EXP-6 ratio = T(adaptive)/min(T(sampling),T(enum_sampling)) — method={method}")
-        plt.colorbar()
-        plt.tight_layout()
-        plt.savefig(os.path.join(figs_dir, f"exp6_ratio_{method}.png"), dpi=200)
-
-        print(f"[plot_exp6] Wrote PNGs and CSVs for method={method} into {figs_dir}")
-
-    print("[plot_exp6] done.")
-
-if __name__ == "__main__":
-    main()
-PY
-
-echo "[EXP6] Plotting ..."
-python3 "${PLOT_PY}" "${SUMMARY_CSV}" "${EXP6_OUT_DIR}/figs"
-
-echo "[EXP6] DONE ✅"
-echo "Results:"
-echo "  ${EXP6_OUT_DIR}/sweep_raw.csv"
-echo "  ${EXP6_OUT_DIR}/sweep_summary.csv"
-echo "Figures:"
-echo "  ${EXP6_OUT_DIR}/figs/exp6_phase_<method>.png"
-echo "  ${EXP6_OUT_DIR}/figs/exp6_ratio_<method>.png"
+log "DONE ✅"
+log "Final results: ${FINAL_OUT}"
+log "Key files:"
+log "  ${FINAL_OUT}/sweep_raw.csv"
+log "  ${FINAL_OUT}/sweep_summary.csv"
+log "  ${FINAL_OUT}/figs/exp6_phase_<method>.png (if matplotlib)"
+log "  ${FINAL_OUT}/figs/exp6_ratio_<method>.png (if matplotlib)"
+log "  ${FINAL_OUT}/figs/exp6_adaptive_branch_<method>.png (if raw supports adaptive_branch)"
