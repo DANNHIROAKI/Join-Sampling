@@ -310,7 +310,7 @@ log "Summary : ${OUT_DIR}/${SUMMARY_FILE}"
 # ----------------------------
 if [[ "${DO_PLOT}" -eq 1 ]]; then
   if command -v python3 >/dev/null 2>&1; then
-    PLOT_SCRIPT="${REPO_ROOT}/run/plot_exp2.py"
+    PLOT_SCRIPT="${REPO_ROOT}/run/include/plot_exp2.py"
     [[ -f "${PLOT_SCRIPT}" ]] || die "Missing plot script: ${PLOT_SCRIPT}"
 
     log "Generating plots via: ${PLOT_SCRIPT}"
