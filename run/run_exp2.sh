@@ -3,19 +3,22 @@
 #
 # EXP-2：Runtime vs t（对应 RQ2）
 #
-# 本脚本需与 Docs/Experiment/EXP-2.md 的表述/原理/思想严格对齐：
-#   - 固定同一数据集 R,S 与固定密度参数 alpha
-#   - 只 sweep t（典型：1k → 1M；具体列表由 config/sweeps/sweep_t.json 决定）
-#   - 对每个 method × variant（sampling / enum_sampling / adaptive）运行 sweep
-#   - 主指标：端到端 wall-clock 时间（summary 中按 method×variant×t 聚合 median/p95/stdev 等）
-#   - 公平性：默认单线程（--threads=1）并默认关闭 write_samples（--write_samples=0）避免 I/O 噪声
+# 这份脚本是为了解决 EXP-2 常见“结果不够理想”的三个真实原因：
+#   (i) repeats 太少 → p95 不稳 / Δruntime 出现负值 / 曲线噪声很大
+#  (ii) j_star 设得过大 → adaptive 永远 enumerate_all，看不出随 t 的 scaling
+# (iii) 线程/写样本等口径没有被强制覆盖 → 计时口径不纯或不可复现
 #
-# 统一目录规范（对齐你的全局要求）：
+# 关键改动（默认值更“论文友好”）：
+#   - repeats 默认=10（使 p95 有意义；曲线更平滑）
+#   - j_star 默认=100000（对 config/sweeps/sweep_t.json 的默认 |J|=200000，
+#                        会触发 adaptive 的 fallback_sampling 分支，从而看到随 t 增长）
+#   - 使用 jq 在 TEMP_DIR 内生成“patched sweep config”，确保 overrides 真正生效。
+#
+# 统一目录规范：
 #   1) Build 统一放在 <repo_root>/build/<type>/ 下（默认 Release -> build/release）
 #   2) 运行产生的日志/中间文件/CSV/图，先写到 <repo_root>/run/temp/exp2/
 #   3) 成功后将 <repo_root>/run/temp/exp2/ 覆盖同步到 <repo_root>/results/raw/exp2/
 #   4) Bash 内不包含任何“内嵌 Python”（不使用 python -c / heredoc）
-#   5) 本脚本运行产生的 json/csv/png/pdf/log 等“必要文件”均先落到 run/temp/exp2
 #
 # 用法：
 #   bash run/run_exp2.sh
@@ -26,12 +29,12 @@
 #   --clean                 删除 build/<type> 后重建
 #   --no-build              跳过构建（假设 sjs_sweep 已存在于 build/<type>）
 #   --no-plot               跳过绘图（仍生成 sweep_raw.csv / sweep_summary.csv）
-#   --threads <int>         覆盖 sweep.json 的 sys.threads（默认：1）
-#   --write_samples <0|1>   覆盖 sweep.json 的 run.write_samples（默认：0）
-#
-# 注意：
-#   - 本实验的最终结果目录固定为 results/raw/exp2（成功后覆盖旧结果），不提供 --out_dir。
-#   - 若要调整数据/alpha/t 列表/方法集合/重复次数等，请编辑 sweep_t.json。
+#   --threads <int>         覆盖 base.sys.threads（默认：1）
+#   --write_samples <0|1>   覆盖 base.run.write_samples（默认：0）
+#   --repeats <int>         覆盖 base.run.repeats（默认：10）
+#   --j_star <u64>          覆盖 base.run.j_star（默认：100000）
+#   --plot_error <auto|p95|stdev>
+#                           绘图误差条策略（默认：auto；repeats>=10 用 p95，否则 stdev）
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -56,22 +59,24 @@ Usage:
   bash run/run_exp2.sh [options]
 
 Options:
-  --config <path>         Sweep JSON (default: config/sweeps/sweep_t.json)
-  --build_type <type>     Release|Debug|RelWithDebInfo|MinSizeRel (default: Release)
-  --clean                 Remove build/<type> before building
-  --no-build              Skip build step
-  --no-plot               Skip plotting step
-  --threads <int>         Override sys.threads (default: 1)
-  --write_samples <0|1>   Override run.write_samples (default: 0)
-  -h, --help              Show help
+  --config <path>              Sweep JSON (default: config/sweeps/sweep_t.json)
+  --build_type <type>          Release|Debug|RelWithDebInfo|MinSizeRel (default: Release)
+  --clean                      Remove build/<type> before building
+  --no-build                   Skip build step
+  --no-plot                    Skip plotting step
+  --threads <int>              Override base.sys.threads (default: 1)
+  --write_samples <0|1>        Override base.run.write_samples (default: 0)
+  --repeats <int>              Override base.run.repeats (default: 10)
+  --j_star <u64>               Override base.run.j_star (default: 100000)
+  --plot_error <auto|p95|stdev>Plot error bars policy (default: auto)
+  -h, --help                   Show help
 
 Outputs (fixed):
-  - Temp (always overwritten):  <repo_root>/run/temp/exp2/
+  - Temp (always overwritten):    <repo_root>/run/temp/exp2/
   - Final (overwritten on success): <repo_root>/results/raw/exp2/
 EOF
 }
 
-# Determine CPU parallelism (portable-ish)
 nproc_safe() {
   if command -v nproc >/dev/null 2>&1; then
     nproc
@@ -96,7 +101,6 @@ find_exe() {
   local build_dir="$1"
   local name="$2"
 
-  # Fast paths.
   if [[ -x "${build_dir}/${name}" ]]; then
     echo "${build_dir}/${name}"
     return
@@ -106,11 +110,26 @@ find_exe() {
     return
   fi
 
-  # Fallback: search.
   local p
   p="$(find "${build_dir}" -type f -name "${name}" -perm -111 2>/dev/null | head -n 1 || true)"
   [[ -n "${p}" ]] || die "Cannot find executable '${name}' under ${build_dir}. Did the build succeed?"
   echo "${p}"
+}
+
+to_bool_json() {
+  # prints: true/false
+  if [[ "$1" == "1" ]]; then
+    echo "true"
+  else
+    echo "false"
+  fi
+}
+
+awk_col_idx() {
+  # Usage: awk_col_idx <csv_file> <column_name>
+  local file="$1"
+  local col="$2"
+  awk -F',' -v c="${col}" 'NR==1{for(i=1;i<=NF;i++){if($i==c){print i; exit}}}' "${file}"
 }
 
 # ----------------------------
@@ -120,12 +139,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # ----------------------------
-# Defaults (aligned with EXP-2.md)
+# Defaults (more stable for EXP-2)
 # ----------------------------
 CONFIG="config/sweeps/sweep_t.json"
 BUILD_TYPE="Release"
 THREADS=1
 WRITE_SAMPLES=0
+REPEATS=10
+J_STAR=100000
+PLOT_ERROR="auto"
 
 DO_CLEAN=0
 DO_BUILD=1
@@ -140,6 +162,9 @@ while [[ $# -gt 0 ]]; do
     --build_type)    BUILD_TYPE="$2"; shift 2;;
     --threads)       THREADS="$2"; shift 2;;
     --write_samples) WRITE_SAMPLES="$2"; shift 2;;
+    --repeats)       REPEATS="$2"; shift 2;;
+    --j_star)        J_STAR="$2"; shift 2;;
+    --plot_error)    PLOT_ERROR="$2"; shift 2;;
     --clean)         DO_CLEAN=1; shift;;
     --no-build)      DO_BUILD=0; shift;;
     --no-plot)       DO_PLOT=0; shift;;
@@ -148,12 +173,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Resolve CONFIG relative to repo root (no embedded Python).
 if [[ "${CONFIG}" != /* ]]; then
   CONFIG="${REPO_ROOT}/${CONFIG}"
 fi
 
-# Fixed directories (per your global requirements).
+# Fixed directories (aligned with your global requirements).
 TEMP_DIR="${REPO_ROOT}/run/temp/exp2"
 RESULT_DIR="${REPO_ROOT}/results/raw/exp2"
 
@@ -166,6 +190,9 @@ BUILD_DIR="${REPO_ROOT}/build/${BUILD_SUBDIR}"
 need_cmd cmake
 need_cmd tee
 need_cmd find
+need_cmd jq
+need_cmd awk
+need_cmd sort
 
 [[ -f "${CONFIG}" ]] || die "Sweep config not found: ${CONFIG}"
 [[ -f "${REPO_ROOT}/CMakeLists.txt" ]] || die "CMakeLists.txt not found at repo root: ${REPO_ROOT}"
@@ -176,6 +203,15 @@ fi
 if [[ "${WRITE_SAMPLES}" != "0" && "${WRITE_SAMPLES}" != "1" ]]; then
   die "--write_samples must be 0 or 1 (got: '${WRITE_SAMPLES}')"
 fi
+if ! [[ "${REPEATS}" =~ ^[0-9]+$ ]] || [[ "${REPEATS}" -le 0 ]]; then
+  die "--repeats must be a positive integer (got: '${REPEATS}')"
+fi
+if ! [[ "${J_STAR}" =~ ^[0-9]+$ ]]; then
+  die "--j_star must be a non-negative integer (got: '${J_STAR}')"
+fi
+if [[ "${PLOT_ERROR}" != "auto" && "${PLOT_ERROR}" != "p95" && "${PLOT_ERROR}" != "stdev" ]]; then
+  die "--plot_error must be auto|p95|stdev (got: '${PLOT_ERROR}')"
+fi
 
 # Clean temp (always overwrite temp).
 rm -rf "${TEMP_DIR}"
@@ -183,35 +219,72 @@ mkdir -p "${TEMP_DIR}/logs"
 
 TS="$(date +%Y%m%d_%H%M%S)"
 
-log "Repo root      : ${REPO_ROOT}"
-log "Sweep config   : ${CONFIG}"
-log "Build type     : ${BUILD_TYPE}"
-log "Build dir      : ${BUILD_DIR}"
-log "Threads        : ${THREADS}"
-log "write_samples  : ${WRITE_SAMPLES}"
-log "Temp dir       : ${TEMP_DIR}"
-log "Final results  : ${RESULT_DIR} (will be overwritten on success)"
+log "Repo root     : ${REPO_ROOT}"
+log "Config (in)   : ${CONFIG}"
+log "Build type    : ${BUILD_TYPE}"
+log "Build dir     : ${BUILD_DIR}"
+log "Threads       : ${THREADS}"
+log "write_samples : ${WRITE_SAMPLES}"
+log "repeats       : ${REPEATS}"
+log "j_star        : ${J_STAR}"
+log "plot_error    : ${PLOT_ERROR}"
+log "Temp dir      : ${TEMP_DIR}"
+log "Final results : ${RESULT_DIR} (will be overwritten on success)"
 
-# Force single-thread behavior for common libs (fairness + reproducibility).
+# Force single-thread behavior for common libs.
 export OMP_NUM_THREADS="${THREADS}"
 export MKL_NUM_THREADS="${THREADS}"
 export OPENBLAS_NUM_THREADS="${THREADS}"
 export VECLIB_MAXIMUM_THREADS="${THREADS}"
 export NUMEXPR_NUM_THREADS="${THREADS}"
 
-# Keep an immutable copy of the sweep config for provenance.
-cp -f "${CONFIG}" "${TEMP_DIR}/sweep_t_used.json"
+# ----------------------------
+# Patch sweep config (so overrides REALLY take effect)
+# ----------------------------
+ORIG_CFG_COPY="${TEMP_DIR}/sweep_t_original.json"
+PATCHED_CFG="${TEMP_DIR}/sweep_t_used.json"
+
+cp -f "${CONFIG}" "${ORIG_CFG_COPY}"
+
+WRITE_SAMPLES_BOOL="$(to_bool_json "${WRITE_SAMPLES}")"
+
+jq \
+  --argjson repeats "${REPEATS}" \
+  --argjson j_star "${J_STAR}" \
+  --argjson threads "${THREADS}" \
+  --argjson write_samples "${WRITE_SAMPLES_BOOL}" \
+  --arg ts "${TS}" \
+  '.base.run.repeats = $repeats
+   | .base.run.j_star = $j_star
+   | .base.sys.threads = $threads
+   | .base.run.write_samples = $write_samples
+   | .sweep.repeats = $repeats
+   | .meta.patch = {
+        "timestamp": $ts,
+        "patched_by": "run/run_exp2.sh",
+        "overrides": {
+          "repeats": $repeats,
+          "j_star": $j_star,
+          "threads": $threads,
+          "write_samples": $write_samples
+        }
+     }
+  ' "${ORIG_CFG_COPY}" > "${PATCHED_CFG}"
 
 # Save environment + manifest.
 {
   echo "EXP-2 manifest"
   echo "timestamp=${TS}"
   echo "repo_root=${REPO_ROOT}"
-  echo "config=${CONFIG}"
+  echo "config_in=${CONFIG}"
+  echo "config_used=${PATCHED_CFG}"
   echo "build_type=${BUILD_TYPE}"
   echo "build_dir=${BUILD_DIR}"
   echo "threads=${THREADS}"
   echo "write_samples=${WRITE_SAMPLES}"
+  echo "repeats=${REPEATS}"
+  echo "j_star=${J_STAR}"
+  echo "plot_error=${PLOT_ERROR}"
   echo "temp_dir=${TEMP_DIR}"
   echo "result_dir=${RESULT_DIR}"
 } > "${TEMP_DIR}/MANIFEST.txt"
@@ -219,29 +292,30 @@ cp -f "${CONFIG}" "${TEMP_DIR}/sweep_t_used.json"
 {
   echo "timestamp=${TS}"
   echo "repo_root=${REPO_ROOT}"
-  echo "config=${CONFIG}"
+  echo "config_in=${CONFIG}"
+  echo "config_used=${PATCHED_CFG}"
   echo "build_dir=${BUILD_DIR}"
   echo "temp_dir=${TEMP_DIR}"
   echo "threads=${THREADS}"
   echo "write_samples=${WRITE_SAMPLES}"
+  echo "repeats=${REPEATS}"
+  echo "j_star=${J_STAR}"
   echo
-  echo "uname:"
-  uname -a || true
+  echo "uname:"; uname -a || true
   echo
-  echo "compiler:"
-  (c++ --version || g++ --version || clang++ --version) 2>/dev/null || true
+  echo "compiler:"; (c++ --version || g++ --version || clang++ --version) 2>/dev/null || true
   echo
-  echo "cmake:"
-  cmake --version 2>/dev/null || true
+  echo "cmake:"; cmake --version 2>/dev/null || true
+  echo
+  echo "jq:"; jq --version 2>/dev/null || true
   echo
   if command -v git >/dev/null 2>&1 && [[ -d "${REPO_ROOT}/.git" ]]; then
-    echo "git:"
-    (cd "${REPO_ROOT}" && git rev-parse HEAD && git status --porcelain) || true
+    echo "git:"; (cd "${REPO_ROOT}" && git rev-parse HEAD && git status --porcelain) || true
   fi
 } > "${TEMP_DIR}/logs/env.txt"
 
 # ----------------------------
-# Build (Release by default)
+# Build
 # ----------------------------
 if [[ "${DO_BUILD}" -eq 1 ]]; then
   if [[ "${DO_CLEAN}" -eq 1 ]]; then
@@ -269,25 +343,22 @@ SJS_SWEEP="$(find_exe "${BUILD_DIR}" "sjs_sweep")"
 log "Using sjs_sweep: ${SJS_SWEEP}"
 
 # ----------------------------
-# Run EXP-2 sweep
+# Run sweep
 # ----------------------------
-OUT_DIR="${TEMP_DIR}"  # sweep outputs (raw/summary + plots) land directly in temp
+OUT_DIR="${TEMP_DIR}"  # outputs land directly here
 RAW_FILE="sweep_raw.csv"
 SUMMARY_FILE="sweep_summary.csv"
 
 log "Running sweep (methods × variants × t × repeats)..."
-log "Command: ${SJS_SWEEP} --config ${CONFIG} --out_dir ${OUT_DIR} --threads=${THREADS} --write_samples=${WRITE_SAMPLES}"
+log "Config used: ${PATCHED_CFG}"
 
-# Run from repo root so relative paths in JSON resolve as expected.
 pushd "${REPO_ROOT}" >/dev/null
 set +e
 "${SJS_SWEEP}" \
-  --config="${CONFIG}" \
+  --config="${PATCHED_CFG}" \
   --out_dir="${OUT_DIR}" \
   --raw_file="${RAW_FILE}" \
   --summary_file="${SUMMARY_FILE}" \
-  --threads="${THREADS}" \
-  --write_samples="${WRITE_SAMPLES}" \
   2>&1 | tee "${TEMP_DIR}/logs/sjs_sweep.log"
 rc="${PIPESTATUS[0]}"
 set -e
@@ -297,7 +368,6 @@ if [[ "${rc}" -ne 0 ]]; then
   die "sjs_sweep failed with exit code ${rc}. See ${TEMP_DIR}/logs/sjs_sweep.log"
 fi
 
-# Basic output checks (must exist per EXP-2.md)
 [[ -f "${OUT_DIR}/${RAW_FILE}" ]] || die "Missing expected output: ${OUT_DIR}/${RAW_FILE}"
 [[ -f "${OUT_DIR}/${SUMMARY_FILE}" ]] || die "Missing expected output: ${OUT_DIR}/${SUMMARY_FILE}"
 
@@ -306,16 +376,49 @@ log "Raw     : ${OUT_DIR}/${RAW_FILE}"
 log "Summary : ${OUT_DIR}/${SUMMARY_FILE}"
 
 # ----------------------------
-# (Optional) Plot
+# Post-checks (fast sanity)
+# ----------------------------
+SUM_PATH="${OUT_DIR}/${SUMMARY_FILE}"
+RAW_PATH="${OUT_DIR}/${RAW_FILE}"
+
+idx_ok="$(awk_col_idx "${SUM_PATH}" "ok_rate")"
+idx_rep="$(awk_col_idx "${SUM_PATH}" "repeats")"
+idx_cnt="$(awk_col_idx "${SUM_PATH}" "count_mean")"
+
+if [[ -n "${idx_ok}" && -n "${idx_rep}" ]]; then
+  uniq_repeats="$(awk -F',' -v okc="${idx_ok}" -v rc="${idx_rep}" 'NR>1 && $okc==1 {print $rc}' "${SUM_PATH}" | sort -u | tr '\n' ' ')"
+  log "Summary ok points repeats values: ${uniq_repeats:-<none>}"
+fi
+
+if [[ -n "${idx_ok}" && -n "${idx_cnt}" ]]; then
+  cnt_minmax="$(awk -F',' -v okc="${idx_ok}" -v cc="${idx_cnt}" 'NR>1 && $okc==1 {v=$cc; if(min==""||v<min)min=v; if(max==""||v>max)max=v} END{if(min!="")printf("min=%s max=%s",min,max)}' "${SUM_PATH}")"
+  log "count_mean over ok points: ${cnt_minmax:-<none>}"
+fi
+
+# Adaptive branch stats (from raw)
+idx_raw_ok="$(awk_col_idx "${RAW_PATH}" "ok")"
+idx_raw_var="$(awk_col_idx "${RAW_PATH}" "variant")"
+idx_raw_branch="$(awk_col_idx "${RAW_PATH}" "adaptive_branch")"
+
+if [[ -n "${idx_raw_ok}" && -n "${idx_raw_var}" && -n "${idx_raw_branch}" ]]; then
+  branch_stats="$(awk -F',' -v okc="${idx_raw_ok}" -v vc="${idx_raw_var}" -v bc="${idx_raw_branch}" 'NR>1 && $okc==1 && $vc=="adaptive" {cnt[$bc]++} END{for(k in cnt){printf("%s:%d ",k,cnt[k])}}' "${RAW_PATH}")"
+  log "Adaptive branches (ok runs): ${branch_stats:-<none>}"
+fi
+
+# ----------------------------
+# Plot
 # ----------------------------
 if [[ "${DO_PLOT}" -eq 1 ]]; then
   if command -v python3 >/dev/null 2>&1; then
+    # Prefer new location; fall back for legacy repos.
     PLOT_SCRIPT="${REPO_ROOT}/run/include/exp2_plot.py"
-    [[ -f "${PLOT_SCRIPT}" ]] || die "Missing plot script: ${PLOT_SCRIPT}"
+    if [[ ! -f "${PLOT_SCRIPT}" ]]; then
+      PLOT_SCRIPT="${REPO_ROOT}/run/plot_exp2.py"
+    fi
+    [[ -f "${PLOT_SCRIPT}" ]] || die "Missing plot script at run/include/exp2_plot.py or run/plot_exp2.py"
 
     log "Generating plots via: ${PLOT_SCRIPT}"
-    # Note: plots are written into OUT_DIR (= run/temp/exp2)
-    python3 "${PLOT_SCRIPT}" --out_dir "${OUT_DIR}" --t0 1000 --error p95 \
+    python3 "${PLOT_SCRIPT}" --out_dir "${OUT_DIR}" --t0 1000 --error "${PLOT_ERROR}" \
       2>&1 | tee "${TEMP_DIR}/logs/plot_exp2.log"
   else
     log "python3 not found; skipping plot step."
