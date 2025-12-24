@@ -41,3 +41,7 @@ Testing/
 /results/summary/*
 !/results/raw/.gitkeep
 !/results/summary/.gitkeep
+
+
+# Run Temp
+/run/temp/*
