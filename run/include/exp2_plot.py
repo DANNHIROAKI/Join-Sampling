@@ -1,30 +1,40 @@
 #!/usr/bin/env python3
 """exp2_plot.py
 
-EXP-2 plotting (Runtime vs t) with more "paper-friendly" defaults.
+Paper-friendly plotting for EXP-2 (Runtime vs t).
 
-Compared to the earlier version, this script addresses the two most common
-EXP-2 presentation pitfalls:
+This version is designed to produce *publication-ready* figures with **minimal**
+plots while staying faithful to the raw measurements.
 
-  1) repeats 太少却画 p95：
-     - supports --error=auto (default)
-     - auto picks p95 if repeats>=10, otherwise stdev
+Key improvements over the original script:
+  1) Warmup exclusion (fixes cold-start bias / negative Δruntime artifacts):
+       - pass --warmup_reps K to drop rep=0..K-1 from all plotted statistics.
+       - NOTE: this assumes rep is 0-based and consecutive (as produced by sjs_sweep).
 
-  2) Δruntime 噪声大、甚至出现负值：
-     - Δruntime is computed from sweep_raw.csv **per rep** by subtracting the
-       matched baseline run at t0 (same method, variant, rep).
-     - then we aggregate deltas with median/p95/stdev.
+  2) Plot from sweep_raw.csv (not sweep_summary.csv):
+       - ensures the warmup policy is respected (summary includes warmup by design).
+       - avoids any summary/plot mismatch when we intentionally change repeats.
+
+  3) Robust sample-phase extraction:
+       - supports a wider set of phases_json keys (including adaptive fallback names)
+       - plus a conservative heuristic fallback for unknown key names.
+
+  4) Fewer, cleaner plots (default --mode=paper):
+       - exp2_paper_runtime_vs_t.(pdf|png): 1 figure with 3 panels (sampling / enum_sampling / adaptive)
+       - exp2_paper_delta_vs_t.(pdf|png): 1 figure with 3 panels (symlog-y; readable even with huge outliers)
+       - exp2_ns_per_sample.csv: slope table (from sample-phase medians)
 
 Inputs (under --out_dir):
-  sweep_summary.csv
   sweep_raw.csv
+  sweep_summary.csv (optional; only used for sanity checks / metadata)
 
 Outputs (written into --out_dir):
-  exp2_runtime_vs_t_<variant>.pdf/.png
-  exp2_delta_runtime_vs_t_<variant>.pdf/.png
-  exp2_sample_phase_vs_t_<variant>.pdf/.png
+  exp2_paper_runtime_vs_t.pdf/.png
+  exp2_paper_delta_vs_t.pdf/.png
   exp2_ns_per_sample.csv
   EXP2_README.txt
+
+Optional: --mode=full also writes the per-variant figures (similar to the original script).
 """
 
 from __future__ import annotations
@@ -36,9 +46,12 @@ import math
 import os
 import statistics
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
+# ----------------------------
+# Small helpers
+# ----------------------------
 def to_int(x: str, default: int = 0) -> int:
     try:
         return int(float(x))
@@ -53,23 +66,23 @@ def to_float(x: str, default: float = float("nan")) -> float:
         return default
 
 
-def percentile_linear(vals: List[float], p: float) -> float:
+def percentile_linear(vals: Sequence[float], p: float) -> float:
     """Linear interpolation percentile. p in [0,1]."""
     if not vals:
         return float("nan")
-    vals = sorted(vals)
-    if len(vals) == 1:
-        return vals[0]
-    pos = p * (len(vals) - 1)
+    xs = sorted(vals)
+    if len(xs) == 1:
+        return xs[0]
+    pos = p * (len(xs) - 1)
     lo = int(math.floor(pos))
     hi = int(math.ceil(pos))
     if lo == hi:
-        return vals[lo]
+        return xs[lo]
     w = pos - lo
-    return vals[lo] * (1 - w) + vals[hi] * w
+    return xs[lo] * (1 - w) + xs[hi] * w
 
 
-def safe_stdev(vals: List[float]) -> float:
+def safe_stdev(vals: Sequence[float]) -> float:
     if len(vals) < 2:
         return 0.0
     return statistics.stdev(vals)
@@ -80,48 +93,85 @@ def ensure_file(path: str) -> None:
         raise FileNotFoundError(path)
 
 
+def split_csv_list(s: str) -> List[str]:
+    s = (s or "").strip()
+    if not s:
+        return []
+    parts = []
+    for p in s.split(","):
+        p = p.strip()
+        if p:
+            parts.append(p)
+    return parts
+
+
+# ----------------------------
+# CLI
+# ----------------------------
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out_dir", required=True, help="EXP-2 output directory containing sweep_raw.csv and sweep_summary.csv")
-    ap.add_argument("--t0", type=int, default=1000, help="Baseline t0 for Δruntime plot (default: 1000)")
+    ap.add_argument("--out_dir", required=True, help="EXP-2 output directory containing sweep_raw.csv")
+    ap.add_argument("--t0", type=int, default=10000, help="Baseline t0 for Δruntime plot (default: 10000)")
     ap.add_argument(
         "--error",
         choices=["auto", "p95", "stdev"],
         default="auto",
         help="Error bar type (default: auto => p95 if repeats>=10 else stdev)",
     )
+    ap.add_argument(
+        "--warmup_reps",
+        type=int,
+        default=0,
+        help="Exclude rep < warmup_reps from all plotted stats (default: 0). Useful if the runner adds warmup.",
+    )
+    ap.add_argument(
+        "--mode",
+        choices=["paper", "full"],
+        default="paper",
+        help="paper: 2 concise paper-ready figures; full: also output per-variant diagnostics.",
+    )
+    ap.add_argument(
+        "--topk",
+        type=int,
+        default=6,
+        help="In paper mode, plot only the top-K fastest methods (ranked on sampling @ max t), plus always_include.",
+    )
+    ap.add_argument(
+        "--always_include",
+        default="ours",
+        help="Comma list of methods that must always be included in paper plots (default: ours)",
+    )
+    ap.add_argument(
+        "--paper_methods",
+        default="",
+        help="If non-empty, use exactly this comma-list of methods for paper plots (overrides topk ranking).",
+    )
+    ap.add_argument(
+        "--exclude_methods",
+        default="",
+        help="Comma list of methods to exclude from plots (e.g., rejection).",
+    )
     return ap.parse_args()
 
 
-def read_summary(summary_path: str) -> List[Dict[str, str]]:
-    """Read sweep_summary.csv and keep only fully successful points."""
-    rows: List[Dict[str, str]] = []
-    with open(summary_path, newline="") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            ok_rate = to_float(row.get("ok_rate", "0"), 0.0)
-            if ok_rate < 1.0:
-                continue
-            wall_med = to_float(row.get("wall_median_ms", "-1"), -1.0)
-            if wall_med <= 0:
-                continue
-            rows.append(row)
-    return rows
-
-
-@dataclass
-class DeltaAgg:
+# ----------------------------
+# Data model
+# ----------------------------
+@dataclass(frozen=True)
+class Agg:
     variant: str
     method: str
     t: int
     n: int
-    median_ms: float
-    p95_ms: float
-    stdev_ms: float
-    t0_used: int
+    median: float
+    p95: float
+    stdev: float
 
 
-def read_raw_wall(raw_path: str) -> List[Dict[str, str]]:
+# ----------------------------
+# Read sweep_raw.csv
+# ----------------------------
+def read_raw_rows(raw_path: str, warmup_reps: int) -> List[Dict[str, str]]:
     rows: List[Dict[str, str]] = []
     with open(raw_path, newline="") as f:
         r = csv.DictReader(f)
@@ -129,189 +179,226 @@ def read_raw_wall(raw_path: str) -> List[Dict[str, str]]:
             ok = to_int(row.get("ok", "0"), 0)
             if ok != 1:
                 continue
-            wall = to_float(row.get("wall_ms", "-1"), -1.0)
-            if wall <= 0:
+            rep = to_int(row.get("rep", "0"), 0)
+            if rep < warmup_reps:
                 continue
+
+            t = to_int(row.get("t", "0"), 0)
+            if t <= 0:
+                continue
+            wall = to_float(row.get("wall_ms", "nan"))
+            if math.isnan(wall) or wall <= 0:
+                continue
+
+            # Keep as-is (strings); we parse fields on demand.
             rows.append(row)
     return rows
 
 
-def choose_error_mode(summary_rows: List[Dict[str, str]], requested: str) -> str:
+def choose_error_mode(aggs: List[Agg], requested: str) -> str:
     if requested != "auto":
         return requested
-    # If repeats is missing, default to stdev.
-    reps: List[int] = []
-    for r in summary_rows:
-        reps.append(to_int(r.get("repeats", "0"), 0))
-    min_rep = min(reps) if reps else 0
-    # Use p95 only if it is meaningful.
-    if min_rep >= 10:
-        # also require p95 column to be present and valid
-        any_valid = False
-        for r in summary_rows:
-            p95 = to_float(r.get("wall_p95_ms", "nan"))
-            if not math.isnan(p95) and p95 > 0:
-                any_valid = True
-                break
-        if any_valid:
-            return "p95"
+    # p95 needs enough repeats per point to be meaningful.
+    min_n = min((a.n for a in aggs), default=0)
+    if min_n >= 10:
+        return "p95"
     return "stdev"
 
 
-def get_yerr_summary(row: Dict[str, str], mode: str) -> Tuple[float, float]:
-    """Upper-only errorbar: return (lower, upper)."""
-    if mode == "stdev":
-        err = max(0.0, to_float(row.get("wall_stdev_ms", "0"), 0.0))
-        return (0.0, err)
-    # p95
-    med = to_float(row.get("wall_median_ms", "nan"))
-    p95 = to_float(row.get("wall_p95_ms", "nan"))
-    if math.isnan(med) or math.isnan(p95):
-        return (0.0, 0.0)
-    return (0.0, max(0.0, p95 - med))
+def aggregate_wall(rows: List[Dict[str, str]]) -> List[Agg]:
+    grouped: Dict[Tuple[str, str, int], List[float]] = {}
+    for row in rows:
+        variant = row.get("variant", "")
+        method = row.get("method", "")
+        t = to_int(row.get("t", "0"), 0)
+        wall = to_float(row.get("wall_ms", "nan"))
+        if t <= 0 or math.isnan(wall) or wall <= 0:
+            continue
+        grouped.setdefault((variant, method, t), []).append(wall)
+
+    out: List[Agg] = []
+    for (variant, method, t), vals in grouped.items():
+        out.append(
+            Agg(
+                variant=variant,
+                method=method,
+                t=t,
+                n=len(vals),
+                median=statistics.median(vals),
+                p95=percentile_linear(vals, 0.95),
+                stdev=safe_stdev(vals),
+            )
+        )
+    return out
 
 
-def compute_delta_from_raw(raw_rows: List[Dict[str, str]], t0: int) -> List[DeltaAgg]:
-    """Compute Δwall per (variant,method,t) by matching baseline at t0 per rep."""
-    # Key baseline: (variant, method, rep) -> wall_ms at t0_used
-    # We may need to fall back to min t if requested t0 not present.
+# ----------------------------
+# Robust sample-phase extraction
+# ----------------------------
+_PHASE_KEYS_PRIORITY: Tuple[str, ...] = (
+    # Common
+    "run_sample_ms",
+    "sample_ms",
+    "phase3_sample_ms",
+    "phase3_ms",
+    # Adaptive/fallback variants (common names seen in practice)
+    "run_fallback_sample_ms",
+    "fallback_sample_ms",
+    "fallback_sampling_ms",
+    "adaptive_fallback_sampling_ms",
+    "adaptive_sampling_ms",
+    "phase3_fallback_sample_ms",
+    "phase3_fallback_ms",
+    "sample_phase_ms",
+)
 
-    # Collect all points per (variant,method)
+
+def _extract_sample_ms(phases: object) -> Optional[float]:
+    """Return sample-phase time (ms) from phases_json.
+
+    Strategy:
+      1) Match known keys in a priority list.
+      2) Conservative heuristic: among keys that look like time in ms and contain
+         'sample', pick the *largest* value (sample phase is typically the dominant
+         '...sample...' timing component within one run).
+    """
+    if not isinstance(phases, dict):
+        return None
+
+    # 1) direct priority match
+    for k in _PHASE_KEYS_PRIORITY:
+        if k in phases:
+            try:
+                v = float(phases[k])
+            except Exception:
+                continue
+            if v > 0:
+                return v
+
+    # 2) heuristic fallback
+    cand: List[float] = []
+    for k, v in phases.items():
+        if not isinstance(k, str):
+            continue
+        lk = k.lower()
+        if not lk.endswith("_ms"):
+            continue
+        if "sample" not in lk:
+            continue
+        try:
+            fv = float(v)
+        except Exception:
+            continue
+        if fv > 0:
+            cand.append(fv)
+    if cand:
+        return max(cand)
+
+    return None
+
+
+def aggregate_sample_phase(rows: List[Dict[str, str]]) -> List[Agg]:
+    grouped: Dict[Tuple[str, str, int], List[float]] = {}
+    for row in rows:
+        variant = row.get("variant", "")
+        method = row.get("method", "")
+        t = to_int(row.get("t", "0"), 0)
+        if t <= 0:
+            continue
+
+        phases_str = row.get("phases_json", "")
+        if not phases_str:
+            continue
+        try:
+            phases = json.loads(phases_str)
+        except Exception:
+            continue
+
+        sample_ms = _extract_sample_ms(phases)
+        if sample_ms is None:
+            continue
+
+        grouped.setdefault((variant, method, t), []).append(sample_ms)
+
+    out: List[Agg] = []
+    for (variant, method, t), vals in grouped.items():
+        out.append(
+            Agg(
+                variant=variant,
+                method=method,
+                t=t,
+                n=len(vals),
+                median=statistics.median(vals),
+                p95=percentile_linear(vals, 0.95),
+                stdev=safe_stdev(vals),
+            )
+        )
+    return out
+
+
+# ----------------------------
+# Δruntime (per-rep baseline)
+# ----------------------------
+def compute_delta_rows(
+    rows: List[Dict[str, str]],
+    t0: int,
+    require_t0: bool,
+) -> List[Agg]:
+    # Collect (t, rep, wall) per (variant, method)
     by_vm: Dict[Tuple[str, str], List[Tuple[int, int, float]]] = {}
-    for r in raw_rows:
-        variant = r.get("variant", "")
-        method = r.get("method", "")
-        t = to_int(r.get("t", "0"), 0)
-        rep = to_int(r.get("rep", "0"), 0)
-        wall = to_float(r.get("wall_ms", "nan"))
-        if t <= 0 or math.isnan(wall):
+    for row in rows:
+        variant = row.get("variant", "")
+        method = row.get("method", "")
+        t = to_int(row.get("t", "0"), 0)
+        rep = to_int(row.get("rep", "0"), 0)
+        wall = to_float(row.get("wall_ms", "nan"))
+        if t <= 0 or math.isnan(wall) or wall <= 0:
             continue
         by_vm.setdefault((variant, method), []).append((t, rep, wall))
 
-    out: List[DeltaAgg] = []
+    grouped: Dict[Tuple[str, str, int], List[float]] = {}
 
-    for (variant, method), pts in sorted(by_vm.items()):
-        # Determine which t0 to use for this (variant,method)
+    for (variant, method), pts in by_vm.items():
         ts = sorted({t for (t, _rep, _wall) in pts})
         if not ts:
             continue
-        t0_used = t0 if t0 in ts else ts[0]
+        if require_t0 and (t0 not in ts):
+            # Skip this method entirely to keep a consistent baseline across methods.
+            continue
+        t0_used = t0 if (t0 in ts) else ts[0]
 
         baseline: Dict[int, float] = {}
         for (t, rep, wall) in pts:
             if t == t0_used:
                 baseline[rep] = wall
 
-        # For each t, collect deltas for reps that have a baseline
-        deltas_by_t: Dict[int, List[float]] = {}
         for (t, rep, wall) in pts:
             b = baseline.get(rep)
             if b is None:
                 continue
-            deltas_by_t.setdefault(t, []).append(wall - b)
+            grouped.setdefault((variant, method, t), []).append(wall - b)
 
-        for t, deltas in sorted(deltas_by_t.items()):
-            if not deltas:
-                continue
-            med = statistics.median(deltas)
-            p95 = percentile_linear(deltas, 0.95)
-            sd = safe_stdev(deltas)
-            out.append(
-                DeltaAgg(
-                    variant=variant,
-                    method=method,
-                    t=t,
-                    n=len(deltas),
-                    median_ms=med,
-                    p95_ms=p95,
-                    stdev_ms=sd,
-                    t0_used=t0_used,
-                )
-            )
-    return out
-
-
-@dataclass
-class PhaseAgg:
-    variant: str
-    method: str
-    t: int
-    n: int
-    median_ms: float
-    p95_ms: float
-    stdev_ms: float
-
-
-def read_sample_phase(raw_path: str) -> List[PhaseAgg]:
-    """Extract sample-phase time from phases_json in sweep_raw.csv."""
-    samples: Dict[Tuple[str, str, int], List[float]] = {}
-    phase_keys = ("run_sample_ms", "sample_ms", "phase3_ms", "phase3_sample_ms")
-
-    with open(raw_path, newline="") as f:
-        r = csv.DictReader(f)
-        for row in r:
-            ok = to_int(row.get("ok", "0"), 0)
-            if ok != 1:
-                continue
-
-            variant = row.get("variant", "")
-            method = row.get("method", "")
-            t = to_int(row.get("t", "0"), 0)
-            if t <= 0:
-                continue
-
-            phases_str = row.get("phases_json", "")
-            if not phases_str:
-                continue
-            try:
-                phases = json.loads(phases_str)
-            except Exception:
-                continue
-
-            sample_ms: Optional[float] = None
-            for k in phase_keys:
-                if k in phases:
-                    try:
-                        sample_ms = float(phases[k])
-                    except Exception:
-                        sample_ms = None
-                    break
-            if sample_ms is None or sample_ms <= 0:
-                continue
-
-            samples.setdefault((variant, method, t), []).append(sample_ms)
-
-    out: List[PhaseAgg] = []
-    for (variant, method, t), vals in samples.items():
-        if not vals:
+    out: List[Agg] = []
+    for (variant, method, t), deltas in grouped.items():
+        if not deltas:
             continue
         out.append(
-            PhaseAgg(
+            Agg(
                 variant=variant,
                 method=method,
                 t=t,
-                n=len(vals),
-                median_ms=statistics.median(vals),
-                p95_ms=percentile_linear(vals, 0.95),
-                stdev_ms=safe_stdev(vals),
+                n=len(deltas),
+                median=statistics.median(deltas),
+                p95=percentile_linear(deltas, 0.95),
+                stdev=safe_stdev(deltas),
             )
         )
     return out
 
 
-def get_yerr_delta(row: DeltaAgg, mode: str) -> Tuple[float, float]:
-    if mode == "stdev":
-        return (0.0, max(0.0, row.stdev_ms))
-    # p95
-    return (0.0, max(0.0, row.p95_ms - row.median_ms))
-
-
-def get_yerr_phase(row: PhaseAgg, mode: str) -> Tuple[float, float]:
-    if mode == "stdev":
-        return (0.0, max(0.0, row.stdev_ms))
-    return (0.0, max(0.0, row.p95_ms - row.median_ms))
-
-
+# ----------------------------
+# ns/sample table
+# ----------------------------
 def regression_slope(xs: List[float], ys: List[float]) -> float:
     """Return slope in (y units)/(x units)."""
     if len(xs) < 2:
@@ -325,174 +412,14 @@ def regression_slope(xs: List[float], ys: List[float]) -> float:
     return cov / var
 
 
-def main() -> None:
-    args = parse_args()
-    out_dir = os.path.abspath(args.out_dir)
-    summary_path = os.path.join(out_dir, "sweep_summary.csv")
-    raw_path = os.path.join(out_dir, "sweep_raw.csv")
-
-    ensure_file(summary_path)
-    ensure_file(raw_path)
-
-    # Matplotlib optional
-    try:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except Exception as e:
-        print(f"[EXP2][PLOT] matplotlib not available; will only write CSV/README. ({e})")
-        plt = None  # type: ignore
-
-    summary_rows = read_summary(summary_path)
-    if not summary_rows:
-        print("[EXP2][PLOT] No successful rows in sweep_summary.csv; nothing to plot.")
-        return
-
-    error_mode = choose_error_mode(summary_rows, args.error)
-    min_repeats = min(to_int(r.get("repeats", "0"), 0) for r in summary_rows)
-    print(f"[EXP2][PLOT] error_mode={error_mode} (requested={args.error}, min_repeats={min_repeats})")
-
-    raw_rows = read_raw_wall(raw_path)
-    delta_agg = compute_delta_from_raw(raw_rows, args.t0)
-    phase_agg = read_sample_phase(raw_path)
-
-    variants = sorted({row["variant"] for row in summary_rows})
-
-    # ----------------------------
-    # Plot 1: wall runtime vs t (from summary)
-    # ----------------------------
-    if plt is not None:
-        for variant in variants:
-            sub = [row for row in summary_rows if row["variant"] == variant]
-            methods = sorted({row["method"] for row in sub})
-
-            plt.figure()
-            for method in methods:
-                g = [row for row in sub if row["method"] == method]
-                g.sort(key=lambda x: to_int(x["t"]))
-                ts = [to_int(x["t"]) for x in g]
-                ys = [to_float(x["wall_median_ms"]) for x in g]
-                low: List[float] = []
-                upp: List[float] = []
-                for x in g:
-                    l, u = get_yerr_summary(x, error_mode)
-                    low.append(l)
-                    upp.append(u)
-
-                plt.errorbar(ts, ys, yerr=[low, upp], marker="o", label=method, linewidth=1)
-
-            plt.xscale("log")
-            plt.yscale("log")
-            plt.xlabel("t (samples)")
-            plt.ylabel("runtime (median ms)")
-            plt.title(f"EXP-2 Runtime vs t ({variant})")
-            plt.legend(fontsize=7)
-            plt.tight_layout()
-            plt.savefig(os.path.join(out_dir, f"exp2_runtime_vs_t_{variant}.pdf"))
-            plt.savefig(os.path.join(out_dir, f"exp2_runtime_vs_t_{variant}.png"), dpi=200)
-            plt.close()
-
-    # ----------------------------
-    # Plot 2: Δ wall runtime vs t (from raw, per-rep delta)
-    # ----------------------------
-    if plt is not None and delta_agg:
-        for variant in variants:
-            sub = [row for row in delta_agg if row.variant == variant]
-            if not sub:
-                continue
-            methods = sorted({row.method for row in sub})
-
-            # Determine t0_used per (variant,method) (should be consistent across t)
-            t0_map: Dict[str, int] = {}
-            for r in sub:
-                t0_map.setdefault(r.method, r.t0_used)
-
-            plt.figure()
-            for method in methods:
-                g = [row for row in sub if row.method == method]
-                g.sort(key=lambda x: x.t)
-                ts = [x.t for x in g]
-                ys = [x.median_ms for x in g]
-                low: List[float] = []
-                upp: List[float] = []
-                for x in g:
-                    l, u = get_yerr_delta(x, error_mode)
-                    low.append(l)
-                    upp.append(u)
-
-                plt.errorbar(ts, ys, yerr=[low, upp], marker="o", label=method, linewidth=1)
-
-            plt.xscale("log")
-            plt.yscale("linear")
-            # Prefer the requested baseline t0; if missing, we used per-method min-t.
-            # For the y-label, show the mode baseline if consistent.
-            t0_useds = sorted(set(t0_map.values()))
-            if len(t0_useds) == 1:
-                t0_label = t0_useds[0]
-            else:
-                t0_label = args.t0
-
-            plt.xlabel("t (samples)")
-            plt.ylabel(f"Δruntime (median ms)  [per-rep baseline @ t={t0_label}]")
-            plt.title(f"EXP-2 ΔRuntime vs t ({variant})")
-            plt.axhline(0.0, linewidth=0.8)
-            plt.legend(fontsize=7)
-            plt.tight_layout()
-            plt.savefig(os.path.join(out_dir, f"exp2_delta_runtime_vs_t_{variant}.pdf"))
-            plt.savefig(os.path.join(out_dir, f"exp2_delta_runtime_vs_t_{variant}.png"), dpi=200)
-            plt.close()
-
-    if plt is not None and not delta_agg:
-        print("[EXP2][PLOT] Δruntime: no usable raw wall_ms data; skip delta plots.")
-
-    # ----------------------------
-    # Plot 3: sample-phase vs t (from raw phases_json)
-    # ----------------------------
-    if plt is not None and phase_agg:
-        phase_variants = sorted({row.variant for row in phase_agg})
-        for variant in phase_variants:
-            sub = [row for row in phase_agg if row.variant == variant]
-            methods = sorted({row.method for row in sub})
-
-            plt.figure()
-            for method in methods:
-                g = [row for row in sub if row.method == method]
-                g.sort(key=lambda x: x.t)
-                ts = [x.t for x in g]
-                ys = [x.median_ms for x in g]
-                low: List[float] = []
-                upp: List[float] = []
-                for x in g:
-                    l, u = get_yerr_phase(x, error_mode)
-                    low.append(l)
-                    upp.append(u)
-
-                plt.errorbar(ts, ys, yerr=[low, upp], marker="o", label=method, linewidth=1)
-
-            plt.xscale("log")
-            plt.yscale("log")
-            plt.xlabel("t (samples)")
-            plt.ylabel("sample-phase time (median ms)")
-            plt.title(f"EXP-2 Sample-phase vs t ({variant})")
-            plt.legend(fontsize=7)
-            plt.tight_layout()
-            plt.savefig(os.path.join(out_dir, f"exp2_sample_phase_vs_t_{variant}.pdf"))
-            plt.savefig(os.path.join(out_dir, f"exp2_sample_phase_vs_t_{variant}.png"), dpi=200)
-            plt.close()
-
-    if plt is not None and not phase_agg:
-        print("[EXP2][PLOT] phases_json sample-phase not found; skip sample-phase plots.")
-
-    # ----------------------------
-    # Report: ns/sample slopes from sample-phase medians
-    # ----------------------------
-    slopes_path = os.path.join(out_dir, "exp2_ns_per_sample.csv")
+def write_ns_per_sample(out_dir: str, phase_aggs: List[Agg]) -> str:
+    path = os.path.join(out_dir, "exp2_ns_per_sample.csv")
+    # group by (variant, method)
     grouped: Dict[Tuple[str, str], List[Tuple[int, float]]] = {}
-    for row in phase_agg:
-        grouped.setdefault((row.variant, row.method), []).append((row.t, row.median_ms))
+    for a in phase_aggs:
+        grouped.setdefault((a.variant, a.method), []).append((a.t, a.median))
 
-    with open(slopes_path, "w", newline="") as f:
+    with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(
             [
@@ -514,17 +441,15 @@ def main() -> None:
                 continue
             t_min, y_min = pts[0]
             t_max, y_max = pts[-1]
-            # endpoints
-            slope_ms = (y_max - y_min) / (t_max - t_min) if t_max > t_min else float("nan")
-            ns_end = slope_ms * 1e6
 
-            # regression over all points
+            slope_end_ms = (y_max - y_min) / (t_max - t_min) if t_max > t_min else float("nan")
+            ns_end = slope_end_ms * 1e6
+
             xs = [float(t) for t, _y in pts]
             ys = [float(y) for _t, y in pts]
             slope_all = regression_slope(xs, ys)
             ns_reg = slope_all * 1e6
 
-            # tail-3 regression (more representative for large t)
             if len(pts) >= 3:
                 tail = pts[-3:]
                 xs_t = [float(t) for t, _y in tail]
@@ -536,40 +461,364 @@ def main() -> None:
 
             w.writerow([variant, method, len(pts), t_min, t_max, y_min, y_max, ns_end, ns_reg, ns_tail])
 
-    print(f"[EXP2][PLOT] wrote {slopes_path}")
+    return path
 
-    # ----------------------------
-    # README artifact
-    # ----------------------------
-    readme_path = os.path.join(out_dir, "EXP2_README.txt")
-    with open(readme_path, "w") as f:
-        f.write("EXP-2 (Runtime vs t) - plots\n\n")
-        f.write("Inputs:\n")
-        f.write("  sweep_raw.csv      : one row per run/repeat (contains phases_json)\n")
-        f.write("  sweep_summary.csv  : aggregated stats per (method,variant,t)\n\n")
-        f.write("Outputs:\n")
-        f.write("  exp2_runtime_vs_t_<variant>.pdf/.png          : wall median vs t (log-x, log-y, upper-only error)\n")
-        f.write("  exp2_delta_runtime_vs_t_<variant>.pdf/.png    : Δ wall median vs t (log-x, linear-y)\n")
-        f.write("  exp2_sample_phase_vs_t_<variant>.pdf/.png     : sample-phase (median run_sample_ms) vs t (log-x, log-y)\n")
-        f.write("  exp2_ns_per_sample.csv                        : ns/sample (endpoints + regression)\n\n")
-        f.write("Error bars:\n")
-        f.write(f"  requested={args.error}\n")
-        f.write(f"  chosen={error_mode}\n")
-        f.write(f"  min_repeats_over_plotted_points={min_repeats}\n\n")
-        f.write("Δruntime definition:\n")
-        f.write("  For each (variant,method,rep), subtract the matched baseline run at t0 (or min t if t0 missing).\n")
-        f.write("  This reduces noise compared to subtracting aggregated medians.\n\n")
-        f.write("Notes:\n")
-        f.write("  - Points with ok_rate < 1.0 are filtered out.\n")
-        f.write("  - Some method/variant combos may be intentionally skipped by sjs_sweep (e.g., rejection+sampling).\n")
 
-        # Quick warning about negative delta medians
-        neg = [d for d in delta_agg if d.median_ms < -1e-9]
-        if neg:
-            f.write("\nWarnings:\n")
-            f.write(f"  - {len(neg)} Δruntime points have negative median (likely measurement noise).\n")
+# ----------------------------
+# Plotting
+# ----------------------------
+def _yerr(a: Agg, mode: str) -> Tuple[float, float]:
+    # Upper-only error bar.
+    if mode == "stdev":
+        return (0.0, max(0.0, a.stdev))
+    return (0.0, max(0.0, a.p95 - a.median))
 
-    print(f"[EXP2][PLOT] wrote {readme_path}")
+
+def _collect_series(aggs: List[Agg]) -> Dict[Tuple[str, str], List[Agg]]:
+    out: Dict[Tuple[str, str], List[Agg]] = {}
+    for a in aggs:
+        out.setdefault((a.variant, a.method), []).append(a)
+    for k in out:
+        out[k] = sorted(out[k], key=lambda x: x.t)
+    return out
+
+
+def _variant_sort_key(v: str) -> int:
+    order = {"sampling": 0, "enum_sampling": 1, "adaptive": 2}
+    return order.get(v, 99)
+
+
+def select_paper_methods(
+    wall_aggs: List[Agg],
+    variants: List[str],
+    topk: int,
+    always_include: List[str],
+    paper_methods: List[str],
+    exclude: List[str],
+) -> List[str]:
+    # If explicitly specified: use exactly that (plus always_include), after filtering.
+    all_methods = sorted({a.method for a in wall_aggs})
+    exclude_set = set(exclude)
+
+    if paper_methods:
+        methods = [m for m in paper_methods if (m in all_methods and m not in exclude_set)]
+        for m in always_include:
+            if m in all_methods and m not in exclude_set and m not in methods:
+                methods.append(m)
+        return methods
+
+    # Rank by sampling @ max-t if possible; otherwise fall back to overall.
+    rank_variant = "sampling" if ("sampling" in variants) else (variants[0] if variants else "")
+    cand = [a for a in wall_aggs if a.variant == rank_variant]
+    if not cand:
+        cand = wall_aggs[:]
+
+    # choose max t within that variant
+    t_max = max((a.t for a in cand), default=None)
+    rank_pts = [a for a in cand if (t_max is not None and a.t == t_max)]
+    # if still empty, just use all points
+    if not rank_pts:
+        rank_pts = cand
+
+    rank_pts = [a for a in rank_pts if a.method not in exclude_set]
+    rank_pts.sort(key=lambda x: x.median)
+
+    methods: List[str] = []
+    for a in rank_pts:
+        if a.method not in methods:
+            methods.append(a.method)
+        if len(methods) >= max(1, topk):
+            break
+
+    for m in always_include:
+        if m in all_methods and m not in exclude_set and m not in methods:
+            methods.append(m)
+
+    return methods
+
+
+def plot_paper_runtime(
+    out_dir: str,
+    wall_aggs: List[Agg],
+    methods: List[str],
+    error_mode: str,
+) -> None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"[EXP2][PLOT] matplotlib not available; skip plots. ({e})")
+        return
+
+    variants = sorted({a.variant for a in wall_aggs}, key=_variant_sort_key)
+    series = _collect_series(wall_aggs)
+
+    fig, axes = plt.subplots(1, len(variants), figsize=(4.4 * max(1, len(variants)), 3.2), squeeze=False)
+    axes_list = axes[0]
+
+    for ax, variant in zip(axes_list, variants):
+        for method in methods:
+            pts = series.get((variant, method))
+            if not pts:
+                continue
+            ts = [p.t for p in pts]
+            ys = [p.median for p in pts]
+            low = []
+            upp = []
+            for p in pts:
+                l, u = _yerr(p, error_mode)
+                low.append(l)
+                upp.append(u)
+
+            ax.errorbar(ts, ys, yerr=[low, upp], marker="o", linewidth=1, markersize=3, label=method)
+
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlabel("t (samples)")
+        ax.set_title(variant)
+
+    axes_list[0].set_ylabel("wall runtime (median ms)")
+    handles, labels = axes_list[0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc="lower center", ncol=min(len(labels), 6), fontsize=8, frameon=False)
+        fig.subplots_adjust(bottom=0.28)
+    fig.suptitle("EXP-2 Runtime vs t", y=0.98)
+    fig.tight_layout()
+
+    pdf = os.path.join(out_dir, "exp2_paper_runtime_vs_t.pdf")
+    png = os.path.join(out_dir, "exp2_paper_runtime_vs_t.png")
+    fig.savefig(pdf)
+    fig.savefig(png, dpi=220)
+    plt.close(fig)
+
+
+def plot_paper_delta(
+    out_dir: str,
+    delta_aggs: List[Agg],
+    methods: List[str],
+    error_mode: str,
+    t0: int,
+) -> None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"[EXP2][PLOT] matplotlib not available; skip plots. ({e})")
+        return
+
+    variants = sorted({a.variant for a in delta_aggs}, key=_variant_sort_key)
+    series = _collect_series(delta_aggs)
+
+    fig, axes = plt.subplots(1, len(variants), figsize=(4.4 * max(1, len(variants)), 3.2), squeeze=False)
+    axes_list = axes[0]
+
+    for ax, variant in zip(axes_list, variants):
+        for method in methods:
+            pts = series.get((variant, method))
+            if not pts:
+                continue
+            ts = [p.t for p in pts]
+            ys = [p.median for p in pts]
+            low = []
+            upp = []
+            for p in pts:
+                l, u = _yerr(p, error_mode)
+                low.append(l)
+                upp.append(u)
+
+            ax.errorbar(ts, ys, yerr=[low, upp], marker="o", linewidth=1, markersize=3, label=method)
+
+        ax.set_xscale("log")
+        # symlog handles negative deltas and huge outliers in a single readable plot.
+        ax.set_yscale("symlog", linthresh=1.0)
+        ax.axhline(0.0, linewidth=0.8)
+        ax.set_xlabel("t (samples)")
+        ax.set_title(variant)
+
+    axes_list[0].set_ylabel(f"Δ wall runtime (median ms)  [baseline t0={t0}]")
+
+    handles, labels = axes_list[0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc="lower center", ncol=min(len(labels), 6), fontsize=8, frameon=False)
+        fig.subplots_adjust(bottom=0.28)
+
+    fig.suptitle("EXP-2 ΔRuntime vs t", y=0.98)
+    fig.tight_layout()
+
+    pdf = os.path.join(out_dir, "exp2_paper_delta_vs_t.pdf")
+    png = os.path.join(out_dir, "exp2_paper_delta_vs_t.png")
+    fig.savefig(pdf)
+    fig.savefig(png, dpi=220)
+    plt.close(fig)
+
+
+# ----------------------------
+# Diagnostics (full mode)
+# ----------------------------
+def _plot_per_variant(
+    out_dir: str,
+    aggs: List[Agg],
+    filename_prefix: str,
+    ylabel: str,
+    yscale: str,
+    error_mode: str,
+) -> None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return
+
+    variants = sorted({a.variant for a in aggs}, key=_variant_sort_key)
+    series = _collect_series(aggs)
+
+    for variant in variants:
+        methods = sorted({a.method for a in aggs if a.variant == variant})
+        plt.figure(figsize=(5.2, 3.6))
+        for method in methods:
+            pts = series.get((variant, method))
+            if not pts:
+                continue
+            ts = [p.t for p in pts]
+            ys = [p.median for p in pts]
+            low = []
+            upp = []
+            for p in pts:
+                l, u = _yerr(p, error_mode)
+                low.append(l)
+                upp.append(u)
+            plt.errorbar(ts, ys, yerr=[low, upp], marker="o", linewidth=1, markersize=3, label=method)
+
+        plt.xscale("log")
+        plt.yscale(yscale)
+        plt.xlabel("t (samples)")
+        plt.ylabel(ylabel)
+        plt.title(f"EXP-2 {filename_prefix} ({variant})")
+        plt.legend(fontsize=7)
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, f"exp2_{filename_prefix}_{variant}.pdf"))
+        plt.savefig(os.path.join(out_dir, f"exp2_{filename_prefix}_{variant}.png"), dpi=200)
+        plt.close()
+
+
+def write_readme(
+    out_dir: str,
+    args: argparse.Namespace,
+    wall_aggs: List[Agg],
+    delta_aggs: List[Agg],
+    phase_aggs: List[Agg],
+    methods_paper: List[str],
+    error_mode: str,
+) -> None:
+    path = os.path.join(out_dir, "EXP2_README.txt")
+    variants = sorted({a.variant for a in wall_aggs}, key=_variant_sort_key)
+    min_n = min((a.n for a in wall_aggs), default=0)
+    neg_delta = sum(1 for a in delta_aggs if a.median < -1e-9)
+
+    with open(path, "w") as f:
+        f.write("EXP-2 (Runtime vs t) - plotting artifact\n\n")
+        f.write(f"mode={args.mode}\n")
+        f.write(f"warmup_reps={args.warmup_reps}\n")
+        f.write(f"t0={args.t0}\n")
+        f.write(f"error_mode={error_mode} (requested={args.error})\n")
+        f.write(f"variants={','.join(variants)}\n")
+        f.write(f"min_repeats_used_in_plots={min_n}\n\n")
+
+        f.write("Paper plots:\n")
+        f.write("  exp2_paper_runtime_vs_t.(pdf|png)\n")
+        f.write("  exp2_paper_delta_vs_t.(pdf|png)\n\n")
+        f.write("Tables:\n")
+        f.write("  exp2_ns_per_sample.csv\n\n")
+
+        f.write("Paper method set:\n")
+        f.write("  " + ", ".join(methods_paper) + "\n\n")
+
+        if args.mode == "full":
+            f.write("Full mode also writes per-variant diagnostics:\n")
+            f.write("  exp2_runtime_vs_t_<variant>.(pdf|png)\n")
+            f.write("  exp2_delta_runtime_vs_t_<variant>.(pdf|png)\n")
+            f.write("  exp2_sample_phase_vs_t_<variant>.(pdf|png)\n\n")
+
+        if neg_delta > 0:
+            f.write("Warnings:\n")
+            f.write(f"  - {neg_delta} Δruntime points have negative median (usually measurement noise).\n")
+
+        if not phase_aggs:
+            f.write("\nNotes:\n")
+            f.write("  - phases_json sample-phase could not be extracted for any run.\n")
+
+    print(f"[EXP2][PLOT] wrote {path}")
+
+
+def main() -> None:
+    args = parse_args()
+    out_dir = os.path.abspath(args.out_dir)
+    raw_path = os.path.join(out_dir, "sweep_raw.csv")
+    ensure_file(raw_path)
+
+    # Read + aggregate from raw (so warmup exclusion is honored)
+    raw_rows = read_raw_rows(raw_path, warmup_reps=max(0, args.warmup_reps))
+    if not raw_rows:
+        print("[EXP2][PLOT] No successful rows in sweep_raw.csv after warmup filtering; nothing to plot.")
+        return
+
+    wall_aggs = aggregate_wall(raw_rows)
+    phase_aggs = aggregate_sample_phase(raw_rows)
+    # For paper delta plots we require a consistent baseline at t0 (no per-method fallback).
+    delta_aggs_paper = compute_delta_rows(raw_rows, t0=args.t0, require_t0=True)
+    delta_aggs_full = compute_delta_rows(raw_rows, t0=args.t0, require_t0=False)
+
+    error_mode = choose_error_mode(wall_aggs, args.error)
+    variants = sorted({a.variant for a in wall_aggs}, key=_variant_sort_key)
+
+    always_include = split_csv_list(args.always_include)
+    paper_methods_arg = split_csv_list(args.paper_methods)
+    exclude = split_csv_list(args.exclude_methods)
+
+    methods_paper = select_paper_methods(
+        wall_aggs=wall_aggs,
+        variants=variants,
+        topk=max(1, args.topk),
+        always_include=always_include,
+        paper_methods=paper_methods_arg,
+        exclude=exclude,
+    )
+
+    print(f"[EXP2][PLOT] mode={args.mode} warmup_reps={args.warmup_reps} t0={args.t0}")
+    print(f"[EXP2][PLOT] error_mode={error_mode} (requested={args.error})")
+    print(f"[EXP2][PLOT] paper_methods={methods_paper}")
+
+    # Always write ns/sample table (even if no plots)
+    ns_path = write_ns_per_sample(out_dir, phase_aggs)
+    print(f"[EXP2][PLOT] wrote {ns_path}")
+
+    # Paper plots (concise)
+    plot_paper_runtime(out_dir, wall_aggs, methods_paper, error_mode)
+    plot_paper_delta(out_dir, delta_aggs_paper, methods_paper, error_mode, t0=args.t0)
+
+    # Full diagnostics if requested
+    if args.mode == "full":
+        _plot_per_variant(out_dir, wall_aggs, "runtime_vs_t", "wall runtime (median ms)", "log", error_mode)
+        _plot_per_variant(out_dir, delta_aggs_full, "delta_runtime_vs_t", f"Δ wall runtime (median ms) [t0={args.t0}]", "symlog", error_mode)
+        if phase_aggs:
+            _plot_per_variant(out_dir, phase_aggs, "sample_phase_vs_t", "sample-phase time (median ms)", "log", error_mode)
+
+    write_readme(
+        out_dir=out_dir,
+        args=args,
+        wall_aggs=wall_aggs,
+        delta_aggs=delta_aggs_full,
+        phase_aggs=phase_aggs,
+        methods_paper=methods_paper,
+        error_mode=error_mode,
+    )
+
     print(f"[EXP2][PLOT] DONE. Out dir: {out_dir}")
 
 

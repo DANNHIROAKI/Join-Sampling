@@ -3,38 +3,53 @@
 #
 # EXP-2：Runtime vs t（对应 RQ2）
 #
-# 这份脚本是为了解决 EXP-2 常见“结果不够理想”的三个真实原因：
-#   (i) repeats 太少 → p95 不稳 / Δruntime 出现负值 / 曲线噪声很大
-#  (ii) j_star 设得过大 → adaptive 永远 enumerate_all，看不出随 t 的 scaling
-# (iii) 线程/写样本等口径没有被强制覆盖 → 计时口径不纯或不可复现
+# 目标：生成“可以直接放进论文”的 EXP-2 结果（稳定、可复现、图少且清晰）。
 #
-# 关键改动（默认值更“论文友好”）：
-#   - repeats 默认=10（使 p95 有意义；曲线更平滑）
-#   - j_star 默认=100000（对 config/sweeps/sweep_t.json 的默认 |J|=200000，
-#                        会触发 adaptive 的 fallback_sampling 分支，从而看到随 t 增长）
-#   - 使用 jq 在 TEMP_DIR 内生成“patched sweep config”，确保 overrides 真正生效。
+# 这份脚本在原始版本的基础上，重点补强了 3 个会导致“结果不够理想”的真实因素：
 #
-# 统一目录规范：
-#   1) Build 统一放在 <repo_root>/build/<type>/ 下（默认 Release -> build/release）
-#   2) 运行产生的日志/中间文件/CSV/图，先写到 <repo_root>/run/temp/exp2/
-#   3) 成功后将 <repo_root>/run/temp/exp2/ 覆盖同步到 <repo_root>/results/raw/exp2/
-#   4) Bash 内不包含任何“内嵌 Python”（不使用 python -c / heredoc）
+#  (A) 冷启动/热缓存偏差 → Δruntime 出现大量负值 / 曲线噪声大
+#      - 新增 warmup repeats：默认多跑 1 次（rep=0）作为 warmup
+#      - 绘图时默认排除 warmup（--warmup_reps）
+#
+#  (B) Δruntime 图被极端 outlier 压扁
+#      - 新绘图脚本默认用 symlog-y（能同时显示小趋势与大 outlier）
+#      - paper 模式默认只画 2 张图（runtime & Δruntime），每张图 3 个 panel
+#
+#  (C) 图太多、不“论文友好”
+#      - 默认 --plot_mode=paper，只输出 2 张“主图级别”的 PDF/PNG
+#      - 同时输出 ns/sample 的 CSV（用于论文文字/表格）
 #
 # 用法：
 #   bash run/run_exp2.sh
 #
-# 可选参数：
+# 常用可选参数：
 #   --config <path>         Sweep JSON（默认：config/sweeps/sweep_t.json）
 #   --build_type <type>     Release|Debug|RelWithDebInfo|MinSizeRel（默认：Release）
 #   --clean                 删除 build/<type> 后重建
-#   --no-build              跳过构建（假设 sjs_sweep 已存在于 build/<type>）
-#   --no-plot               跳过绘图（仍生成 sweep_raw.csv / sweep_summary.csv）
+#   --no-build              跳过构建
+#   --no-plot               跳过绘图
 #   --threads <int>         覆盖 base.sys.threads（默认：1）
 #   --write_samples <0|1>   覆盖 base.run.write_samples（默认：0）
-#   --repeats <int>         覆盖 base.run.repeats（默认：10）
+#   --repeats <int>         *有效重复次数*（默认：10）
+#   --warmup <int>          额外 warmup 次数（默认：1；绘图会自动排除）
 #   --j_star <u64>          覆盖 base.run.j_star（默认：100000）
-#   --plot_error <auto|p95|stdev>
-#                           绘图误差条策略（默认：auto；repeats>=10 用 p95，否则 stdev）
+#
+# 绘图相关：
+#   --plot_mode <paper|full>    默认 paper（只生成 2 张主图）
+#   --plot_t0 <int>             Δruntime 的 baseline t0（默认：10000）
+#   --plot_error <auto|p95|stdev> 误差条策略（默认：auto）
+#   --topk <int>                paper 图里仅绘制 top-k 最快方法 + ours（默认：6）
+#   --exclude_methods <list>     逗号分隔；从图中排除某些方法（如 rejection）
+#
+# 输出目录：
+#   - Temp（每次覆盖）：<repo_root>/run/temp/exp2/
+#   - Final（成功后覆盖同步）：<repo_root>/results/raw/exp2/
+#
+# 注意：
+#   - repeats 会被 patch 成 (repeats + warmup)，即 raw.csv 里会看到更多 rep。
+#   - exp2_plot.py 会根据 --warmup_reps 自动忽略 rep < warmup。
+#   - 这属于“实验口径修正”（排除冷启动），不改变算法语义。
+#
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -47,9 +62,7 @@ trap 'echo -e "[EXP2][FATAL] Failed at line ${LINENO}: ${BASH_COMMAND}" >&2; exi
 log() { echo -e "[EXP2] $*"; }
 die() { echo -e "[EXP2][FATAL] $*" >&2; exit 1; }
 
-need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"
-}
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"; }
 
 usage() {
   cat <<'EOF'
@@ -59,20 +72,28 @@ Usage:
   bash run/run_exp2.sh [options]
 
 Options:
-  --config <path>              Sweep JSON (default: config/sweeps/sweep_t.json)
-  --build_type <type>          Release|Debug|RelWithDebInfo|MinSizeRel (default: Release)
-  --clean                      Remove build/<type> before building
-  --no-build                   Skip build step
-  --no-plot                    Skip plotting step
-  --threads <int>              Override base.sys.threads (default: 1)
-  --write_samples <0|1>        Override base.run.write_samples (default: 0)
-  --repeats <int>              Override base.run.repeats (default: 10)
-  --j_star <u64>               Override base.run.j_star (default: 100000)
-  --plot_error <auto|p95|stdev>Plot error bars policy (default: auto)
-  -h, --help                   Show help
+  --config <path>                 Sweep JSON (default: config/sweeps/sweep_t.json)
+  --build_type <type>             Release|Debug|RelWithDebInfo|MinSizeRel (default: Release)
+  --clean                         Remove build/<type> before building
+  --no-build                      Skip build step
+  --no-plot                       Skip plotting step
+  --threads <int>                 Override base.sys.threads (default: 1)
+  --write_samples <0|1>           Override base.run.write_samples (default: 0)
+  --repeats <int>                 Effective repeats used for reporting/plots (default: 10)
+  --warmup <int>                  Extra warmup repeats (excluded from plots) (default: 1)
+  --j_star <u64>                  Override base.run.j_star (default: 100000)
+
+Plot options:
+  --plot_mode <paper|full>        Default: paper
+  --plot_t0 <int>                 Baseline t0 for Δruntime (default: 10000)
+  --plot_error <auto|p95|stdev>   Default: auto
+  --topk <int>                    Paper plots: top-k fastest methods + ours (default: 6)
+  --exclude_methods <csv>         Comma-separated methods to exclude in plots (default: empty)
+
+  -h, --help                      Show help
 
 Outputs (fixed):
-  - Temp (always overwritten):    <repo_root>/run/temp/exp2/
+  - Temp (always overwritten):      <repo_root>/run/temp/exp2/
   - Final (overwritten on success): <repo_root>/results/raw/exp2/
 EOF
 }
@@ -116,17 +137,9 @@ find_exe() {
   echo "${p}"
 }
 
-to_bool_json() {
-  # prints: true/false
-  if [[ "$1" == "1" ]]; then
-    echo "true"
-  else
-    echo "false"
-  fi
-}
+to_bool_json() { [[ "$1" == "1" ]] && echo "true" || echo "false"; }
 
 awk_col_idx() {
-  # Usage: awk_col_idx <csv_file> <column_name>
   local file="$1"
   local col="$2"
   awk -F',' -v c="${col}" 'NR==1{for(i=1;i<=NF;i++){if($i==c){print i; exit}}}' "${file}"
@@ -139,15 +152,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # ----------------------------
-# Defaults (more stable for EXP-2)
+# Defaults (paper-friendly)
 # ----------------------------
 CONFIG="config/sweeps/sweep_t.json"
 BUILD_TYPE="Release"
 THREADS=1
 WRITE_SAMPLES=0
-REPEATS=10
+REPEATS=10        # effective repeats (excluding warmup)
+WARMUP=1          # extra repeats to warm cache; excluded from plots
 J_STAR=100000
+
+PLOT_MODE="paper"
+PLOT_T0=10000
 PLOT_ERROR="auto"
+TOPK=6
+EXCLUDE_METHODS=""
 
 DO_CLEAN=0
 DO_BUILD=1
@@ -158,17 +177,22 @@ DO_PLOT=1
 # ----------------------------
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --config)        CONFIG="$2"; shift 2;;
-    --build_type)    BUILD_TYPE="$2"; shift 2;;
-    --threads)       THREADS="$2"; shift 2;;
-    --write_samples) WRITE_SAMPLES="$2"; shift 2;;
-    --repeats)       REPEATS="$2"; shift 2;;
-    --j_star)        J_STAR="$2"; shift 2;;
-    --plot_error)    PLOT_ERROR="$2"; shift 2;;
-    --clean)         DO_CLEAN=1; shift;;
-    --no-build)      DO_BUILD=0; shift;;
-    --no-plot)       DO_PLOT=0; shift;;
-    -h|--help)       usage; exit 0;;
+    --config)          CONFIG="$2"; shift 2;;
+    --build_type)      BUILD_TYPE="$2"; shift 2;;
+    --threads)         THREADS="$2"; shift 2;;
+    --write_samples)   WRITE_SAMPLES="$2"; shift 2;;
+    --repeats)         REPEATS="$2"; shift 2;;
+    --warmup)          WARMUP="$2"; shift 2;;
+    --j_star)          J_STAR="$2"; shift 2;;
+    --plot_mode)       PLOT_MODE="$2"; shift 2;;
+    --plot_t0)         PLOT_T0="$2"; shift 2;;
+    --plot_error)      PLOT_ERROR="$2"; shift 2;;
+    --topk)            TOPK="$2"; shift 2;;
+    --exclude_methods) EXCLUDE_METHODS="$2"; shift 2;;
+    --clean)           DO_CLEAN=1; shift;;
+    --no-build)        DO_BUILD=0; shift;;
+    --no-plot)         DO_PLOT=0; shift;;
+    -h|--help)         usage; exit 0;;
     *) die "Unknown argument: $1 (try --help)";;
   esac
 done
@@ -177,7 +201,6 @@ if [[ "${CONFIG}" != /* ]]; then
   CONFIG="${REPO_ROOT}/${CONFIG}"
 fi
 
-# Fixed directories (aligned with your global requirements).
 TEMP_DIR="${REPO_ROOT}/run/temp/exp2"
 RESULT_DIR="${REPO_ROOT}/results/raw/exp2"
 
@@ -197,21 +220,18 @@ need_cmd sort
 [[ -f "${CONFIG}" ]] || die "Sweep config not found: ${CONFIG}"
 [[ -f "${REPO_ROOT}/CMakeLists.txt" ]] || die "CMakeLists.txt not found at repo root: ${REPO_ROOT}"
 
-if ! [[ "${THREADS}" =~ ^[0-9]+$ ]] || [[ "${THREADS}" -le 0 ]]; then
-  die "--threads must be a positive integer (got: '${THREADS}')"
-fi
-if [[ "${WRITE_SAMPLES}" != "0" && "${WRITE_SAMPLES}" != "1" ]]; then
-  die "--write_samples must be 0 or 1 (got: '${WRITE_SAMPLES}')"
-fi
-if ! [[ "${REPEATS}" =~ ^[0-9]+$ ]] || [[ "${REPEATS}" -le 0 ]]; then
-  die "--repeats must be a positive integer (got: '${REPEATS}')"
-fi
-if ! [[ "${J_STAR}" =~ ^[0-9]+$ ]]; then
-  die "--j_star must be a non-negative integer (got: '${J_STAR}')"
-fi
-if [[ "${PLOT_ERROR}" != "auto" && "${PLOT_ERROR}" != "p95" && "${PLOT_ERROR}" != "stdev" ]]; then
-  die "--plot_error must be auto|p95|stdev (got: '${PLOT_ERROR}')"
-fi
+if ! [[ "${THREADS}" =~ ^[0-9]+$ ]] || [[ "${THREADS}" -le 0 ]]; then die "--threads must be a positive integer"; fi
+if [[ "${WRITE_SAMPLES}" != "0" && "${WRITE_SAMPLES}" != "1" ]]; then die "--write_samples must be 0 or 1"; fi
+if ! [[ "${REPEATS}" =~ ^[0-9]+$ ]] || [[ "${REPEATS}" -le 0 ]]; then die "--repeats must be a positive integer"; fi
+if ! [[ "${WARMUP}" =~ ^[0-9]+$ ]] || [[ "${WARMUP}" -lt 0 ]]; then die "--warmup must be a non-negative integer"; fi
+if ! [[ "${J_STAR}" =~ ^[0-9]+$ ]]; then die "--j_star must be a non-negative integer"; fi
+
+if [[ "${PLOT_MODE}" != "paper" && "${PLOT_MODE}" != "full" ]]; then die "--plot_mode must be paper|full"; fi
+if ! [[ "${PLOT_T0}" =~ ^[0-9]+$ ]] || [[ "${PLOT_T0}" -le 0 ]]; then die "--plot_t0 must be a positive integer"; fi
+if [[ "${PLOT_ERROR}" != "auto" && "${PLOT_ERROR}" != "p95" && "${PLOT_ERROR}" != "stdev" ]]; then die "--plot_error must be auto|p95|stdev"; fi
+if ! [[ "${TOPK}" =~ ^[0-9]+$ ]] || [[ "${TOPK}" -le 0 ]]; then die "--topk must be a positive integer"; fi
+
+TOTAL_REPEATS=$((REPEATS + WARMUP))
 
 # Clean temp (always overwrite temp).
 rm -rf "${TEMP_DIR}"
@@ -225,9 +245,15 @@ log "Build type    : ${BUILD_TYPE}"
 log "Build dir     : ${BUILD_DIR}"
 log "Threads       : ${THREADS}"
 log "write_samples : ${WRITE_SAMPLES}"
-log "repeats       : ${REPEATS}"
+log "repeats(eff)  : ${REPEATS}"
+log "warmup reps   : ${WARMUP}"
+log "repeats(total): ${TOTAL_REPEATS}"
 log "j_star        : ${J_STAR}"
+log "plot_mode     : ${PLOT_MODE}"
+log "plot_t0       : ${PLOT_T0}"
 log "plot_error    : ${PLOT_ERROR}"
+log "topk          : ${TOPK}"
+log "exclude_methods: ${EXCLUDE_METHODS:-<none>}"
 log "Temp dir      : ${TEMP_DIR}"
 log "Final results : ${RESULT_DIR} (will be overwritten on success)"
 
@@ -249,7 +275,9 @@ cp -f "${CONFIG}" "${ORIG_CFG_COPY}"
 WRITE_SAMPLES_BOOL="$(to_bool_json "${WRITE_SAMPLES}")"
 
 jq \
-  --argjson repeats "${REPEATS}" \
+  --argjson repeats "${TOTAL_REPEATS}" \
+  --argjson repeats_eff "${REPEATS}" \
+  --argjson warmup_reps "${WARMUP}" \
   --argjson j_star "${J_STAR}" \
   --argjson threads "${THREADS}" \
   --argjson write_samples "${WRITE_SAMPLES_BOOL}" \
@@ -263,10 +291,12 @@ jq \
         "timestamp": $ts,
         "patched_by": "run/run_exp2.sh",
         "overrides": {
-          "repeats": $repeats,
-          "j_star": $j_star,
           "threads": $threads,
-          "write_samples": $write_samples
+          "write_samples": $write_samples,
+          "j_star": $j_star,
+          "repeats_total": $repeats,
+          "repeats_effective": $repeats_eff,
+          "warmup_reps": $warmup_reps
         }
      }
   ' "${ORIG_CFG_COPY}" > "${PATCHED_CFG}"
@@ -282,9 +312,15 @@ jq \
   echo "build_dir=${BUILD_DIR}"
   echo "threads=${THREADS}"
   echo "write_samples=${WRITE_SAMPLES}"
-  echo "repeats=${REPEATS}"
+  echo "repeats_effective=${REPEATS}"
+  echo "warmup_reps=${WARMUP}"
+  echo "repeats_total=${TOTAL_REPEATS}"
   echo "j_star=${J_STAR}"
+  echo "plot_mode=${PLOT_MODE}"
+  echo "plot_t0=${PLOT_T0}"
   echo "plot_error=${PLOT_ERROR}"
+  echo "topk=${TOPK}"
+  echo "exclude_methods=${EXCLUDE_METHODS}"
   echo "temp_dir=${TEMP_DIR}"
   echo "result_dir=${RESULT_DIR}"
 } > "${TEMP_DIR}/MANIFEST.txt"
@@ -298,7 +334,9 @@ jq \
   echo "temp_dir=${TEMP_DIR}"
   echo "threads=${THREADS}"
   echo "write_samples=${WRITE_SAMPLES}"
-  echo "repeats=${REPEATS}"
+  echo "repeats_effective=${REPEATS}"
+  echo "warmup_reps=${WARMUP}"
+  echo "repeats_total=${TOTAL_REPEATS}"
   echo "j_star=${J_STAR}"
   echo
   echo "uname:"; uname -a || true
@@ -345,11 +383,11 @@ log "Using sjs_sweep: ${SJS_SWEEP}"
 # ----------------------------
 # Run sweep
 # ----------------------------
-OUT_DIR="${TEMP_DIR}"  # outputs land directly here
+OUT_DIR="${TEMP_DIR}"
 RAW_FILE="sweep_raw.csv"
 SUMMARY_FILE="sweep_summary.csv"
 
-log "Running sweep (methods × variants × t × repeats)..."
+log "Running sweep (methods × variants × t × repeats_total=${TOTAL_REPEATS})..."
 log "Config used: ${PATCHED_CFG}"
 
 pushd "${REPO_ROOT}" >/dev/null
@@ -387,7 +425,7 @@ idx_cnt="$(awk_col_idx "${SUM_PATH}" "count_mean")"
 
 if [[ -n "${idx_ok}" && -n "${idx_rep}" ]]; then
   uniq_repeats="$(awk -F',' -v okc="${idx_ok}" -v rc="${idx_rep}" 'NR>1 && $okc==1 {print $rc}' "${SUM_PATH}" | sort -u | tr '\n' ' ')"
-  log "Summary ok points repeats values: ${uniq_repeats:-<none>}"
+  log "Summary ok points repeats values (includes warmup): ${uniq_repeats:-<none>}"
 fi
 
 if [[ -n "${idx_ok}" && -n "${idx_cnt}" ]]; then
@@ -418,7 +456,14 @@ if [[ "${DO_PLOT}" -eq 1 ]]; then
     [[ -f "${PLOT_SCRIPT}" ]] || die "Missing plot script at run/include/exp2_plot.py or run/plot_exp2.py"
 
     log "Generating plots via: ${PLOT_SCRIPT}"
-    python3 "${PLOT_SCRIPT}" --out_dir "${OUT_DIR}" --t0 1000 --error "${PLOT_ERROR}" \
+    python3 "${PLOT_SCRIPT}" \
+      --out_dir "${OUT_DIR}" \
+      --t0 "${PLOT_T0}" \
+      --error "${PLOT_ERROR}" \
+      --warmup_reps "${WARMUP}" \
+      --mode "${PLOT_MODE}" \
+      --topk "${TOPK}" \
+      --exclude_methods "${EXCLUDE_METHODS}" \
       2>&1 | tee "${TEMP_DIR}/logs/plot_exp2.log"
   else
     log "python3 not found; skipping plot step."
