@@ -1,56 +1,45 @@
 #!/usr/bin/env bash
-# run/run_exp2.sh
+# run/run_exp2.sh  (paper+extended runner)
 #
-# EXP-2：Runtime vs t（对应 RQ2）
+# EXP-2: Runtime vs t (RQ2)
 #
-# 目标：生成“可以直接放进论文”的 EXP-2 结果（稳定、可复现、图少且清晰）。
+# This is a *paper-ready* runner that:
+#   - keeps the original EXP-2 behavior (sweep by JSON config)
+#   - fixes the most common "paper figure" issues (cold start bias, inconsistent baseline t0)
+#   - optionally runs an *extended t-range* to make asymptotic trends visible
+#   - always preserves transparency (raw + summary kept; full plots optional)
 #
-# 这份脚本在原始版本的基础上，重点补强了 3 个会导致“结果不够理想”的真实因素：
+# Key upgrades vs the previous runner:
+#   1) Default Δruntime baseline t0=1000 (matches EXP-2 writeup).
+#   2) Two profiles (paper / extended) via --t_profile={paper|extended|both}.
+#   3) Optional patch of the sweep t-list from the runner (no manual JSON edits).
+#   4) Plotter is called with --min_repeats so paper plots only use fully-successful repeats.
+#   5) Optional paper method set control (topk OR explicit list) without hiding raw data.
 #
-#  (A) 冷启动/热缓存偏差 → Δruntime 出现大量负值 / 曲线噪声大
-#      - 新增 warmup repeats：默认多跑 1 次（rep=0）作为 warmup
-#      - 绘图时默认排除 warmup（--warmup_reps）
+# NOTE (integrity):
+#   - This script does NOT delete "unfavorable" raw results.
+#   - It only changes: (i) t-range coverage, (ii) plotting defaults, (iii) reproducibility metadata.
+#   - If you choose to show a method subset in the main paper figure, keep the full outputs
+#     (mode=full) as supplementary material.
 #
-#  (B) Δruntime 图被极端 outlier 压扁
-#      - 新绘图脚本默认用 symlog-y（能同时显示小趋势与大 outlier）
-#      - paper 模式默认只画 2 张图（runtime & Δruntime），每张图 3 个 panel
-#
-#  (C) 图太多、不“论文友好”
-#      - 默认 --plot_mode=paper，只输出 2 张“主图级别”的 PDF/PNG
-#      - 同时输出 ns/sample 的 CSV（用于论文文字/表格）
-#
-# 用法：
+# Usage:
 #   bash run/run_exp2.sh
 #
-# 常用可选参数：
-#   --config <path>         Sweep JSON（默认：config/sweeps/sweep_t.json）
-#   --build_type <type>     Release|Debug|RelWithDebInfo|MinSizeRel（默认：Release）
-#   --clean                 删除 build/<type> 后重建
-#   --no-build              跳过构建
-#   --no-plot               跳过绘图
-#   --threads <int>         覆盖 base.sys.threads（默认：1）
-#   --write_samples <0|1>   覆盖 base.run.write_samples（默认：0）
-#   --repeats <int>         *有效重复次数*（默认：10）
-#   --warmup <int>          额外 warmup 次数（默认：1；绘图会自动排除）
-#   --j_star <u64>          覆盖 base.run.j_star（默认：100000）
+# Examples:
+#   # Paper-only (default), with explicit method set shown in paper figure:
+#   bash run/run_exp2.sh --t_profile paper --paper_methods "ours,pbsm,range_tree,kd_tree"
 #
-# 绘图相关：
-#   --plot_mode <paper|full>    默认 paper（只生成 2 张主图）
-#   --plot_t0 <int>             Δruntime 的 baseline t0（默认：10000）
-#   --plot_error <auto|p95|stdev> 误差条策略（默认：auto）
-#   --topk <int>                paper 图里仅绘制 top-k 最快方法 + ours（默认：6）
-#   --exclude_methods <list>     逗号分隔；从图中排除某些方法（如 rejection）
+#   # Paper + Extended (to show eventual crossover / slope dominance):
+#   bash run/run_exp2.sh --t_profile both
 #
-# 输出目录：
-#   - Temp（每次覆盖）：<repo_root>/run/temp/exp2/
-#   - Final（成功后覆盖同步）：<repo_root>/results/raw/exp2/
+#   # Override t lists:
+#   bash run/run_exp2.sh --t_list_paper "1000,3000,10000,30000,100000,300000,1000000" \
+#                        --t_list_ext   "1000,1000000,3000000,10000000,30000000"
 #
-# 注意：
-#   - repeats 会被 patch 成 (repeats + warmup)，即 raw.csv 里会看到更多 rep。
-#   - exp2_plot.py 会根据 --warmup_reps 自动忽略 rep < warmup。
-#   - 这属于“实验口径修正”（排除冷启动），不改变算法语义。
+# Outputs (fixed):
+#   - Temp (always overwritten):      <repo_root>/run/temp/exp2/
+#   - Final (overwritten on success): <repo_root>/results/raw/exp2/
 #
-
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -61,7 +50,6 @@ trap 'echo -e "[EXP2][FATAL] Failed at line ${LINENO}: ${BASH_COMMAND}" >&2; exi
 # ----------------------------
 log() { echo -e "[EXP2] $*"; }
 die() { echo -e "[EXP2][FATAL] $*" >&2; exit 1; }
-
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"; }
 
 usage() {
@@ -71,25 +59,43 @@ EXP-2 runner (Runtime vs t)
 Usage:
   bash run/run_exp2.sh [options]
 
-Options:
+Core options:
   --config <path>                 Sweep JSON (default: config/sweeps/sweep_t.json)
+  --t_profile <paper|extended|both>  Which t-range(s) to run (default: both)
+
+  --t_list_paper <csv>            Override t-list for paper profile
+  --t_list_ext <csv>              Override t-list for extended profile
+
+Build options:
   --build_type <type>             Release|Debug|RelWithDebInfo|MinSizeRel (default: Release)
   --clean                         Remove build/<type> before building
   --no-build                      Skip build step
-  --no-plot                       Skip plotting step
+
+Run options:
   --threads <int>                 Override base.sys.threads (default: 1)
   --write_samples <0|1>           Override base.run.write_samples (default: 0)
-  --repeats <int>                 Effective repeats used for reporting/plots (default: 10)
-  --warmup <int>                  Extra warmup repeats (excluded from plots) (default: 1)
   --j_star <u64>                  Override base.run.j_star (default: 100000)
 
-Plot options:
-  --plot_mode <paper|full>        Default: paper
-  --plot_t0 <int>                 Baseline t0 for Δruntime (default: 10000)
-  --plot_error <auto|p95|stdev>   Default: auto
-  --topk <int>                    Paper plots: top-k fastest methods + ours (default: 6)
-  --exclude_methods <csv>         Comma-separated methods to exclude in plots (default: empty)
+Repeats:
+  --repeats_paper <int>           Effective repeats for paper profile (default: 10)
+  --warmup_paper <int>            Extra warmup repeats excluded from plots (default: 2)
+  --repeats_ext <int>             Effective repeats for extended profile (default: 5)
+  --warmup_ext <int>              Extra warmup repeats excluded from plots (default: 1)
 
+Plot options:
+  --no-plot                       Skip plotting
+  --plot_mode <paper|full>        Default: paper
+  --plot_t0 <int>                 Baseline t0 for Δruntime (default: 1000)
+  --plot_error <auto|p95|stdev>   Default: auto
+  --paper_with_sample_phase <0|1> Also output sample-phase paper figure (default: 1)
+
+Paper figure method selection:
+  --topk <int>                    Paper plots: top-k fastest methods + always_include (default: 6)
+  --always_include <csv>          Default: ours
+  --paper_methods <csv>           If set, use exactly this comma-list (plus always_include)
+  --exclude_methods <csv>         Methods to exclude from plots (e.g., rejection)
+
+Misc:
   -h, --help                      Show help
 
 Outputs (fixed):
@@ -121,16 +127,8 @@ build_subdir_from_type() {
 find_exe() {
   local build_dir="$1"
   local name="$2"
-
-  if [[ -x "${build_dir}/${name}" ]]; then
-    echo "${build_dir}/${name}"
-    return
-  fi
-  if [[ -x "${build_dir}/apps/${name}" ]]; then
-    echo "${build_dir}/apps/${name}"
-    return
-  fi
-
+  if [[ -x "${build_dir}/${name}" ]]; then echo "${build_dir}/${name}"; return; fi
+  if [[ -x "${build_dir}/apps/${name}" ]]; then echo "${build_dir}/apps/${name}"; return; fi
   local p
   p="$(find "${build_dir}" -type f -name "${name}" -perm -111 2>/dev/null | head -n 1 || true)"
   [[ -n "${p}" ]] || die "Cannot find executable '${name}' under ${build_dir}. Did the build succeed?"
@@ -139,33 +137,288 @@ find_exe() {
 
 to_bool_json() { [[ "$1" == "1" ]] && echo "true" || echo "false"; }
 
+trim() { local s="$*"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf "%s" "${s}"; }
+
+csv_ints_to_json_array() {
+  local csv="$(trim "$1")"
+  [[ -n "${csv}" ]] || die "Empty CSV list"
+  local out="["
+  local first=1
+  IFS=',' read -ra parts <<< "${csv}"
+  for p in "${parts[@]}"; do
+    p="$(trim "${p}")"
+    [[ -z "${p}" ]] && continue
+    [[ "${p}" =~ ^[0-9]+$ ]] || die "Non-integer value in list: '${p}'"
+    if [[ "${first}" -eq 0 ]]; then out+=", "; fi
+    out+="${p}"
+    first=0
+  done
+  out+="]"
+  echo "${out}"
+}
+
 awk_col_idx() {
   local file="$1"
   local col="$2"
   awk -F',' -v c="${col}" 'NR==1{for(i=1;i<=NF;i++){if($i==c){print i; exit}}}' "${file}"
 }
 
+# Extract the effective sweep t-list from a sweep config (best effort across common schemas).
+extract_t_list_csv() {
+  local cfg="$1"
+  jq -r '
+    def first_nonnull(a):
+      reduce a[] as $x (null; . // $x);
+    def axes_t_values:
+      if (.sweep.axes? != null) then
+        ([.sweep.axes[]? | select((.name?=="t") or (.key?=="t") or (.param?=="t")) | .values?] | .[0])
+      else null end;
+
+    def axis_values:
+      if ((.sweep.axis? // "") == "t") then .sweep.values? else null end;
+
+    def candidate:
+      first_nonnull([
+        .sweep.t_list?,
+        .sweep.ts?,
+        .sweep.t_values?,
+        .sweep.t?,
+        (.sweep.params.t?),
+        axis_values,
+        axes_t_values
+      ]);
+
+    (candidate // empty) | if type=="array" then map(tostring)|join(",") else empty end
+  ' "${cfg}"
+}
+
+# Patch the sweep config:
+#   - repeats, threads, write_samples, j_star
+#   - t_list (best effort across common schemas)
+patch_config() {
+  local cfg_in="$1"
+  local cfg_out="$2"
+  local profile="$3"
+  local repeats_total="$4"
+  local repeats_eff="$5"
+  local warmup_reps="$6"
+  local threads="$7"
+  local write_samples_bool="$8"
+  local j_star="$9"
+  local t_list_json="${10}"
+  local ts="${11}"
+
+  jq \
+    --arg profile "${profile}" \
+    --argjson repeats "${repeats_total}" \
+    --argjson repeats_eff "${repeats_eff}" \
+    --argjson warmup_reps "${warmup_reps}" \
+    --argjson threads "${threads}" \
+    --argjson write_samples "${write_samples_bool}" \
+    --argjson j_star "${j_star}" \
+    --argjson t_list "${t_list_json}" \
+    --arg ts "${ts}" \
+    '
+    def set_if_exists(path; val):
+      if (getpath(path) != null) then setpath(path; val) else . end;
+
+    def patch_t(val):
+      .
+      | set_if_exists(["sweep","t_list"]; val)
+      | set_if_exists(["sweep","ts"]; val)
+      | set_if_exists(["sweep","t_values"]; val)
+      | set_if_exists(["sweep","t"]; val)
+      | (if (.sweep.params? != null and .sweep.params.t? != null) then .sweep.params.t = val else . end)
+      | (if ((.sweep.axis? // "") == "t" and .sweep.values? != null) then .sweep.values = val else . end)
+      | (if (.sweep.axes? != null) then
+            .sweep.axes = (.sweep.axes | map(
+              if ((.name?=="t") or (.key?=="t") or (.param?=="t")) then
+                (if .values? != null then .values = val else . end)
+              else .
+              end))
+         else . end);
+
+    .
+    | .base.run.repeats = $repeats
+    | .base.run.j_star = $j_star
+    | .base.sys.threads = $threads
+    | .base.run.write_samples = $write_samples
+    | .sweep.repeats = $repeats
+    | patch_t($t_list)
+    | .meta.patch = {
+        "timestamp": $ts,
+        "patched_by": "run/run_exp2.sh",
+        "profile": $profile,
+        "overrides": {
+          "threads": $threads,
+          "write_samples": $write_samples,
+          "j_star": $j_star,
+          "repeats_total": $repeats,
+          "repeats_effective": $repeats_eff,
+          "warmup_reps": $warmup_reps,
+          "t_list": $t_list
+        }
+      }
+    ' "${cfg_in}" > "${cfg_out}"
+}
+
+run_sweep_and_plot() {
+  local profile="$1"
+  local t_list_csv="$2"
+  local repeats_eff="$3"
+  local warmup_reps="$4"
+
+  local total_repeats=$((repeats_eff + warmup_reps))
+  local out_dir="${TEMP_DIR}/${profile}"
+  mkdir -p "${out_dir}/logs"
+
+  log "------------------------------"
+  log "PROFILE=${profile}"
+  log "t_list=${t_list_csv}"
+  log "repeats_effective=${repeats_eff} warmup=${warmup_reps} total=${total_repeats}"
+  log "------------------------------"
+
+  local orig_cfg_copy="${out_dir}/sweep_original.json"
+  local patched_cfg="${out_dir}/sweep_used.json"
+  cp -f "${CONFIG}" "${orig_cfg_copy}"
+
+  local t_list_json
+  t_list_json="$(csv_ints_to_json_array "${t_list_csv}")"
+
+  local write_samples_bool
+  write_samples_bool="$(to_bool_json "${WRITE_SAMPLES}")"
+
+  patch_config "${orig_cfg_copy}" "${patched_cfg}" "${profile}" \
+    "${total_repeats}" "${repeats_eff}" "${warmup_reps}" \
+    "${THREADS}" "${write_samples_bool}" "${J_STAR}" \
+    "${t_list_json}" "${TS}"
+
+  # Validate t-list extraction worked and includes t0 (for consistent Δruntime).
+  local t_list_used
+  t_list_used="$(extract_t_list_csv "${patched_cfg}")"
+  [[ -n "${t_list_used}" ]] || die "Could not extract t-list from patched config (${patched_cfg}). Please update patch_t() candidates."
+  log "t_list_used(extracted)=${t_list_used}"
+  if ! echo ",${t_list_used}," | grep -q ",${PLOT_T0},"; then
+    die "plot_t0=${PLOT_T0} is not present in the sweep t-list for profile=${profile}. Fix --plot_t0 or --t_list_*."
+  fi
+
+  # Write per-profile manifest.
+  {
+    echo "EXP-2 profile manifest"
+    echo "timestamp=${TS}"
+    echo "profile=${profile}"
+    echo "repo_root=${REPO_ROOT}"
+    echo "config_in=${CONFIG}"
+    echo "config_used=${patched_cfg}"
+    echo "threads=${THREADS}"
+    echo "write_samples=${WRITE_SAMPLES}"
+    echo "j_star=${J_STAR}"
+    echo "t_list_requested=${t_list_csv}"
+    echo "t_list_used=${t_list_used}"
+    echo "repeats_effective=${repeats_eff}"
+    echo "warmup_reps=${warmup_reps}"
+    echo "repeats_total=${total_repeats}"
+    echo "plot_mode=${PLOT_MODE}"
+    echo "plot_t0=${PLOT_T0}"
+    echo "plot_error=${PLOT_ERROR}"
+    echo "paper_with_sample_phase=${PAPER_WITH_SAMPLE_PHASE}"
+    echo "topk=${TOPK}"
+    echo "always_include=${ALWAYS_INCLUDE}"
+    echo "paper_methods=${PAPER_METHODS}"
+    echo "exclude_methods=${EXCLUDE_METHODS}"
+    echo "out_dir=${out_dir}"
+  } > "${out_dir}/MANIFEST.txt"
+
+  # Run sweep
+  log "Running sjs_sweep for profile=${profile} ..."
+  pushd "${REPO_ROOT}" >/dev/null
+  set +e
+  "${SJS_SWEEP}" \
+    --config="${patched_cfg}" \
+    --out_dir="${out_dir}" \
+    --raw_file="sweep_raw.csv" \
+    --summary_file="sweep_summary.csv" \
+    2>&1 | tee "${out_dir}/logs/sjs_sweep.log"
+  local rc="${PIPESTATUS[0]}"
+  set -e
+  popd >/dev/null
+  [[ "${rc}" -eq 0 ]] || die "sjs_sweep failed for profile=${profile} (exit=${rc}). See ${out_dir}/logs/sjs_sweep.log"
+
+  [[ -f "${out_dir}/sweep_raw.csv" ]] || die "Missing ${out_dir}/sweep_raw.csv"
+  [[ -f "${out_dir}/sweep_summary.csv" ]] || die "Missing ${out_dir}/sweep_summary.csv"
+
+  # Fast sanity: count_mean should be constant across t (fixed dataset).
+  local sum_path="${out_dir}/sweep_summary.csv"
+  local idx_ok idx_cnt
+  idx_ok="$(awk_col_idx "${sum_path}" "ok_rate")"
+  idx_cnt="$(awk_col_idx "${sum_path}" "count_mean")"
+  if [[ -n "${idx_ok}" && -n "${idx_cnt}" ]]; then
+    local cnt_minmax
+    cnt_minmax="$(awk -F',' -v okc="${idx_ok}" -v cc="${idx_cnt}" 'NR>1 && $okc==1 {v=$cc; if(min==""||v<min)min=v; if(max==""||v>max)max=v} END{if(min!="")printf("min=%s max=%s",min,max)}' "${sum_path}")"
+    log "[${profile}] count_mean over ok points: ${cnt_minmax:-<none>}"
+  fi
+
+  # Plot
+  if [[ "${DO_PLOT}" -eq 1 ]]; then
+    if command -v python3 >/dev/null 2>&1; then
+      log "Plotting profile=${profile} ..."
+      python3 "${PLOT_SCRIPT}" \
+        --out_dir "${out_dir}" \
+        --t0 "${PLOT_T0}" \
+        --error "${PLOT_ERROR}" \
+        --warmup_reps "${warmup_reps}" \
+        --mode "${PLOT_MODE}" \
+        --topk "${TOPK}" \
+        --always_include "${ALWAYS_INCLUDE}" \
+        --paper_methods "${PAPER_METHODS}" \
+        --exclude_methods "${EXCLUDE_METHODS}" \
+        --min_repeats "${repeats_eff}" \
+        --paper_with_sample_phase "${PAPER_WITH_SAMPLE_PHASE}" \
+        2>&1 | tee "${out_dir}/logs/plot_exp2.log"
+    else
+      log "python3 not found; skipping plot step for profile=${profile}."
+    fi
+  else
+    log "Plot step disabled (--no-plot)."
+  fi
+}
+
 # ----------------------------
-# Resolve paths (relative to this script)
+# Resolve paths
 # ----------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # ----------------------------
-# Defaults (paper-friendly)
+# Defaults
 # ----------------------------
 CONFIG="config/sweeps/sweep_t.json"
+T_PROFILE="both"
+
+# Default t-lists:
+# - paper:   standard range (as in EXP-2 doc)
+# - ext:     includes bigger t to make slope dominance / crossover visible
+T_LIST_PAPER="1000,3000,10000,30000,100000,300000,1000000"
+T_LIST_EXT="1000,1000000,3000000,10000000,30000000"
+
 BUILD_TYPE="Release"
 THREADS=1
 WRITE_SAMPLES=0
-REPEATS=10        # effective repeats (excluding warmup)
-WARMUP=1          # extra repeats to warm cache; excluded from plots
 J_STAR=100000
 
+REPEATS_PAPER=10
+WARMUP_PAPER=2
+REPEATS_EXT=5
+WARMUP_EXT=1
+
 PLOT_MODE="paper"
-PLOT_T0=10000
+PLOT_T0=1000
 PLOT_ERROR="auto"
+PAPER_WITH_SAMPLE_PHASE=1
+
 TOPK=6
+ALWAYS_INCLUDE="ours"
+PAPER_METHODS=""
 EXCLUDE_METHODS=""
 
 DO_CLEAN=0
@@ -177,22 +430,36 @@ DO_PLOT=1
 # ----------------------------
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --config)          CONFIG="$2"; shift 2;;
-    --build_type)      BUILD_TYPE="$2"; shift 2;;
-    --threads)         THREADS="$2"; shift 2;;
-    --write_samples)   WRITE_SAMPLES="$2"; shift 2;;
-    --repeats)         REPEATS="$2"; shift 2;;
-    --warmup)          WARMUP="$2"; shift 2;;
-    --j_star)          J_STAR="$2"; shift 2;;
-    --plot_mode)       PLOT_MODE="$2"; shift 2;;
-    --plot_t0)         PLOT_T0="$2"; shift 2;;
-    --plot_error)      PLOT_ERROR="$2"; shift 2;;
-    --topk)            TOPK="$2"; shift 2;;
-    --exclude_methods) EXCLUDE_METHODS="$2"; shift 2;;
-    --clean)           DO_CLEAN=1; shift;;
-    --no-build)        DO_BUILD=0; shift;;
-    --no-plot)         DO_PLOT=0; shift;;
-    -h|--help)         usage; exit 0;;
+    --config)            CONFIG="$2"; shift 2;;
+    --t_profile)         T_PROFILE="$2"; shift 2;;
+    --t_list_paper)      T_LIST_PAPER="$2"; shift 2;;
+    --t_list_ext)        T_LIST_EXT="$2"; shift 2;;
+
+    --build_type)        BUILD_TYPE="$2"; shift 2;;
+    --threads)           THREADS="$2"; shift 2;;
+    --write_samples)     WRITE_SAMPLES="$2"; shift 2;;
+    --j_star)            J_STAR="$2"; shift 2;;
+
+    --repeats_paper)     REPEATS_PAPER="$2"; shift 2;;
+    --warmup_paper)      WARMUP_PAPER="$2"; shift 2;;
+    --repeats_ext)       REPEATS_EXT="$2"; shift 2;;
+    --warmup_ext)        WARMUP_EXT="$2"; shift 2;;
+
+    --plot_mode)         PLOT_MODE="$2"; shift 2;;
+    --plot_t0)           PLOT_T0="$2"; shift 2;;
+    --plot_error)        PLOT_ERROR="$2"; shift 2;;
+    --paper_with_sample_phase) PAPER_WITH_SAMPLE_PHASE="$2"; shift 2;;
+
+    --topk)              TOPK="$2"; shift 2;;
+    --always_include)    ALWAYS_INCLUDE="$2"; shift 2;;
+    --paper_methods)     PAPER_METHODS="$2"; shift 2;;
+    --exclude_methods)   EXCLUDE_METHODS="$2"; shift 2;;
+
+    --clean)             DO_CLEAN=1; shift;;
+    --no-build)          DO_BUILD=0; shift;;
+    --no-plot)           DO_PLOT=0; shift;;
+
+    -h|--help)           usage; exit 0;;
     *) die "Unknown argument: $1 (try --help)";;
   esac
 done
@@ -222,122 +489,83 @@ need_cmd sort
 
 if ! [[ "${THREADS}" =~ ^[0-9]+$ ]] || [[ "${THREADS}" -le 0 ]]; then die "--threads must be a positive integer"; fi
 if [[ "${WRITE_SAMPLES}" != "0" && "${WRITE_SAMPLES}" != "1" ]]; then die "--write_samples must be 0 or 1"; fi
-if ! [[ "${REPEATS}" =~ ^[0-9]+$ ]] || [[ "${REPEATS}" -le 0 ]]; then die "--repeats must be a positive integer"; fi
-if ! [[ "${WARMUP}" =~ ^[0-9]+$ ]] || [[ "${WARMUP}" -lt 0 ]]; then die "--warmup must be a non-negative integer"; fi
 if ! [[ "${J_STAR}" =~ ^[0-9]+$ ]]; then die "--j_star must be a non-negative integer"; fi
+
+if [[ "${T_PROFILE}" != "paper" && "${T_PROFILE}" != "extended" && "${T_PROFILE}" != "both" ]]; then
+  die "--t_profile must be paper|extended|both"
+fi
+
+for v in "${REPEATS_PAPER}" "${WARMUP_PAPER}" "${REPEATS_EXT}" "${WARMUP_EXT}"; do
+  if ! [[ "${v}" =~ ^[0-9]+$ ]]; then die "Repeats/warmup values must be integers"; fi
+done
 
 if [[ "${PLOT_MODE}" != "paper" && "${PLOT_MODE}" != "full" ]]; then die "--plot_mode must be paper|full"; fi
 if ! [[ "${PLOT_T0}" =~ ^[0-9]+$ ]] || [[ "${PLOT_T0}" -le 0 ]]; then die "--plot_t0 must be a positive integer"; fi
 if [[ "${PLOT_ERROR}" != "auto" && "${PLOT_ERROR}" != "p95" && "${PLOT_ERROR}" != "stdev" ]]; then die "--plot_error must be auto|p95|stdev"; fi
 if ! [[ "${TOPK}" =~ ^[0-9]+$ ]] || [[ "${TOPK}" -le 0 ]]; then die "--topk must be a positive integer"; fi
+if [[ "${PAPER_WITH_SAMPLE_PHASE}" != "0" && "${PAPER_WITH_SAMPLE_PHASE}" != "1" ]]; then die "--paper_with_sample_phase must be 0 or 1"; fi
 
-TOTAL_REPEATS=$((REPEATS + WARMUP))
-
-# Clean temp (always overwrite temp).
+# Clean temp (always overwrite temp)
 rm -rf "${TEMP_DIR}"
 mkdir -p "${TEMP_DIR}/logs"
 
 TS="$(date +%Y%m%d_%H%M%S)"
 
-log "Repo root     : ${REPO_ROOT}"
-log "Config (in)   : ${CONFIG}"
-log "Build type    : ${BUILD_TYPE}"
-log "Build dir     : ${BUILD_DIR}"
-log "Threads       : ${THREADS}"
-log "write_samples : ${WRITE_SAMPLES}"
-log "repeats(eff)  : ${REPEATS}"
-log "warmup reps   : ${WARMUP}"
-log "repeats(total): ${TOTAL_REPEATS}"
-log "j_star        : ${J_STAR}"
-log "plot_mode     : ${PLOT_MODE}"
-log "plot_t0       : ${PLOT_T0}"
-log "plot_error    : ${PLOT_ERROR}"
-log "topk          : ${TOPK}"
+log "Repo root      : ${REPO_ROOT}"
+log "Config (in)    : ${CONFIG}"
+log "t_profile      : ${T_PROFILE}"
+log "t_list_paper   : ${T_LIST_PAPER}"
+log "t_list_ext     : ${T_LIST_EXT}"
+log "Build type     : ${BUILD_TYPE}"
+log "Build dir      : ${BUILD_DIR}"
+log "Threads        : ${THREADS}"
+log "write_samples  : ${WRITE_SAMPLES}"
+log "j_star         : ${J_STAR}"
+log "paper repeats  : eff=${REPEATS_PAPER} warmup=${WARMUP_PAPER}"
+log "ext repeats    : eff=${REPEATS_EXT} warmup=${WARMUP_EXT}"
+log "plot_mode      : ${PLOT_MODE}"
+log "plot_t0        : ${PLOT_T0}"
+log "plot_error     : ${PLOT_ERROR}"
+log "paper_with_sample_phase: ${PAPER_WITH_SAMPLE_PHASE}"
+log "topk           : ${TOPK}"
+log "always_include : ${ALWAYS_INCLUDE}"
+log "paper_methods  : ${PAPER_METHODS:-<auto/topk>}"
 log "exclude_methods: ${EXCLUDE_METHODS:-<none>}"
-log "Temp dir      : ${TEMP_DIR}"
-log "Final results : ${RESULT_DIR} (will be overwritten on success)"
+log "Temp dir       : ${TEMP_DIR}"
+log "Final results  : ${RESULT_DIR} (will be overwritten on success)"
 
-# Force single-thread behavior for common libs.
+# Force single-thread behavior for common libs
 export OMP_NUM_THREADS="${THREADS}"
 export MKL_NUM_THREADS="${THREADS}"
 export OPENBLAS_NUM_THREADS="${THREADS}"
 export VECLIB_MAXIMUM_THREADS="${THREADS}"
 export NUMEXPR_NUM_THREADS="${THREADS}"
 
-# ----------------------------
-# Patch sweep config (so overrides REALLY take effect)
-# ----------------------------
-ORIG_CFG_COPY="${TEMP_DIR}/sweep_t_original.json"
-PATCHED_CFG="${TEMP_DIR}/sweep_t_used.json"
-
-cp -f "${CONFIG}" "${ORIG_CFG_COPY}"
-
-WRITE_SAMPLES_BOOL="$(to_bool_json "${WRITE_SAMPLES}")"
-
-jq \
-  --argjson repeats "${TOTAL_REPEATS}" \
-  --argjson repeats_eff "${REPEATS}" \
-  --argjson warmup_reps "${WARMUP}" \
-  --argjson j_star "${J_STAR}" \
-  --argjson threads "${THREADS}" \
-  --argjson write_samples "${WRITE_SAMPLES_BOOL}" \
-  --arg ts "${TS}" \
-  '.base.run.repeats = $repeats
-   | .base.run.j_star = $j_star
-   | .base.sys.threads = $threads
-   | .base.run.write_samples = $write_samples
-   | .sweep.repeats = $repeats
-   | .meta.patch = {
-        "timestamp": $ts,
-        "patched_by": "run/run_exp2.sh",
-        "overrides": {
-          "threads": $threads,
-          "write_samples": $write_samples,
-          "j_star": $j_star,
-          "repeats_total": $repeats,
-          "repeats_effective": $repeats_eff,
-          "warmup_reps": $warmup_reps
-        }
-     }
-  ' "${ORIG_CFG_COPY}" > "${PATCHED_CFG}"
-
-# Save environment + manifest.
+# Save environment
 {
-  echo "EXP-2 manifest"
   echo "timestamp=${TS}"
   echo "repo_root=${REPO_ROOT}"
   echo "config_in=${CONFIG}"
-  echo "config_used=${PATCHED_CFG}"
   echo "build_type=${BUILD_TYPE}"
   echo "build_dir=${BUILD_DIR}"
+  echo "t_profile=${T_PROFILE}"
+  echo "t_list_paper=${T_LIST_PAPER}"
+  echo "t_list_ext=${T_LIST_EXT}"
   echo "threads=${THREADS}"
   echo "write_samples=${WRITE_SAMPLES}"
-  echo "repeats_effective=${REPEATS}"
-  echo "warmup_reps=${WARMUP}"
-  echo "repeats_total=${TOTAL_REPEATS}"
   echo "j_star=${J_STAR}"
+  echo "repeats_paper_effective=${REPEATS_PAPER}"
+  echo "warmup_paper=${WARMUP_PAPER}"
+  echo "repeats_ext_effective=${REPEATS_EXT}"
+  echo "warmup_ext=${WARMUP_EXT}"
   echo "plot_mode=${PLOT_MODE}"
   echo "plot_t0=${PLOT_T0}"
   echo "plot_error=${PLOT_ERROR}"
+  echo "paper_with_sample_phase=${PAPER_WITH_SAMPLE_PHASE}"
   echo "topk=${TOPK}"
+  echo "always_include=${ALWAYS_INCLUDE}"
+  echo "paper_methods=${PAPER_METHODS}"
   echo "exclude_methods=${EXCLUDE_METHODS}"
-  echo "temp_dir=${TEMP_DIR}"
-  echo "result_dir=${RESULT_DIR}"
-} > "${TEMP_DIR}/MANIFEST.txt"
-
-{
-  echo "timestamp=${TS}"
-  echo "repo_root=${REPO_ROOT}"
-  echo "config_in=${CONFIG}"
-  echo "config_used=${PATCHED_CFG}"
-  echo "build_dir=${BUILD_DIR}"
-  echo "temp_dir=${TEMP_DIR}"
-  echo "threads=${THREADS}"
-  echo "write_samples=${WRITE_SAMPLES}"
-  echo "repeats_effective=${REPEATS}"
-  echo "warmup_reps=${WARMUP}"
-  echo "repeats_total=${TOTAL_REPEATS}"
-  echo "j_star=${J_STAR}"
   echo
   echo "uname:"; uname -a || true
   echo
@@ -380,96 +608,22 @@ fi
 SJS_SWEEP="$(find_exe "${BUILD_DIR}" "sjs_sweep")"
 log "Using sjs_sweep: ${SJS_SWEEP}"
 
+# Plot script location (prefer run/include/exp2_plot.py)
+PLOT_SCRIPT="${REPO_ROOT}/run/include/exp2_plot.py"
+if [[ ! -f "${PLOT_SCRIPT}" ]]; then
+  PLOT_SCRIPT="${REPO_ROOT}/run/plot_exp2.py"
+fi
+[[ -f "${PLOT_SCRIPT}" ]] || die "Missing plot script at run/include/exp2_plot.py or run/plot_exp2.py"
+
 # ----------------------------
-# Run sweep
+# Run profiles
 # ----------------------------
-OUT_DIR="${TEMP_DIR}"
-RAW_FILE="sweep_raw.csv"
-SUMMARY_FILE="sweep_summary.csv"
-
-log "Running sweep (methods × variants × t × repeats_total=${TOTAL_REPEATS})..."
-log "Config used: ${PATCHED_CFG}"
-
-pushd "${REPO_ROOT}" >/dev/null
-set +e
-"${SJS_SWEEP}" \
-  --config="${PATCHED_CFG}" \
-  --out_dir="${OUT_DIR}" \
-  --raw_file="${RAW_FILE}" \
-  --summary_file="${SUMMARY_FILE}" \
-  2>&1 | tee "${TEMP_DIR}/logs/sjs_sweep.log"
-rc="${PIPESTATUS[0]}"
-set -e
-popd >/dev/null
-
-if [[ "${rc}" -ne 0 ]]; then
-  die "sjs_sweep failed with exit code ${rc}. See ${TEMP_DIR}/logs/sjs_sweep.log"
+if [[ "${T_PROFILE}" == "paper" || "${T_PROFILE}" == "both" ]]; then
+  run_sweep_and_plot "paper" "${T_LIST_PAPER}" "${REPEATS_PAPER}" "${WARMUP_PAPER}"
 fi
 
-[[ -f "${OUT_DIR}/${RAW_FILE}" ]] || die "Missing expected output: ${OUT_DIR}/${RAW_FILE}"
-[[ -f "${OUT_DIR}/${SUMMARY_FILE}" ]] || die "Missing expected output: ${OUT_DIR}/${SUMMARY_FILE}"
-
-log "Sweep finished OK."
-log "Raw     : ${OUT_DIR}/${RAW_FILE}"
-log "Summary : ${OUT_DIR}/${SUMMARY_FILE}"
-
-# ----------------------------
-# Post-checks (fast sanity)
-# ----------------------------
-SUM_PATH="${OUT_DIR}/${SUMMARY_FILE}"
-RAW_PATH="${OUT_DIR}/${RAW_FILE}"
-
-idx_ok="$(awk_col_idx "${SUM_PATH}" "ok_rate")"
-idx_rep="$(awk_col_idx "${SUM_PATH}" "repeats")"
-idx_cnt="$(awk_col_idx "${SUM_PATH}" "count_mean")"
-
-if [[ -n "${idx_ok}" && -n "${idx_rep}" ]]; then
-  uniq_repeats="$(awk -F',' -v okc="${idx_ok}" -v rc="${idx_rep}" 'NR>1 && $okc==1 {print $rc}' "${SUM_PATH}" | sort -u | tr '\n' ' ')"
-  log "Summary ok points repeats values (includes warmup): ${uniq_repeats:-<none>}"
-fi
-
-if [[ -n "${idx_ok}" && -n "${idx_cnt}" ]]; then
-  cnt_minmax="$(awk -F',' -v okc="${idx_ok}" -v cc="${idx_cnt}" 'NR>1 && $okc==1 {v=$cc; if(min==""||v<min)min=v; if(max==""||v>max)max=v} END{if(min!="")printf("min=%s max=%s",min,max)}' "${SUM_PATH}")"
-  log "count_mean over ok points: ${cnt_minmax:-<none>}"
-fi
-
-# Adaptive branch stats (from raw)
-idx_raw_ok="$(awk_col_idx "${RAW_PATH}" "ok")"
-idx_raw_var="$(awk_col_idx "${RAW_PATH}" "variant")"
-idx_raw_branch="$(awk_col_idx "${RAW_PATH}" "adaptive_branch")"
-
-if [[ -n "${idx_raw_ok}" && -n "${idx_raw_var}" && -n "${idx_raw_branch}" ]]; then
-  branch_stats="$(awk -F',' -v okc="${idx_raw_ok}" -v vc="${idx_raw_var}" -v bc="${idx_raw_branch}" 'NR>1 && $okc==1 && $vc=="adaptive" {cnt[$bc]++} END{for(k in cnt){printf("%s:%d ",k,cnt[k])}}' "${RAW_PATH}")"
-  log "Adaptive branches (ok runs): ${branch_stats:-<none>}"
-fi
-
-# ----------------------------
-# Plot
-# ----------------------------
-if [[ "${DO_PLOT}" -eq 1 ]]; then
-  if command -v python3 >/dev/null 2>&1; then
-    # Prefer new location; fall back for legacy repos.
-    PLOT_SCRIPT="${REPO_ROOT}/run/include/exp2_plot.py"
-    if [[ ! -f "${PLOT_SCRIPT}" ]]; then
-      PLOT_SCRIPT="${REPO_ROOT}/run/plot_exp2.py"
-    fi
-    [[ -f "${PLOT_SCRIPT}" ]] || die "Missing plot script at run/include/exp2_plot.py or run/plot_exp2.py"
-
-    log "Generating plots via: ${PLOT_SCRIPT}"
-    python3 "${PLOT_SCRIPT}" \
-      --out_dir "${OUT_DIR}" \
-      --t0 "${PLOT_T0}" \
-      --error "${PLOT_ERROR}" \
-      --warmup_reps "${WARMUP}" \
-      --mode "${PLOT_MODE}" \
-      --topk "${TOPK}" \
-      --exclude_methods "${EXCLUDE_METHODS}" \
-      2>&1 | tee "${TEMP_DIR}/logs/plot_exp2.log"
-  else
-    log "python3 not found; skipping plot step."
-  fi
-else
-  log "Plot step disabled (--no-plot)."
+if [[ "${T_PROFILE}" == "extended" || "${T_PROFILE}" == "both" ]]; then
+  run_sweep_and_plot "extended" "${T_LIST_EXT}" "${REPEATS_EXT}" "${WARMUP_EXT}"
 fi
 
 # ----------------------------

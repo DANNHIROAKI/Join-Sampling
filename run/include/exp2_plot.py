@@ -3,38 +3,28 @@
 
 Paper-friendly plotting for EXP-2 (Runtime vs t).
 
-This version is designed to produce *publication-ready* figures with **minimal**
-plots while staying faithful to the raw measurements.
+This is a drop-in replacement of the EXP-2 plotter with two extra goals:
+  1) Paper figures should use *consistent* repeats across points.
+  2) The script should *not silently hide issues*: it writes a drop report if any
+     (variant,method,t) points are excluded due to insufficient repeats.
 
-Key improvements over the original script:
-  1) Warmup exclusion (fixes cold-start bias / negative Δruntime artifacts):
-       - pass --warmup_reps K to drop rep=0..K-1 from all plotted statistics.
-       - NOTE: this assumes rep is 0-based and consecutive (as produced by sjs_sweep).
-
-  2) Plot from sweep_raw.csv (not sweep_summary.csv):
-       - ensures the warmup policy is respected (summary includes warmup by design).
-       - avoids any summary/plot mismatch when we intentionally change repeats.
-
-  3) Robust sample-phase extraction:
-       - supports a wider set of phases_json keys (including adaptive fallback names)
-       - plus a conservative heuristic fallback for unknown key names.
-
-  4) Fewer, cleaner plots (default --mode=paper):
-       - exp2_paper_runtime_vs_t.(pdf|png): 1 figure with 3 panels (sampling / enum_sampling / adaptive)
-       - exp2_paper_delta_vs_t.(pdf|png): 1 figure with 3 panels (symlog-y; readable even with huge outliers)
-       - exp2_ns_per_sample.csv: slope table (from sample-phase medians)
+Compared with the baseline plotter:
+  - default t0=1000
+  - new arg: --min_repeats (paper plots only include points with n>=min_repeats)
+  - new arg: --paper_with_sample_phase (paper mode also writes sample-phase figure)
+  - error_mode=auto uses --min_repeats (if set) to decide p95 vs stdev.
 
 Inputs (under --out_dir):
   sweep_raw.csv
-  sweep_summary.csv (optional; only used for sanity checks / metadata)
+  sweep_summary.csv (optional)
 
 Outputs (written into --out_dir):
   exp2_paper_runtime_vs_t.pdf/.png
   exp2_paper_delta_vs_t.pdf/.png
+  exp2_paper_sample_phase_vs_t.pdf/.png  (optional)
   exp2_ns_per_sample.csv
   EXP2_README.txt
-
-Optional: --mode=full also writes the per-variant figures (similar to the original script).
+  exp2_dropped_points.csv  (if any)
 """
 
 from __future__ import annotations
@@ -46,7 +36,7 @@ import math
 import os
 import statistics
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 
 # ----------------------------
@@ -111,7 +101,7 @@ def split_csv_list(s: str) -> List[str]:
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out_dir", required=True, help="EXP-2 output directory containing sweep_raw.csv")
-    ap.add_argument("--t0", type=int, default=10000, help="Baseline t0 for Δruntime plot (default: 10000)")
+    ap.add_argument("--t0", type=int, default=1000, help="Baseline t0 for Δruntime plot (default: 1000)")
     ap.add_argument(
         "--error",
         choices=["auto", "p95", "stdev"],
@@ -122,13 +112,19 @@ def parse_args() -> argparse.Namespace:
         "--warmup_reps",
         type=int,
         default=0,
-        help="Exclude rep < warmup_reps from all plotted stats (default: 0). Useful if the runner adds warmup.",
+        help="Exclude rep < warmup_reps from all plotted stats (default: 0).",
+    )
+    ap.add_argument(
+        "--min_repeats",
+        type=int,
+        default=0,
+        help="If >0, paper plots only include points with n>=min_repeats (after warmup filtering).",
     )
     ap.add_argument(
         "--mode",
         choices=["paper", "full"],
         default="paper",
-        help="paper: 2 concise paper-ready figures; full: also output per-variant diagnostics.",
+        help="paper: concise figures; full: also output per-variant diagnostics.",
     )
     ap.add_argument(
         "--topk",
@@ -150,6 +146,12 @@ def parse_args() -> argparse.Namespace:
         "--exclude_methods",
         default="",
         help="Comma list of methods to exclude from plots (e.g., rejection).",
+    )
+    ap.add_argument(
+        "--paper_with_sample_phase",
+        type=int,
+        default=1,
+        help="If 1, also output exp2_paper_sample_phase_vs_t.(pdf|png) when available (default: 1).",
     )
     return ap.parse_args()
 
@@ -190,31 +192,31 @@ def read_raw_rows(raw_path: str, warmup_reps: int) -> List[Dict[str, str]]:
             if math.isnan(wall) or wall <= 0:
                 continue
 
-            # Keep as-is (strings); we parse fields on demand.
             rows.append(row)
     return rows
 
 
-def choose_error_mode(aggs: List[Agg], requested: str) -> str:
+def choose_error_mode(aggs: List[Agg], requested: str, min_repeats: int) -> str:
     if requested != "auto":
         return requested
-    # p95 needs enough repeats per point to be meaningful.
-    min_n = min((a.n for a in aggs), default=0)
-    if min_n >= 10:
+    # If the runner tells us the effective repeats (min_repeats), prefer that.
+    if min_repeats and min_repeats >= 10:
         return "p95"
-    return "stdev"
+    # Otherwise fall back to observed min-n.
+    min_n = min((a.n for a in aggs), default=0)
+    return "p95" if min_n >= 10 else "stdev"
 
 
-def aggregate_wall(rows: List[Dict[str, str]]) -> List[Agg]:
+def aggregate_metric(rows: List[Dict[str, str]], key: str) -> List[Agg]:
     grouped: Dict[Tuple[str, str, int], List[float]] = {}
     for row in rows:
         variant = row.get("variant", "")
         method = row.get("method", "")
         t = to_int(row.get("t", "0"), 0)
-        wall = to_float(row.get("wall_ms", "nan"))
-        if t <= 0 or math.isnan(wall) or wall <= 0:
+        v = to_float(row.get(key, "nan"))
+        if t <= 0 or math.isnan(v) or v <= 0:
             continue
-        grouped.setdefault((variant, method, t), []).append(wall)
+        grouped.setdefault((variant, method, t), []).append(v)
 
     out: List[Agg] = []
     for (variant, method, t), vals in grouped.items():
@@ -236,12 +238,11 @@ def aggregate_wall(rows: List[Dict[str, str]]) -> List[Agg]:
 # Robust sample-phase extraction
 # ----------------------------
 _PHASE_KEYS_PRIORITY: Tuple[str, ...] = (
-    # Common
     "run_sample_ms",
     "sample_ms",
     "phase3_sample_ms",
     "phase3_ms",
-    # Adaptive/fallback variants (common names seen in practice)
+    # Adaptive/fallback variants
     "run_fallback_sample_ms",
     "fallback_sample_ms",
     "fallback_sampling_ms",
@@ -254,18 +255,9 @@ _PHASE_KEYS_PRIORITY: Tuple[str, ...] = (
 
 
 def _extract_sample_ms(phases: object) -> Optional[float]:
-    """Return sample-phase time (ms) from phases_json.
-
-    Strategy:
-      1) Match known keys in a priority list.
-      2) Conservative heuristic: among keys that look like time in ms and contain
-         'sample', pick the *largest* value (sample phase is typically the dominant
-         '...sample...' timing component within one run).
-    """
     if not isinstance(phases, dict):
         return None
 
-    # 1) direct priority match
     for k in _PHASE_KEYS_PRIORITY:
         if k in phases:
             try:
@@ -275,7 +267,6 @@ def _extract_sample_ms(phases: object) -> Optional[float]:
             if v > 0:
                 return v
 
-    # 2) heuristic fallback
     cand: List[float] = []
     for k, v in phases.items():
         if not isinstance(k, str):
@@ -291,10 +282,8 @@ def _extract_sample_ms(phases: object) -> Optional[float]:
             continue
         if fv > 0:
             cand.append(fv)
-    if cand:
-        return max(cand)
 
-    return None
+    return max(cand) if cand else None
 
 
 def aggregate_sample_phase(rows: List[Dict[str, str]]) -> List[Agg]:
@@ -317,7 +306,6 @@ def aggregate_sample_phase(rows: List[Dict[str, str]]) -> List[Agg]:
         sample_ms = _extract_sample_ms(phases)
         if sample_ms is None:
             continue
-
         grouped.setdefault((variant, method, t), []).append(sample_ms)
 
     out: List[Agg] = []
@@ -339,12 +327,7 @@ def aggregate_sample_phase(rows: List[Dict[str, str]]) -> List[Agg]:
 # ----------------------------
 # Δruntime (per-rep baseline)
 # ----------------------------
-def compute_delta_rows(
-    rows: List[Dict[str, str]],
-    t0: int,
-    require_t0: bool,
-) -> List[Agg]:
-    # Collect (t, rep, wall) per (variant, method)
+def compute_delta_rows(rows: List[Dict[str, str]], t0: int, require_t0: bool) -> List[Agg]:
     by_vm: Dict[Tuple[str, str], List[Tuple[int, int, float]]] = {}
     for row in rows:
         variant = row.get("variant", "")
@@ -363,7 +346,6 @@ def compute_delta_rows(
         if not ts:
             continue
         if require_t0 and (t0 not in ts):
-            # Skip this method entirely to keep a consistent baseline across methods.
             continue
         t0_used = t0 if (t0 in ts) else ts[0]
 
@@ -380,8 +362,6 @@ def compute_delta_rows(
 
     out: List[Agg] = []
     for (variant, method, t), deltas in grouped.items():
-        if not deltas:
-            continue
         out.append(
             Agg(
                 variant=variant,
@@ -397,10 +377,37 @@ def compute_delta_rows(
 
 
 # ----------------------------
+# Filtering + reporting
+# ----------------------------
+def filter_by_min_repeats(aggs: List[Agg], min_repeats: int) -> Tuple[List[Agg], List[Tuple[str, str, int, int]]]:
+    if min_repeats <= 0:
+        return aggs, []
+    kept: List[Agg] = []
+    dropped: List[Tuple[str, str, int, int]] = []
+    for a in aggs:
+        if a.n >= min_repeats:
+            kept.append(a)
+        else:
+            dropped.append((a.variant, a.method, a.t, a.n))
+    return kept, dropped
+
+
+def write_drop_report(out_dir: str, dropped: List[Tuple[str, str, int, int]], min_repeats: int) -> None:
+    if not dropped:
+        return
+    path = os.path.join(out_dir, "exp2_dropped_points.csv")
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["variant", "method", "t", "n_ok_after_warmup", "min_repeats_required"])
+        for (variant, method, t, n) in sorted(dropped):
+            w.writerow([variant, method, t, n, min_repeats])
+    print(f"[EXP2][PLOT] wrote {path} (dropped {len(dropped)} points)")
+
+
+# ----------------------------
 # ns/sample table
 # ----------------------------
 def regression_slope(xs: List[float], ys: List[float]) -> float:
-    """Return slope in (y units)/(x units)."""
     if len(xs) < 2:
         return float("nan")
     mx = sum(xs) / len(xs)
@@ -414,7 +421,6 @@ def regression_slope(xs: List[float], ys: List[float]) -> float:
 
 def write_ns_per_sample(out_dir: str, phase_aggs: List[Agg]) -> str:
     path = os.path.join(out_dir, "exp2_ns_per_sample.csv")
-    # group by (variant, method)
     grouped: Dict[Tuple[str, str], List[Tuple[int, float]]] = {}
     for a in phase_aggs:
         grouped.setdefault((a.variant, a.method), []).append((a.t, a.median))
@@ -468,7 +474,6 @@ def write_ns_per_sample(out_dir: str, phase_aggs: List[Agg]) -> str:
 # Plotting
 # ----------------------------
 def _yerr(a: Agg, mode: str) -> Tuple[float, float]:
-    # Upper-only error bar.
     if mode == "stdev":
         return (0.0, max(0.0, a.stdev))
     return (0.0, max(0.0, a.p95 - a.median))
@@ -496,7 +501,6 @@ def select_paper_methods(
     paper_methods: List[str],
     exclude: List[str],
 ) -> List[str]:
-    # If explicitly specified: use exactly that (plus always_include), after filtering.
     all_methods = sorted({a.method for a in wall_aggs})
     exclude_set = set(exclude)
 
@@ -507,16 +511,13 @@ def select_paper_methods(
                 methods.append(m)
         return methods
 
-    # Rank by sampling @ max-t if possible; otherwise fall back to overall.
     rank_variant = "sampling" if ("sampling" in variants) else (variants[0] if variants else "")
     cand = [a for a in wall_aggs if a.variant == rank_variant]
     if not cand:
         cand = wall_aggs[:]
 
-    # choose max t within that variant
     t_max = max((a.t for a in cand), default=None)
     rank_pts = [a for a in cand if (t_max is not None and a.t == t_max)]
-    # if still empty, just use all points
     if not rank_pts:
         rank_pts = cand
 
@@ -537,136 +538,79 @@ def select_paper_methods(
     return methods
 
 
-def plot_paper_runtime(
-    out_dir: str,
-    wall_aggs: List[Agg],
-    methods: List[str],
-    error_mode: str,
-) -> None:
-    try:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except Exception as e:
-        print(f"[EXP2][PLOT] matplotlib not available; skip plots. ({e})")
-        return
-
-    variants = sorted({a.variant for a in wall_aggs}, key=_variant_sort_key)
-    series = _collect_series(wall_aggs)
-
-    fig, axes = plt.subplots(1, len(variants), figsize=(4.4 * max(1, len(variants)), 3.2), squeeze=False)
-    axes_list = axes[0]
-
-    for ax, variant in zip(axes_list, variants):
-        for method in methods:
-            pts = series.get((variant, method))
-            if not pts:
-                continue
-            ts = [p.t for p in pts]
-            ys = [p.median for p in pts]
-            low = []
-            upp = []
-            for p in pts:
-                l, u = _yerr(p, error_mode)
-                low.append(l)
-                upp.append(u)
-
-            ax.errorbar(ts, ys, yerr=[low, upp], marker="o", linewidth=1, markersize=3, label=method)
-
-        ax.set_xscale("log")
-        ax.set_yscale("log")
-        ax.set_xlabel("t (samples)")
-        ax.set_title(variant)
-
-    axes_list[0].set_ylabel("wall runtime (median ms)")
-    handles, labels = axes_list[0].get_legend_handles_labels()
-    if handles:
-        fig.legend(handles, labels, loc="lower center", ncol=min(len(labels), 6), fontsize=8, frameon=False)
-        fig.subplots_adjust(bottom=0.28)
-    fig.suptitle("EXP-2 Runtime vs t", y=0.98)
-    fig.tight_layout()
-
-    pdf = os.path.join(out_dir, "exp2_paper_runtime_vs_t.pdf")
-    png = os.path.join(out_dir, "exp2_paper_runtime_vs_t.png")
-    fig.savefig(pdf)
-    fig.savefig(png, dpi=220)
-    plt.close(fig)
-
-
-def plot_paper_delta(
-    out_dir: str,
-    delta_aggs: List[Agg],
-    methods: List[str],
-    error_mode: str,
-    t0: int,
-) -> None:
-    try:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except Exception as e:
-        print(f"[EXP2][PLOT] matplotlib not available; skip plots. ({e})")
-        return
-
-    variants = sorted({a.variant for a in delta_aggs}, key=_variant_sort_key)
-    series = _collect_series(delta_aggs)
-
-    fig, axes = plt.subplots(1, len(variants), figsize=(4.4 * max(1, len(variants)), 3.2), squeeze=False)
-    axes_list = axes[0]
-
-    for ax, variant in zip(axes_list, variants):
-        for method in methods:
-            pts = series.get((variant, method))
-            if not pts:
-                continue
-            ts = [p.t for p in pts]
-            ys = [p.median for p in pts]
-            low = []
-            upp = []
-            for p in pts:
-                l, u = _yerr(p, error_mode)
-                low.append(l)
-                upp.append(u)
-
-            ax.errorbar(ts, ys, yerr=[low, upp], marker="o", linewidth=1, markersize=3, label=method)
-
-        ax.set_xscale("log")
-        # symlog handles negative deltas and huge outliers in a single readable plot.
-        ax.set_yscale("symlog", linthresh=1.0)
-        ax.axhline(0.0, linewidth=0.8)
-        ax.set_xlabel("t (samples)")
-        ax.set_title(variant)
-
-    axes_list[0].set_ylabel(f"Δ wall runtime (median ms)  [baseline t0={t0}]")
-
-    handles, labels = axes_list[0].get_legend_handles_labels()
-    if handles:
-        fig.legend(handles, labels, loc="lower center", ncol=min(len(labels), 6), fontsize=8, frameon=False)
-        fig.subplots_adjust(bottom=0.28)
-
-    fig.suptitle("EXP-2 ΔRuntime vs t", y=0.98)
-    fig.tight_layout()
-
-    pdf = os.path.join(out_dir, "exp2_paper_delta_vs_t.pdf")
-    png = os.path.join(out_dir, "exp2_paper_delta_vs_t.png")
-    fig.savefig(pdf)
-    fig.savefig(png, dpi=220)
-    plt.close(fig)
-
-
-# ----------------------------
-# Diagnostics (full mode)
-# ----------------------------
-def _plot_per_variant(
+def plot_paper_panels(
     out_dir: str,
     aggs: List[Agg],
-    filename_prefix: str,
+    methods: List[str],
+    error_mode: str,
+    filename: str,
     ylabel: str,
     yscale: str,
-    error_mode: str,
+    title: str,
+    *,
+    add_hline0: bool = False,
+    symlog_linthresh: float = 1.0,
 ) -> None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"[EXP2][PLOT] matplotlib not available; skip plots. ({e})")
+        return
+
+    variants = sorted({a.variant for a in aggs}, key=_variant_sort_key)
+    series = _collect_series(aggs)
+
+    fig, axes = plt.subplots(1, len(variants), figsize=(4.4 * max(1, len(variants)), 3.2), squeeze=False)
+    axes_list = axes[0]
+
+    for ax, variant in zip(axes_list, variants):
+        for method in methods:
+            pts = series.get((variant, method))
+            if not pts:
+                continue
+            ts = [p.t for p in pts]
+            ys = [p.median for p in pts]
+            low = []
+            upp = []
+            for p in pts:
+                l, u = _yerr(p, error_mode)
+                low.append(l)
+                upp.append(u)
+
+            ax.errorbar(ts, ys, yerr=[low, upp], marker="o", linewidth=1, markersize=3, label=method)
+
+        ax.set_xscale("log")
+        if yscale == "symlog":
+            ax.set_yscale("symlog", linthresh=symlog_linthresh)
+        else:
+            ax.set_yscale(yscale)
+
+        if add_hline0:
+            ax.axhline(0.0, linewidth=0.8)
+
+        ax.set_xlabel("t (samples)")
+        ax.set_title(variant)
+
+    axes_list[0].set_ylabel(ylabel)
+    handles, labels = axes_list[0].get_legend_handles_labels()
+    if handles:
+        fig.legend(handles, labels, loc="lower center", ncol=min(len(labels), 6), fontsize=8, frameon=False)
+        fig.subplots_adjust(bottom=0.28)
+
+    fig.suptitle(title, y=0.98)
+    fig.tight_layout()
+
+    pdf = os.path.join(out_dir, f"{filename}.pdf")
+    png = os.path.join(out_dir, f"{filename}.png")
+    fig.savefig(pdf)
+    fig.savefig(png, dpi=220)
+    plt.close(fig)
+
+
+def _plot_per_variant(out_dir: str, aggs: List[Agg], filename_prefix: str, ylabel: str, yscale: str, error_mode: str) -> None:
     try:
         import matplotlib
 
@@ -696,7 +640,12 @@ def _plot_per_variant(
             plt.errorbar(ts, ys, yerr=[low, upp], marker="o", linewidth=1, markersize=3, label=method)
 
         plt.xscale("log")
-        plt.yscale(yscale)
+        if yscale == "symlog":
+            plt.yscale("symlog", linthresh=1.0)
+            plt.axhline(0.0, linewidth=0.8)
+        else:
+            plt.yscale(yscale)
+
         plt.xlabel("t (samples)")
         plt.ylabel(ylabel)
         plt.title(f"EXP-2 {filename_prefix} ({variant})")
@@ -710,30 +659,34 @@ def _plot_per_variant(
 def write_readme(
     out_dir: str,
     args: argparse.Namespace,
-    wall_aggs: List[Agg],
-    delta_aggs: List[Agg],
-    phase_aggs: List[Agg],
+    variants: List[str],
     methods_paper: List[str],
     error_mode: str,
+    n_raw_rows: int,
+    n_wall_points: int,
+    dropped_points: int,
 ) -> None:
     path = os.path.join(out_dir, "EXP2_README.txt")
-    variants = sorted({a.variant for a in wall_aggs}, key=_variant_sort_key)
-    min_n = min((a.n for a in wall_aggs), default=0)
-    neg_delta = sum(1 for a in delta_aggs if a.median < -1e-9)
-
     with open(path, "w") as f:
         f.write("EXP-2 (Runtime vs t) - plotting artifact\n\n")
         f.write(f"mode={args.mode}\n")
         f.write(f"warmup_reps={args.warmup_reps}\n")
+        f.write(f"min_repeats={args.min_repeats}\n")
         f.write(f"t0={args.t0}\n")
         f.write(f"error_mode={error_mode} (requested={args.error})\n")
-        f.write(f"variants={','.join(variants)}\n")
-        f.write(f"min_repeats_used_in_plots={min_n}\n\n")
+        f.write(f"paper_with_sample_phase={args.paper_with_sample_phase}\n")
+        f.write(f"variants={','.join(variants)}\n\n")
+
+        f.write(f"raw_ok_rows_used(after warmup)={n_raw_rows}\n")
+        f.write(f"wall_points_aggregated={n_wall_points}\n")
+        f.write(f"points_dropped_by_min_repeats={dropped_points}\n\n")
 
         f.write("Paper plots:\n")
         f.write("  exp2_paper_runtime_vs_t.(pdf|png)\n")
-        f.write("  exp2_paper_delta_vs_t.(pdf|png)\n\n")
-        f.write("Tables:\n")
+        f.write("  exp2_paper_delta_vs_t.(pdf|png)\n")
+        if args.paper_with_sample_phase:
+            f.write("  exp2_paper_sample_phase_vs_t.(pdf|png)  [if phases_json available]\n")
+        f.write("\nTables:\n")
         f.write("  exp2_ns_per_sample.csv\n\n")
 
         f.write("Paper method set:\n")
@@ -745,13 +698,10 @@ def write_readme(
             f.write("  exp2_delta_runtime_vs_t_<variant>.(pdf|png)\n")
             f.write("  exp2_sample_phase_vs_t_<variant>.(pdf|png)\n\n")
 
-        if neg_delta > 0:
-            f.write("Warnings:\n")
-            f.write(f"  - {neg_delta} Δruntime points have negative median (usually measurement noise).\n")
-
-        if not phase_aggs:
-            f.write("\nNotes:\n")
-            f.write("  - phases_json sample-phase could not be extracted for any run.\n")
+        if dropped_points > 0:
+            f.write("Note:\n")
+            f.write("  Some points were dropped from paper plots due to insufficient successful repeats.\n")
+            f.write("  See exp2_dropped_points.csv.\n")
 
     print(f"[EXP2][PLOT] wrote {path}")
 
@@ -762,27 +712,38 @@ def main() -> None:
     raw_path = os.path.join(out_dir, "sweep_raw.csv")
     ensure_file(raw_path)
 
-    # Read + aggregate from raw (so warmup exclusion is honored)
     raw_rows = read_raw_rows(raw_path, warmup_reps=max(0, args.warmup_reps))
     if not raw_rows:
         print("[EXP2][PLOT] No successful rows in sweep_raw.csv after warmup filtering; nothing to plot.")
         return
 
-    wall_aggs = aggregate_wall(raw_rows)
-    phase_aggs = aggregate_sample_phase(raw_rows)
-    # For paper delta plots we require a consistent baseline at t0 (no per-method fallback).
-    delta_aggs_paper = compute_delta_rows(raw_rows, t0=args.t0, require_t0=True)
-    delta_aggs_full = compute_delta_rows(raw_rows, t0=args.t0, require_t0=False)
+    wall_aggs_all = aggregate_metric(raw_rows, "wall_ms")
+    phase_aggs_all = aggregate_sample_phase(raw_rows)
 
-    error_mode = choose_error_mode(wall_aggs, args.error)
-    variants = sorted({a.variant for a in wall_aggs}, key=_variant_sort_key)
+    # Δruntime uses wall_ms only
+    delta_aggs_paper_all = compute_delta_rows(raw_rows, t0=args.t0, require_t0=True)
+    delta_aggs_full_all = compute_delta_rows(raw_rows, t0=args.t0, require_t0=False)
+
+    # Apply min_repeats filtering for PAPER plots (and for slope table to keep it reliable).
+    wall_aggs, dropped_wall = filter_by_min_repeats(wall_aggs_all, args.min_repeats)
+    delta_aggs_paper, dropped_delta = filter_by_min_repeats(delta_aggs_paper_all, args.min_repeats)
+    phase_aggs, dropped_phase = filter_by_min_repeats(phase_aggs_all, args.min_repeats)
+
+    dropped = dropped_wall + dropped_delta + dropped_phase
+    write_drop_report(out_dir, dropped, args.min_repeats)
+
+    error_mode = choose_error_mode(wall_aggs if wall_aggs else wall_aggs_all, args.error, args.min_repeats)
+
+    variants = sorted({a.variant for a in wall_aggs_all}, key=_variant_sort_key)
 
     always_include = split_csv_list(args.always_include)
     paper_methods_arg = split_csv_list(args.paper_methods)
     exclude = split_csv_list(args.exclude_methods)
 
+    # Method selection should be based on the filtered (reliable) wall aggs if available.
+    wall_for_rank = wall_aggs if wall_aggs else wall_aggs_all
     methods_paper = select_paper_methods(
-        wall_aggs=wall_aggs,
+        wall_aggs=wall_for_rank,
         variants=variants,
         topk=max(1, args.topk),
         always_include=always_include,
@@ -790,33 +751,67 @@ def main() -> None:
         exclude=exclude,
     )
 
-    print(f"[EXP2][PLOT] mode={args.mode} warmup_reps={args.warmup_reps} t0={args.t0}")
+    print(f"[EXP2][PLOT] mode={args.mode} warmup_reps={args.warmup_reps} t0={args.t0} min_repeats={args.min_repeats}")
     print(f"[EXP2][PLOT] error_mode={error_mode} (requested={args.error})")
     print(f"[EXP2][PLOT] paper_methods={methods_paper}")
 
-    # Always write ns/sample table (even if no plots)
-    ns_path = write_ns_per_sample(out_dir, phase_aggs)
+    # Always write ns/sample table (use filtered phase points if min_repeats is set).
+    ns_path = write_ns_per_sample(out_dir, phase_aggs if phase_aggs else phase_aggs_all)
     print(f"[EXP2][PLOT] wrote {ns_path}")
 
     # Paper plots (concise)
-    plot_paper_runtime(out_dir, wall_aggs, methods_paper, error_mode)
-    plot_paper_delta(out_dir, delta_aggs_paper, methods_paper, error_mode, t0=args.t0)
+    plot_paper_panels(
+        out_dir=out_dir,
+        aggs=wall_aggs if wall_aggs else wall_aggs_all,
+        methods=methods_paper,
+        error_mode=error_mode,
+        filename="exp2_paper_runtime_vs_t",
+        ylabel="wall runtime (median ms)",
+        yscale="log",
+        title="EXP-2 Runtime vs t",
+    )
+
+    plot_paper_panels(
+        out_dir=out_dir,
+        aggs=delta_aggs_paper if delta_aggs_paper else delta_aggs_paper_all,
+        methods=methods_paper,
+        error_mode=error_mode,
+        filename="exp2_paper_delta_vs_t",
+        ylabel=f"Δ wall runtime (median ms)  [baseline t0={args.t0}]",
+        yscale="symlog",
+        title="EXP-2 ΔRuntime vs t",
+        add_hline0=True,
+        symlog_linthresh=1.0,
+    )
+
+    if args.paper_with_sample_phase and (phase_aggs or phase_aggs_all):
+        plot_paper_panels(
+            out_dir=out_dir,
+            aggs=phase_aggs if phase_aggs else phase_aggs_all,
+            methods=methods_paper,
+            error_mode=error_mode,
+            filename="exp2_paper_sample_phase_vs_t",
+            ylabel="sample-phase time (median ms)",
+            yscale="log",
+            title="EXP-2 Sample-phase vs t",
+        )
 
     # Full diagnostics if requested
     if args.mode == "full":
-        _plot_per_variant(out_dir, wall_aggs, "runtime_vs_t", "wall runtime (median ms)", "log", error_mode)
-        _plot_per_variant(out_dir, delta_aggs_full, "delta_runtime_vs_t", f"Δ wall runtime (median ms) [t0={args.t0}]", "symlog", error_mode)
-        if phase_aggs:
-            _plot_per_variant(out_dir, phase_aggs, "sample_phase_vs_t", "sample-phase time (median ms)", "log", error_mode)
+        _plot_per_variant(out_dir, wall_aggs_all, "runtime_vs_t", "wall runtime (median ms)", "log", error_mode)
+        _plot_per_variant(out_dir, delta_aggs_full_all, "delta_runtime_vs_t", f"Δ wall runtime (median ms) [t0={args.t0}]", "symlog", error_mode)
+        if phase_aggs_all:
+            _plot_per_variant(out_dir, phase_aggs_all, "sample_phase_vs_t", "sample-phase time (median ms)", "log", error_mode)
 
     write_readme(
         out_dir=out_dir,
         args=args,
-        wall_aggs=wall_aggs,
-        delta_aggs=delta_aggs_full,
-        phase_aggs=phase_aggs,
+        variants=variants,
         methods_paper=methods_paper,
         error_mode=error_mode,
+        n_raw_rows=len(raw_rows),
+        n_wall_points=len(wall_aggs_all),
+        dropped_points=len(dropped),
     )
 
     print(f"[EXP2][PLOT] DONE. Out dir: {out_dir}")
