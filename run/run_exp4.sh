@@ -43,7 +43,7 @@
 # ==============================================================================
 
 set -euo pipefail
-IFS=$'\n\t'
+IFS=$' \n\t'
 
 trap 'echo -e "[EXP4][FATAL] Failed at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
 
