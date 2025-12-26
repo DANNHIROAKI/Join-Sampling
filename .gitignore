@@ -36,7 +36,11 @@ Testing/
 !/data/real/.gitkeep
 !/data/synthetic/.gitkeep
 
-
+# Generated results
+/results/raw/*
+/results/summary/*
+!/results/raw/.gitkeep
+!/results/summary/.gitkeep
 
 
 # Run Temp
