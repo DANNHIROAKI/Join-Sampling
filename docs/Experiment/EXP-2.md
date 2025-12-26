@@ -1,6 +1,6 @@
 # EXP-2 阅读文档：Runtime vs t
 
-> 本文档用于复现实验 **EXP-2（RQ2: Runtime vs t）**，并且**严格与仓库的一键 runner：`run/run_exp2.sh` 的实际行为一致**（包括：默认 t-profile、默认 repeats/warmup、输出目录结构与覆盖策略、绘图入口与参数）。
+> 本文档用于复现实验 **EXP-2（RQ2: Runtime vs t）**，并且**严格与仓库的一键 runner：`run/run_exp2.sh` 的实际行为一致**（包括：默认 t-profile、默认 repeats/warmup、默认 `j_star`、输出目录结构与覆盖策略、绘图入口与参数）。
 
 ---
 
@@ -42,26 +42,45 @@ EXP-2 的核心价值是：**把“生成更多样本”这一维的代价分离
 - **固定线程数**：默认单线程（`--threads 1`）。
 - **固定是否写样本**：默认关闭写样本（`--write_samples 0`），避免 I/O 噪声。
 
-> 以上 3 个“运行侧固定项”都可在 `run/run_exp2.sh` 里通过参数覆盖。
+> 以上运行侧固定项都可在 `run/run_exp2.sh` 里通过参数覆盖。
 
-### 3.2 扫描项：只 sweep $t$
+### 3.2 扫描项：只 sweep $t$（profiles）
 
-runner 支持两套 t-range（称为 **profiles**）：
+runner 支持三套 t-range（称为 **profiles**）：
 
-- **paper profile（默认 t-list）：**
-  $$
-  t\in \{10^3, 3\cdot10^3, 10^4, 3\cdot10^4, 10^5, 3\cdot10^5, 10^6\}
-  $$
-  对应默认：`--t_list_paper "1000,3000,10000,30000,100000,300000,1000000"`。
+#### (A) paper profile（默认 t-list）
+$$
+t\in \{10^3, 3\cdot10^3, 10^4, 3\cdot10^4, 10^5, 3\cdot10^5, 10^6\}
+$$
 
-- **extended profile（默认 t-list）：**
-  用更大的 $t$ 拉开渐近趋势/观察潜在 crossover（用于 appendix / supplement）。
-  默认：`--t_list_ext "1000,1000000,3000000,10000000,30000000"`。
+对应默认参数：
+- `--t_list_paper "1000,3000,10000,30000,100000,300000,1000000"`
 
-你可以用 `--t_profile paper|extended|both` 选择跑哪一套：
-- `paper`：只跑 paper t-range  
-- `extended`：只跑 extended t-range  
-- `both`：两套都跑（**runner 默认就是 both**）
+#### (B) extended profile（默认 t-list）
+用于更大 $t$，更容易暴露渐近项主导/潜在 crossover：
+- `--t_list_ext "1000,1000000,3000000,10000000,30000000"`
+
+#### (C) full profile（**runner 默认 profile**）
+**full** 会在同一次 sweep 中跑一条“全范围曲线”，默认取：
+- `union(paper, extended)` 的 **去重 + 升序**集合
+
+因此默认 full 的 $t$ 点为：
+$$
+t\in \{10^3, 3\cdot10^3, 10^4, 3\cdot10^4, 10^5, 3\cdot10^5, 10^6, 3\cdot10^6, 10^7, 3\cdot10^7\}.
+$$
+
+对应参数：
+- 若不显式指定 `--t_list_full`，runner 会自动合并 `t_list_paper` 与 `t_list_ext` 生成 full 列表；
+- 也可以手动覆盖：`--t_list_full "<csv>"`。
+
+#### profile 选择：`--t_profile`
+- `full`：只跑 full（**默认**）
+- `paper`：只跑 paper（最贴合主文图的范围）
+- `extended`：只跑 extended（更像 appendix/supplement 图）
+- `both`：分别跑 paper 与 extended（两个目录，两套图）
+
+> 注意：`full` 与 `both` 的区别是：  
+> `full` 会把所有点画在同一条曲线里（一个目录）；`both` 会输出两套独立 profile（两个目录）。
 
 ### 3.3 方法与三种运行模式（论文推荐固定写法）
 
@@ -74,7 +93,7 @@ runner 支持两套 t-range（称为 **profiles**）：
    \min\{T(\text{enumerate}),T(\text{sampling})\}.
    $$
 
-runner 默认会把 `base.run.j_star` 设为 **100000**（可用 `--j_star` 覆盖）。
+runner 默认会把 `base.run.j_star` 设为 **10000**（可用 `--j_star` 覆盖）。
 
 ---
 
@@ -87,13 +106,13 @@ EXP-2 的主指标是 **端到端 wall-clock 时间**，覆盖方法内部典型
 - Build：索引/预处理  
 - Count：计数或权重计算  
 - Enumerate（如适用）：枚举 join 流  
-- Sample：生成 $t$ 个样本（含二次扫描/定位）
+- Sample：生成 $t$ 个样本（含二次扫描/定位）  
 
 > 实际落盘字段以 `sweep_raw.csv` 与 `phases_json` 为准。
 
 ### 4.2 repeats / warmup
 
-runner 采用 “**warmup + 有效 repeats**” 的策略减少 cold-start 偏差：
+runner 采用 “**warmup + 有效 repeats**” 的策略减少 cold-start 偏差；每个 profile 的默认值如下：
 
 - **paper profile 默认：**
   - 有效 repeats：`--repeats_paper 10`
@@ -105,7 +124,12 @@ runner 采用 “**warmup + 有效 repeats**” 的策略减少 cold-start 偏�
   - warmup：`--warmup_ext 1`
   - 总 runs：6
 
-绘图时 runner 会把 `warmup_reps` 传给 plotter，从而自动排除 warmup 轮。
+- **full profile 默认：**
+  - 有效 repeats：`--repeats_full 5`
+  - warmup：`--warmup_full 1`
+  - 总 runs：6
+
+绘图时 runner 会把 `warmup_reps` 传给 plotter，从而自动排除 warmup 轮；同时传 `--min_repeats=<effective_repeats>`，从而只使用 fully-successful 的点。
 
 > 快速 sanity 可以把 repeats 调小，但论文主图建议保持 paper 默认（10 个有效 repeats + p95）。
 
@@ -116,22 +140,21 @@ runner 采用 “**warmup + 有效 repeats**” 的策略减少 cold-start 偏�
 ### 5.1 Sweep 配置文件（输入定义）
 
 默认使用：
-
 - `config/sweeps/sweep_t.json`
 
-runner 会自动复制一份并做 **patch**（见 6.2），所以你通常不需要手动改 JSON。
+runner 会自动复制一份并做 **patch**（线程数、repeats、write_samples、j_star、t_list 等），所以你通常不需要手动改 JSON。
 
 ### 5.2 一键运行脚本
 
 对应文件：`run/run_exp2.sh`
 
-最常用：
+最常用（**默认 full profile**）：
 
 ```bash
 bash run/run_exp2.sh
 ```
 
-只跑 paper t-range（更贴合论文主图）：
+只跑 paper t-range（更贴合论文主文 t 范围）：
 
 ```bash
 bash run/run_exp2.sh --t_profile paper
@@ -143,15 +166,26 @@ bash run/run_exp2.sh --t_profile paper
 bash run/run_exp2.sh --t_profile extended
 ```
 
+分别跑 paper + extended 两套（两个目录）：
+
+```bash
+bash run/run_exp2.sh --t_profile both
+```
+
 覆盖线程数 / 写样本 / adaptive 阈值：
 
 ```bash
-bash run/run_exp2.sh --threads 1 --write_samples 0 --j_star 100000
+bash run/run_exp2.sh --threads 1 --write_samples 0 --j_star 10000
 ```
 
 覆盖 t-list（逗号分隔整数）：
 
 ```bash
+# full（单条曲线）
+bash run/run_exp2.sh --t_profile full \
+  --t_list_full "1000,3000,10000,30000,100000,300000,1000000,3000000,10000000,30000000"
+
+# paper + extended（两套输出）
 bash run/run_exp2.sh --t_profile both \
   --t_list_paper "1000,3000,10000,30000,100000,300000,1000000" \
   --t_list_ext   "1000,1000000,3000000,10000000,30000000"
@@ -207,8 +241,9 @@ runner 的输出路径是固定的：
 
 最终目录 `results/raw/exp2/` 下会按 profile 分子目录：
 
-- `paper/`（若跑了 paper profile）
-- `extended/`（若跑了 extended profile）
+- `full/`（默认）
+- `paper/`（当 `--t_profile paper` 或 `both`）
+- `extended/`（当 `--t_profile extended` 或 `both`）
 
 每个 profile 目录下包含：
 
@@ -246,11 +281,11 @@ runner 会优先使用：
 
 runner 调用 plotter 时的关键参数包括：
 
-- `--out_dir <profile_dir>`（例如 `.../run/temp/exp2/paper`）
+- `--out_dir <profile_dir>`（例如 `.../run/temp/exp2/full`）
 - `--t0 <plot_t0>`：Δruntime 基线点，默认 1000（runner 会检查 t0 必须存在于 t-list）
 - `--warmup_reps <warmup>`：自动从 raw 中排除 warmup
 - `--min_repeats <effective_repeats>`：只使用完整成功的 repeats 点
-- `--mode paper|full`：默认 `paper`  
+- `--mode paper|full`：默认 `paper`
 - paper 图方法选择：
   - `--topk <int>`（默认 6）
   - `--always_include <csv>`（默认 `ours`）
@@ -259,20 +294,9 @@ runner 调用 plotter 时的关键参数包括：
 
 > 说明：**raw/summary 永远保留全量**。plot 的 method subset 只影响“主图展示集合”，不会删原始结果。
 
-### 7.3 推荐的“三张图”组合（以 plotter 输出为准）
-
-plotter 通常会生成（每个 variant 一张/或每 profile 一组）：
-
-- `runtime vs t`（主图）
-- `Δruntime vs t`（扣除 t0 常数项）
-- `sample-phase vs t`（解释型 profiling）
-- `ns per sample`（每样本成本估计表）
-
-具体文件名以 plotter 输出为准；这些文件都会出现在对应 profile 的 `out_dir` 下。
-
 ---
 
-## 8. 理论预期与“看到什么算正常”（不变，但补充 profile 解释）
+## 8. 理论预期与“看到什么算正常”
 
 ### 8.1 Sampling 模式：通常 ~线性增长
 
@@ -298,7 +322,7 @@ Enum+Sampling 通常包含：
 - 若 $|J| < J_\star$：可能走枚举分支；
 - 若 $|J| > J_\star$：会切到 sampling 分支。
 
-> extended profile 的价值：当 paper 区间内还看不出明显斜率差异时，extended 的更大 t 更容易暴露“渐近项主导”和 crossover。
+> 读图时应同时报告 raw 中的分支统计（例如 pilot 规模 / 是否走枚举），否则读者会问“为什么 adaptive 不切换/为什么和某个模式一模一样”。
 
 ---
 
@@ -311,7 +335,7 @@ Enum+Sampling 通常包含：
   - 过滤失败点（ok_rate < 1）；
   - 对 paper mode 只展示 top-k 或指定 method 子集（但 raw 仍保留全量）。
 
-如果启用了枚举上限（enum_cap 等），应在论文说明截断点/失败点，不要静默消失。
+若启用了枚举上限（enum_cap 等），应在论文说明截断点/失败点，不要静默消失。
 
 ---
 
@@ -334,4 +358,3 @@ Enum+Sampling 通常包含：
 3. 主图看起来不随 t 变：是否常数项过大？请看 Δruntime 与 sample-phase。  
 4. repeats 太少却画 p95：建议增加 repeats（paper 默认已是 10 有效 repeats）。  
 5. 你改了 `--plot_t0` 却报错：t0 必须出现在 t-list 中（runner 会强制检查）。  
-
