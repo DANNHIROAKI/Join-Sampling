@@ -61,10 +61,11 @@ Usage:
 
 Core options:
   --config <path>                 Sweep JSON (default: config/sweeps/sweep_t.json)
-  --t_profile <paper|extended|both>  Which t-range(s) to run (default: both)
+  --t_profile <paper|extended|both|full>  Which t-range(s) to run (default: full)
 
   --t_list_paper <csv>            Override t-list for paper profile
   --t_list_ext <csv>              Override t-list for extended profile
+  --t_list_full <csv>             Override t-list for full profile (default: union(paper,ext))
 
 Build options:
   --build_type <type>             Release|Debug|RelWithDebInfo|MinSizeRel (default: Release)
@@ -81,6 +82,8 @@ Repeats:
   --warmup_paper <int>            Extra warmup repeats excluded from plots (default: 2)
   --repeats_ext <int>             Effective repeats for extended profile (default: 5)
   --warmup_ext <int>              Extra warmup repeats excluded from plots (default: 1)
+  --repeats_full <int>            Effective repeats for full profile (default: 5)
+  --warmup_full <int>             Extra warmup repeats excluded from plots (default: 1)
 
 Plot options:
   --no-plot                       Skip plotting
@@ -156,6 +159,24 @@ csv_ints_to_json_array() {
   out+="]"
   echo "${out}"
 }
+
+# Merge two CSV integer lists into a sorted, unique CSV list.
+# This is useful to build a single "full-range" t sweep that includes both paper + extended points.
+merge_t_lists_csv() {
+  local a="$(trim "$1")"
+  local b="$(trim "$2")"
+  local merged
+  merged="$(
+    printf "%s,%s\n" "${a}" "${b}" \
+      | tr ',' '\n' \
+      | awk 'NF {gsub(/^[ \t]+|[ \t]+$/, "", $0); if($0 ~ /^[0-9]+$/) print $0}' \
+      | sort -n \
+      | awk '!seen[$0]++ {out = out (out==""? $0 : "," $0)} END{print out}'
+  )"
+  [[ -n "${merged}" ]] || die "Failed to merge t-lists into a non-empty CSV."
+  echo "${merged}"
+}
+
 
 awk_col_idx() {
   local file="$1"
@@ -393,23 +414,26 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # Defaults
 # ----------------------------
 CONFIG="config/sweeps/sweep_t.json"
-T_PROFILE="both"
+T_PROFILE="full"
 
 # Default t-lists:
 # - paper:   standard range (as in EXP-2 doc)
 # - ext:     includes bigger t to make slope dominance / crossover visible
 T_LIST_PAPER="1000,3000,10000,30000,100000,300000,1000000"
 T_LIST_EXT="1000,1000000,3000000,10000000,30000000"
+T_LIST_FULL=""  # If empty, will be set to union(t_list_paper, t_list_ext)
 
 BUILD_TYPE="Release"
 THREADS=1
 WRITE_SAMPLES=0
-J_STAR=100000
+J_STAR=10000
 
 REPEATS_PAPER=10
 WARMUP_PAPER=2
 REPEATS_EXT=5
 WARMUP_EXT=1
+REPEATS_FULL=5
+WARMUP_FULL=1
 
 PLOT_MODE="paper"
 PLOT_T0=1000
@@ -434,6 +458,7 @@ while [[ $# -gt 0 ]]; do
     --t_profile)         T_PROFILE="$2"; shift 2;;
     --t_list_paper)      T_LIST_PAPER="$2"; shift 2;;
     --t_list_ext)        T_LIST_EXT="$2"; shift 2;;
+    --t_list_full)       T_LIST_FULL="$2"; shift 2;;
 
     --build_type)        BUILD_TYPE="$2"; shift 2;;
     --threads)           THREADS="$2"; shift 2;;
@@ -444,6 +469,8 @@ while [[ $# -gt 0 ]]; do
     --warmup_paper)      WARMUP_PAPER="$2"; shift 2;;
     --repeats_ext)       REPEATS_EXT="$2"; shift 2;;
     --warmup_ext)        WARMUP_EXT="$2"; shift 2;;
+    --repeats_full)      REPEATS_FULL="$2"; shift 2;;
+    --warmup_full)       WARMUP_FULL="$2"; shift 2;;
 
     --plot_mode)         PLOT_MODE="$2"; shift 2;;
     --plot_t0)           PLOT_T0="$2"; shift 2;;
@@ -466,6 +493,11 @@ done
 
 if [[ "${CONFIG}" != /* ]]; then
   CONFIG="${REPO_ROOT}/${CONFIG}"
+fi
+
+# If full t-list not specified, derive it from the union of paper + extended lists.
+if [[ -z "${T_LIST_FULL}" ]]; then
+  T_LIST_FULL="$(merge_t_lists_csv "${T_LIST_PAPER}" "${T_LIST_EXT}")"
 fi
 
 TEMP_DIR="${REPO_ROOT}/run/temp/exp2"
@@ -491,11 +523,11 @@ if ! [[ "${THREADS}" =~ ^[0-9]+$ ]] || [[ "${THREADS}" -le 0 ]]; then die "--thr
 if [[ "${WRITE_SAMPLES}" != "0" && "${WRITE_SAMPLES}" != "1" ]]; then die "--write_samples must be 0 or 1"; fi
 if ! [[ "${J_STAR}" =~ ^[0-9]+$ ]]; then die "--j_star must be a non-negative integer"; fi
 
-if [[ "${T_PROFILE}" != "paper" && "${T_PROFILE}" != "extended" && "${T_PROFILE}" != "both" ]]; then
-  die "--t_profile must be paper|extended|both"
+if [[ "${T_PROFILE}" != "paper" && "${T_PROFILE}" != "extended" && "${T_PROFILE}" != "both" && "${T_PROFILE}" != "full" ]]; then
+  die "--t_profile must be paper|extended|both|full"
 fi
 
-for v in "${REPEATS_PAPER}" "${WARMUP_PAPER}" "${REPEATS_EXT}" "${WARMUP_EXT}"; do
+for v in "${REPEATS_PAPER}" "${WARMUP_PAPER}" "${REPEATS_EXT}" "${WARMUP_EXT}" "${REPEATS_FULL}" "${WARMUP_FULL}"; do
   if ! [[ "${v}" =~ ^[0-9]+$ ]]; then die "Repeats/warmup values must be integers"; fi
 done
 
@@ -516,6 +548,7 @@ log "Config (in)    : ${CONFIG}"
 log "t_profile      : ${T_PROFILE}"
 log "t_list_paper   : ${T_LIST_PAPER}"
 log "t_list_ext     : ${T_LIST_EXT}"
+log "t_list_full    : ${T_LIST_FULL}"
 log "Build type     : ${BUILD_TYPE}"
 log "Build dir      : ${BUILD_DIR}"
 log "Threads        : ${THREADS}"
@@ -523,6 +556,7 @@ log "write_samples  : ${WRITE_SAMPLES}"
 log "j_star         : ${J_STAR}"
 log "paper repeats  : eff=${REPEATS_PAPER} warmup=${WARMUP_PAPER}"
 log "ext repeats    : eff=${REPEATS_EXT} warmup=${WARMUP_EXT}"
+log "full repeats   : eff=${REPEATS_FULL} warmup=${WARMUP_FULL}"
 log "plot_mode      : ${PLOT_MODE}"
 log "plot_t0        : ${PLOT_T0}"
 log "plot_error     : ${PLOT_ERROR}"
@@ -551,6 +585,7 @@ export NUMEXPR_NUM_THREADS="${THREADS}"
   echo "t_profile=${T_PROFILE}"
   echo "t_list_paper=${T_LIST_PAPER}"
   echo "t_list_ext=${T_LIST_EXT}"
+  echo "t_list_full=${T_LIST_FULL}"
   echo "threads=${THREADS}"
   echo "write_samples=${WRITE_SAMPLES}"
   echo "j_star=${J_STAR}"
@@ -558,6 +593,8 @@ export NUMEXPR_NUM_THREADS="${THREADS}"
   echo "warmup_paper=${WARMUP_PAPER}"
   echo "repeats_ext_effective=${REPEATS_EXT}"
   echo "warmup_ext=${WARMUP_EXT}"
+  echo "repeats_full_effective=${REPEATS_FULL}"
+  echo "warmup_full=${WARMUP_FULL}"
   echo "plot_mode=${PLOT_MODE}"
   echo "plot_t0=${PLOT_T0}"
   echo "plot_error=${PLOT_ERROR}"
@@ -618,12 +655,16 @@ fi
 # ----------------------------
 # Run profiles
 # ----------------------------
-if [[ "${T_PROFILE}" == "paper" || "${T_PROFILE}" == "both" ]]; then
-  run_sweep_and_plot "paper" "${T_LIST_PAPER}" "${REPEATS_PAPER}" "${WARMUP_PAPER}"
-fi
+if [[ "${T_PROFILE}" == "full" ]]; then
+  run_sweep_and_plot "full" "${T_LIST_FULL}" "${REPEATS_FULL}" "${WARMUP_FULL}"
+else
+  if [[ "${T_PROFILE}" == "paper" || "${T_PROFILE}" == "both" ]]; then
+    run_sweep_and_plot "paper" "${T_LIST_PAPER}" "${REPEATS_PAPER}" "${WARMUP_PAPER}"
+  fi
 
-if [[ "${T_PROFILE}" == "extended" || "${T_PROFILE}" == "both" ]]; then
-  run_sweep_and_plot "extended" "${T_LIST_EXT}" "${REPEATS_EXT}" "${WARMUP_EXT}"
+  if [[ "${T_PROFILE}" == "extended" || "${T_PROFILE}" == "both" ]]; then
+    run_sweep_and_plot "extended" "${T_LIST_EXT}" "${REPEATS_EXT}" "${WARMUP_EXT}"
+  fi
 fi
 
 # ----------------------------
