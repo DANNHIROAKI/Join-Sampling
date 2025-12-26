@@ -1,14 +1,18 @@
 # EXP-2 阅读文档：Runtime vs t
 
+> 本文档用于复现实验 **EXP-2（RQ2: Runtime vs t）**，并且**严格与仓库的一键 runner：`run/run_exp2.sh` 的实际行为一致**（包括：默认 t-profile、默认 repeats/warmup、输出目录结构与覆盖策略、绘图入口与参数）。
+
+---
+
 ## 1. 实验目的与要回答的问题（RQ2）
 
 **EXP-2** 用来回答 RQ2：
 
-> 在固定数据集（固定 $R,S$）与固定密度参数 $\alpha$ 下，随着采样数量 $t$ 从 1k 增加到 1M，各方法的端到端 wall-clock 时间如何变化？是否呈现“采样型随 $t$ 增长；枚举型对 $t$ 的敏感度取决于其额外步骤（如 rank-sampling 排序）”的典型分化？
+> 在固定数据集（固定 $R,S$）与固定密度参数 $\alpha$ 下，随着采样数量 $t$ 从 1k 增加到 1M（以及更大扩展区间），各方法的端到端 wall-clock 时间如何变化？是否呈现“采样型随 $t$ 增长；枚举型对 $t$ 的敏感度取决于其额外步骤（如 rank-sampling 排序）”的典型分化？
 
 EXP-2 的核心价值是：**把“生成更多样本”这一维的代价分离出来**，让读者看到方法随 $t$ 的扩展性，并为后续 RQ3/RQ4/RQ6 的趋势解释提供 baseline。
 
-------
+---
 
 ## 2. 任务定义与语义约束（必须写清）
 
@@ -27,38 +31,52 @@ EXP-2 的核心价值是：**把“生成更多样本”这一维的代价分离
 
 > 解释时请强调：**边界贴合不算相交**（half-open），所有方法都必须严格遵守同一判定，否则不能放在一起比较。
 
-------
+---
 
 ## 3. EXP-2 的实验设计（“固定什么、扫什么”）
 
-### 3.1 固定项
+### 3.1 固定项（runner 默认已帮你做的）
 
-- **固定数据集**：同一组 $R,S$ 在 sweep 全程不变。
-- **固定密度参数 $\alpha$**：EXP-2 不扫 $\alpha$。
-- **固定线程数**：建议单线程（公平、可解释）。
-- **固定是否写样本**：建议关闭 `write_samples`（避免 I/O 噪声）。
+- **固定数据集**：同一组 $R,S$ 在 sweep 全程不变（由 sweep JSON 决定）。
+- **固定密度参数 $\alpha$**：EXP-2 不扫 $\alpha$（由 sweep JSON 决定）。
+- **固定线程数**：默认单线程（`--threads 1`）。
+- **固定是否写样本**：默认关闭写样本（`--write_samples 0`），避免 I/O 噪声。
 
-### 3.2 扫描项
+> 以上 3 个“运行侧固定项”都可在 `run/run_exp2.sh` 里通过参数覆盖。
 
-- 只 sweep **$t$**：典型序列为
+### 3.2 扫描项：只 sweep $t$
+
+runner 支持两套 t-range（称为 **profiles**）：
+
+- **paper profile（默认 t-list）：**
   $$
-  t\in \{10^3,3\cdot10^3,10^4,3\cdot10^4,10^5,3\cdot10^5,10^6\}.
+  t\in \{10^3, 3\cdot10^3, 10^4, 3\cdot10^4, 10^5, 3\cdot10^5, 10^6\}
   $$
+  对应默认：`--t_list_paper "1000,3000,10000,30000,100000,300000,1000000"`。
+
+- **extended profile（默认 t-list）：**
+  用更大的 $t$ 拉开渐近趋势/观察潜在 crossover（用于 appendix / supplement）。
+  默认：`--t_list_ext "1000,1000000,3000000,10000000,30000000"`。
+
+你可以用 `--t_profile paper|extended|both` 选择跑哪一套：
+- `paper`：只跑 paper t-range  
+- `extended`：只跑 extended t-range  
+- `both`：两套都跑（**runner 默认就是 both**）
 
 ### 3.3 方法与三种运行模式（论文推荐固定写法）
 
-每个方法都以三种模式评估：
+每个方法都以三种模式评估（由 sweep 配置决定 method×variant 的组合）：
 
-1. **Sampling**：不物化全部 $J$，直接输出 $t$ 个样本。
-
-2. **Enum+Sampling（枚举基线）**：先枚举 $J$，再从枚举流中做均匀有放回抽样。
-
-3. **Adaptive**：用阈值/探测策略在 “枚举” 与 “采样” 之间切换，目标接近
+1. **Sampling**：不物化全部 $J$，直接输出 $t$ 个样本。  
+2. **Enum+Sampling（枚举基线）**：先枚举 $J$，再从枚举流中做均匀有放回抽样。  
+3. **Adaptive**：阈值切换 “枚举” 与 “采样”，目标接近
    $$
    \min\{T(\text{enumerate}),T(\text{sampling})\}.
    $$
 
-------
+runner 默认会把 `base.run.j_star` 设为 **100000**（可用 `--j_star` 覆盖）。
+
+---
 
 ## 4. 计时口径与统计口径（读图前必须明确）
 
@@ -66,200 +84,254 @@ EXP-2 的核心价值是：**把“生成更多样本”这一维的代价分离
 
 EXP-2 的主指标是 **端到端 wall-clock 时间**，覆盖方法内部典型阶段（随实现不同会合并/拆分）：
 
-- Build：索引/预处理
-- Count：计数或权重计算
-- Enumerate（如适用）：枚举 join 流
+- Build：索引/预处理  
+- Count：计数或权重计算  
+- Enumerate（如适用）：枚举 join 流  
 - Sample：生成 $t$ 个样本（含二次扫描/定位）
 
-**不计入**：数据生成/数据加载、写样本到磁盘等非算法主体开销。
+> 实际落盘字段以 `sweep_raw.csv` 与 `phases_json` 为准。
 
-### 4.2 统计方式
+### 4.2 repeats / warmup
 
-- 每个配置点重复运行 $k$ 次（常用 3 或 5；如果要用 p95 更推荐 ≥10）。
-- 报告：
-  - 主线：`wall_median_ms`
-  - 误差条：`p95` 或 `stdev`
+runner 采用 “**warmup + 有效 repeats**” 的策略减少 cold-start 偏差：
 
-------
+- **paper profile 默认：**
+  - 有效 repeats：`--repeats_paper 10`
+  - warmup（不参与绘图/统计）：`--warmup_paper 2`
+  - 总 runs（传给 sweep）：12
+
+- **extended profile 默认：**
+  - 有效 repeats：`--repeats_ext 5`
+  - warmup：`--warmup_ext 1`
+  - 总 runs：6
+
+绘图时 runner 会把 `warmup_reps` 传给 plotter，从而自动排除 warmup 轮。
+
+> 快速 sanity 可以把 repeats 调小，但论文主图建议保持 paper 默认（10 个有效 repeats + p95）。
+
+---
 
 ## 5. 配置文件与运行入口（你应该看哪里）
 
-### 5.1 Sweep 配置文件
+### 5.1 Sweep 配置文件（输入定义）
 
-EXP-2 推荐直接使用仓库提供的 sweep 配置（或复制后修改）：
+默认使用：
 
-- `config/sweeps/sweep_t.json`（固定数据与 $\alpha$，只扫 $t$）
+- `config/sweeps/sweep_t.json`
 
-### 5.2 一键运行脚本（推荐）
+runner 会自动复制一份并做 **patch**（见 6.2），所以你通常不需要手动改 JSON。
 
-仓库的 EXP-2 runner 脚本会执行：Release 编译 → sweep → 生成图。
- 对应文件：`run/.sh` 
+### 5.2 一键运行脚本
 
-常用方式：
+对应文件：`run/run_exp2.sh`
 
-```
-bash run/.sh
-```
+最常用：
 
-或指定输出目录：
-
-```
-bash run/.sh --out_dir results/exp2/runtime_vs_t/my_run
+```bash
+bash run/run_exp2.sh
 ```
 
-> 脚本会把环境信息写入 `logs/env.txt`，便于复现（CPU/编译器/commit 等）。
+只跑 paper t-range（更贴合论文主图）：
 
-------
+```bash
+bash run/run_exp2.sh --t_profile paper
+```
 
-## 6. EXP-2 的输出文件结构（你会拿哪些东西写论文）
+只跑 extended（用于观察大 t 渐近趋势）：
 
-一次 EXP-2 运行完成后，输出目录下至少包含：
+```bash
+bash run/run_exp2.sh --t_profile extended
+```
 
-- `sweep_raw.csv`：**每次 repeat 一行**（含阶段耗时、随机种子、是否成功等）
-- `sweep_summary.csv`：**聚合后的统计表**（按 method×variant×t 聚合 median/p95/stdev/ok_rate）
+覆盖线程数 / 写样本 / adaptive 阈值：
 
-如果启用了绘图脚本（默认启用），还会生成图与说明文件（见下一节）。
+```bash
+bash run/run_exp2.sh --threads 1 --write_samples 0 --j_star 100000
+```
 
-------
+覆盖 t-list（逗号分隔整数）：
 
-## 7. 绘图与读图：推荐的“三张图”组合
+```bash
+bash run/run_exp2.sh --t_profile both \
+  --t_list_paper "1000,3000,10000,30000,100000,300000,1000000" \
+  --t_list_ext   "1000,1000000,3000000,10000000,30000000"
+```
 
-仓库的绘图脚本 `run/.py`  会自动从 raw+summary 生成以下结果（每个 variant 一张）：
+构建控制：
 
-### 图 A：`runtime vs t`（主图）
+```bash
+# 重新干净构建
+bash run/run_exp2.sh --clean
 
-- 文件名：`exp2_runtime_vs_t_<variant>.png/.pdf`
-- x 轴：$t$（log）
-- y 轴：wall runtime（log）
-- 误差条：默认 **upper-only p95-median**（避免 log-y 下界 <0 的问题）
+# 跳过构建（已编译好时）
+bash run/run_exp2.sh --no-build
 
-**读法**：这是“端到端用户感知延迟”曲线，用于论文主结论展示。
+# Debug/RelWithDebInfo 等
+bash run/run_exp2.sh --build_type RelWithDebInfo
+```
 
-------
+绘图控制：
 
-### 图 B：`Δruntime vs t`（强烈建议论文也给）
+```bash
+# 只跑数据，不画图
+bash run/run_exp2.sh --no-plot
 
-- 文件名：`exp2_delta_runtime_vs_t_<variant>.png/.pdf`
+# 改 Δruntime 的基线点 t0（注意：t0 必须在 t-list 中，runner 会强制检查）
+bash run/run_exp2.sh --plot_t0 1000
+```
 
-- 定义：对每条曲线减去基线点（默认 $t_0=1000$）：
-  $$
-  \Delta T(t)=T(t)-T(t_0)
-  $$
+> 依赖：runner 会检查 `cmake/jq/awk/sort/find/tee` 等；绘图需要 `python3`（若找不到 python3 会自动跳过绘图）。
 
-- 作用：**把常数开销（Build/Count/Enumerate）抵消掉**，让“随 $t$ 的增长项”更显著。
+---
 
-**读法**：
+## 6. 输出目录结构（与 runner 完全一致）
 
-- 若 Sampling 的 $\Delta T(t)$ 近线性，说明“生成样本的增量成本”接近 $O(t)$。
-- 若 Enum+Sampling 的 $\Delta T(t)$ 明显增长，通常来自 rank-sampling 的排序/定位（常见 $O(t\log t)$）。
+### 6.1 输出位置与覆盖策略（重要）
 
-------
+runner 的输出路径是固定的：
 
-### 图 C：`sample-phase vs t`（解释型 profiling 图）
+- **临时目录（每次运行都会覆盖）：**  
+  `run/temp/exp2/`
 
-- 文件名：`exp2_sample_phase_vs_t_<variant>.png/.pdf`
+- **最终目录（运行成功后覆盖）：**  
+  `results/raw/exp2/`
 
-- 从 `sweep_raw.csv` 的 `phases_json` 中提取 `run_sample_ms`（或兼容键名），对每点取 median/p95。
+> ⚠️ 注意：`results/raw/exp2/` 会在成功时被 `rm -rf` 后整目录覆盖写入。  
+> 若要保留多次运行结果，请在每次跑完后手动拷贝：
+>
+> ```bash
+> cp -a results/raw/exp2 results/raw/exp2_$(date +%Y%m%d_%H%M%S)
+> ```
 
-- 额外输出：`exp2_ns_per_sample.csv`
-   用端点斜率估计每样本纳秒级成本：
-  $$
-  \text{ns/sample}\approx \frac{\Delta (\text{sample\_ms})}{\Delta t}\times 10^6
-  $$
+### 6.2 每个 profile 的目录内容
 
-**读法**：这是“只看 Sample 阶段”随 $t$ 的 scaling，最适合解释“为什么 wall 主图看起来不怎么变/为什么某条曲线斜率更小”。
+最终目录 `results/raw/exp2/` 下会按 profile 分子目录：
 
-------
+- `paper/`（若跑了 paper profile）
+- `extended/`（若跑了 extended profile）
 
-## 8. 理论预期与“看到什么算正常”
+每个 profile 目录下包含：
 
-为了写论文时“结论-解释闭环”，EXP-2 推荐用下面这套固定叙事：
+- `sweep_raw.csv`：每次 repeat 一行（含 ok、wall、phases_json 等）
+- `sweep_summary.csv`：按 method×variant×t 聚合后的统计表（median/p95/stdev/ok_rate 等）
+- `sweep_original.json`：runner 拷贝的原始 sweep 配置
+- `sweep_used.json`：runner patch 后实际使用的配置（包含 `meta.patch`）
+- `MANIFEST.txt`：本次运行关键参数（threads、t_list、repeats、plot 选项等）
+- `logs/`：
+  - `sjs_sweep.log`
+  - `plot_exp2.log`（若启用绘图）
+
+此外，在 `results/raw/exp2/logs/` 还有全局日志/环境信息：
+
+- `env.txt`：包含 timestamp、硬件/编译器信息、git 版本（若在 git repo 内）等
+- `cmake_configure.log`、`cmake_build.log`：构建日志
+
+---
+
+## 7. 绘图与读图（由 runner 自动调用 plotter）
+
+### 7.1 绘图脚本位置（runner 的实际选择逻辑）
+
+runner 会优先使用：
+
+- `run/include/exp2_plot.py`
+
+若不存在，则 fallback 到：
+
+- `run/plot_exp2.py`
+
+你一般不需要手动调用 plotter；runner 会在每个 profile 运行后自动调用（除非 `--no-plot`）。
+
+### 7.2 绘图输入与关键参数（runner 已固定/可覆盖）
+
+runner 调用 plotter 时的关键参数包括：
+
+- `--out_dir <profile_dir>`（例如 `.../run/temp/exp2/paper`）
+- `--t0 <plot_t0>`：Δruntime 基线点，默认 1000（runner 会检查 t0 必须存在于 t-list）
+- `--warmup_reps <warmup>`：自动从 raw 中排除 warmup
+- `--min_repeats <effective_repeats>`：只使用完整成功的 repeats 点
+- `--mode paper|full`：默认 `paper`  
+- paper 图方法选择：
+  - `--topk <int>`（默认 6）
+  - `--always_include <csv>`（默认 `ours`）
+  - `--paper_methods <csv>`（若指定，则精确使用此列表 + always_include）
+  - `--exclude_methods <csv>`（可排除某些方法，如 rejection）
+
+> 说明：**raw/summary 永远保留全量**。plot 的 method subset 只影响“主图展示集合”，不会删原始结果。
+
+### 7.3 推荐的“三张图”组合（以 plotter 输出为准）
+
+plotter 通常会生成（每个 variant 一张/或每 profile 一组）：
+
+- `runtime vs t`（主图）
+- `Δruntime vs t`（扣除 t0 常数项）
+- `sample-phase vs t`（解释型 profiling）
+- `ns per sample`（每样本成本估计表）
+
+具体文件名以 plotter 输出为准；这些文件都会出现在对应 profile 的 `out_dir` 下。
+
+---
+
+## 8. 理论预期与“看到什么算正常”（不变，但补充 profile 解释）
 
 ### 8.1 Sampling 模式：通常 ~线性增长
 
-Sampling 需要真实产出 $t$ 个样本，因此**随 $t$ 增长是必然的**：
+Sampling 需要真实产出 $t$ 个样本，因此随 $t$ 增长是必然的：
 
 - 预期：`Δruntime`、`sample-phase` 近似线性；
-- 解释：Phase-3（或 Sample 阶段）每个样本通常 $O(1)$ 摊还，整体 $O(t)$。
+- 解释：Sample 阶段每个样本通常 $O(1)$ 摊还，整体 $O(t)$。
 
 ### 8.2 Enum+Sampling 模式：可能出现 $t\log t$ 项
 
-在你们实现框架里，Enum+Sampling 通常包含：
+Enum+Sampling 通常包含：
 
 - 生成 $t$ 个 ranks 并排序；
-- 再扫描 join 流定位到这些 ranks；
+- 扫描 join 流定位这些 ranks；
 
 因此：
 
-- 当 $t$ 很大时，可能明显看到 **$t\log t$** 的增长；
-- 当 $|J|$ 很大时，枚举扫描成本会主导，曲线可能对 $t$ “不那么敏感”。
-
-> 论文写法建议：不要笼统写“枚举型对 t 不敏感”，而写“枚举型总成本由 $|J|$ 枚举 + $t\log t$ rank sampling 共同决定，在不同区间主导项不同”。
+- $t$ 很大时可能看到 **$t\log t$** 的增长；
+- $|J|$ 很大时枚举扫描成本主导，曲线可能对 $t$ “不那么敏感”。
 
 ### 8.3 Adaptive：是否“切换”取决于 $J_\star$ 与 $|J|$
 
-- 如果 $|J| < J_\star$：Adaptive 可能全程走枚举分支 → 曲线看起来几乎不随 $t$ 变（或仅很弱）。
-- 如果 $|J| > J_\star$：Adaptive 会切到 sampling → 曲线更像 Sampling。
+- 若 $|J| < J_\star$：可能走枚举分支；
+- 若 $|J| > J_\star$：会切到 sampling 分支。
 
-**读图时应同时报告** raw 中的分支统计（例如 `used_enumeration` 或 pilot 规模），否则读者会问“为什么 adaptive 不切换/为什么和某个模式一模一样”。
+> extended profile 的价值：当 paper 区间内还看不出明显斜率差异时，extended 的更大 t 更容易暴露“渐近项主导”和 crossover。
 
-------
+---
 
-## 9. 公平性与失败处理（读 summary 前先看这些列）
+## 9. 公平性与失败处理（与 runner 的行为一致）
 
-### 9.1 过滤规则（绘图默认做）
+- runner **不会删除或隐藏**任何 raw/summary 结果。
+- 绘图时可能会：
+  - 排除 warmup repeats；
+  - 仅使用满足 `--min_repeats` 的点；
+  - 过滤失败点（ok_rate < 1）；
+  - 对 paper mode 只展示 top-k 或指定 method 子集（但 raw 仍保留全量）。
 
-- 过滤 `ok_rate < 1.0` 的点（避免失败/跳过点污染）
-- 但论文里应在 caption/正文说明：哪些方法/组合被跳过或失败（例如某些 rejection 组合可能被禁用）
+如果启用了枚举上限（enum_cap 等），应在论文说明截断点/失败点，不要静默消失。
 
-### 9.2 `enum_cap` 与“截断点”
-
-如果启用了枚举上限（防止爆内存），那么：
-
-- 图上应把截断点显式标注为失败或缺失；
-- 不能静默过滤而不说明（否则不公平）。
-
-------
+---
 
 ## 10. 推荐写入论文的 EXP-2 小节结构（模板）
 
-你可以直接按以下结构写实验小节（每段对应 1–2 句话即可）：
+（可直接复用）
 
-1. **Setup**：固定数据集（给出 $n_r,n_s,\alpha$）、单线程、重复 $k$ 次、报告 median+p95（或 stdev）。
-2. **Result (Sampling)**：runtime 随 $t$ 增长，Δruntime/sample-phase 近线性；给出 ns/sample 量级。
-3. **Result (Enum+Sampling)**：在大 t 区间出现明显增长（解释为 rank sort 的 $t\log t$）；或在高 $|J|$ 区间枚举主导。
-4. **Result (Adaptive)**：根据 $|J|$ 与 $J_\star$ 的关系展示分支选择；讨论其是否接近 $\min\{\cdot\}$。
-5. **Takeaway**：一句话总结“谁的斜率更小/谁的固定开销更大/哪类方法对 t 更稳”。
+1. **Setup**：固定数据集（给出 $n_r,n_s,\alpha$）、单线程、paper profile t-range、有效 repeats=10（+2 warmup）、报告 median+p95。  
+2. **Result (Sampling)**：runtime 随 $t$ 增长；Δruntime/sample-phase 近线性；给出 ns/sample 量级。  
+3. **Result (Enum+Sampling)**：解释 $t\log t$（rank sort）与 $|J|$ 枚举项的主导区间。  
+4. **Result (Adaptive)**：给出不同 t 区间/不同方法的分支选择现象；讨论其接近 $\min\{\cdot\}$ 的程度。  
+5. **Takeaway**：一句话总结“谁的斜率更小/谁的固定开销更大/谁对 t 更稳”。
 
-------
+---
 
 ## 11. 常见坑与排障清单（跑完 EXP-2 必查）
 
-1. `count_mean` 在所有 t 下是否一致？（固定数据集应一致）
-2. `ok_rate` 是否为 1？若不是，失败原因是否在 raw 里可追踪？
-3. 主图看起来不随 t 变：是否因为常数开销过大？请看 Δruntime 与 sample-phase 图。
-4. 使用 p95 误差条但 repeats 太少：建议改用 stdev 或增加 repeats。
-5. log-y 下误差条出现负下界：必须用 upper-only（绘图脚本已处理）。
+1. 固定数据集下，`count_mean` 是否随 t 基本不变？（summary 中可快速 sanity）  
+2. `ok_rate` 是否为 1？若不是，查看 `logs/sjs_sweep.log` 与 raw。  
+3. 主图看起来不随 t 变：是否常数项过大？请看 Δruntime 与 sample-phase。  
+4. repeats 太少却画 p95：建议增加 repeats（paper 默认已是 10 有效 repeats）。  
+5. 你改了 `--plot_t0` 却报错：t0 必须出现在 t-list 中（runner 会强制检查）。  
 
-------
-
-## 12. 本实验与整体研究问题的关系（你在论文里怎么“接上”）
-
-- EXP-2 直接回答 **RQ2（Runtime vs t）**；
-- EXP-2 的样本阶段斜率（ns/sample）和常数项分解，将在：
-  - EXP-3（扫 $\alpha$）解释“稠密导致 Build/Count/Enumerate 退化”
-  - EXP-6（adaptive heatmap）解释“为什么 adaptive 在某些区间更接近 min”
-  - EXP-7（phase profiling）成为“解释性证据”
-
-------
-
-### 附：与你们脚本输出的文件名对照表（便于读者定位）
-
-- 一键跑：`run/.sh` 
-- 绘图与解读：`run/.py` 
-- 原始记录：`sweep_raw.csv`
-- 聚合统计：`sweep_summary.csv`
-- 主图：`exp2_runtime_vs_t_<variant>.(png|pdf)`
-- 增量图：`exp2_delta_runtime_vs_t_<variant>.(png|pdf)`
-- sample-phase 图：`exp2_sample_phase_vs_t_<variant>.(png|pdf)`
-- 每样本成本：`exp2_ns_per_sample.csv`
