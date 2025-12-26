@@ -2,6 +2,10 @@
 
 本文档用于**阅读、复现、解释**实验 EXP‑3（RQ3：Sensitivity to density α）的结果。目标是让读者在不读代码的情况下，也能理解：实验做了什么、曲线应该怎么看、异常点怎么处理、结论如何写得“paper‑friendly”。
 
+> **推荐复现入口（与最新 `run/run_exp3.sh` 对齐）**：  
+> `bash run/run_exp3.sh`  
+> 该脚本会：自动编译 → 生成 effective config → 跑 sweep → 导出 adaptive 分支比例 →（可选）画图 → 同步产物到 `results/raw/exp3`（或按时间戳保存）。
+
 ------
 
 ## 1. EXP‑3 在整篇论文中的位置
@@ -39,7 +43,9 @@ $$
 $$
 而不是 $|J|/(|R||S|)$。直观含义：**每个对象平均匹配量级**，便于跨规模对齐与压力测试。
 
-> 注意：合成数据生成器通常用 $k=\mathrm{round}(\alpha\cdot(n_r+n_s))$ 生成目标 $|J|=k$，因此实际 $\alpha$ 可能是离散近似（论文里建议写 “α_target/α_achieved” 或说明 rounding）。
+> 注意：合成数据生成器通常用  
+> $k=\mathrm{round}(\alpha\cdot(n_r+n_s))$ 生成目标 $|J|=k$，  
+> 因此实际 $\alpha$ 可能是离散近似（论文里建议写 “α_target/α_achieved” 或说明 rounding）。
 
 ------
 
@@ -59,7 +65,7 @@ EXP‑3 的核心输出应回答以下问题（建议论文按这套问题写解
 
 ### 4.1 计时口径（论文必须写清）
 
-EXP‑3 比较聚焦“算法本体”：
+EXP‑3 比较聚焦“算法本体”——建议以**runner 内部 wall time**作为主口径：
 
 - 数据生成 / 文件读写 **不计入**主要计时
 - 计时覆盖：Build / Count / Enumerate（如适用）/ Sample
@@ -77,6 +83,8 @@ EXP‑3 比较聚焦“算法本体”：
 
 主文默认 **单线程**（`sys.threads=1`），确保公平比较；多线程作为补充实验放附录。
 
+> 与脚本对齐：`run/run_exp3.sh` 默认 `EXP3_THREADS=1`；若你设置 `EXP3_THREADS>1`，脚本也会同步设置常见的线程池上限（如 `OMP_NUM_THREADS` 等）到同一值，避免“明明指定多线程但被外部线程池强制 1”的歧义。
+
 ------
 
 ## 5. 数据与工作负载（EXP‑3 专用）
@@ -89,8 +97,8 @@ EXP‑3 使用 **可控密度条带构造**（stripe 控制 $|J|$ 从而控制 �
 - 扫描 α
 - 生成保证 $|J| \approx \alpha(n_r+n_s)$（取整误差）
 
-> 为什么它对 EXP‑3 “paper‑friendly”：
->  因为 $|J|$ 是你可控的，所以你能把退化归因于“密度压力”，而不是数据集偶然性。
+> 为什么它对 EXP‑3 “paper‑friendly”：  
+> 因为 $|J|$ 是你可控的，所以你能把退化归因于“密度压力”，而不是数据集偶然性。
 
 ### 5.2 固定参数（典型默认，建议先跑通）
 
@@ -98,6 +106,9 @@ EXP‑3 使用 **可控密度条带构造**（stripe 控制 $|J|$ 从而控制 �
 - $t=100000$
 - repeats=3
 - 单线程
+
+> 注意：上述是“典型默认”。实际跑出来的默认值以  
+> `config/sweeps/sweep_alpha.json` 与脚本生成的 `run/temp/exp3/sweep_exp3_effective.json` 为准。
 
 ------
 
@@ -109,7 +120,8 @@ EXP‑3 使用 **可控密度条带构造**（stripe 控制 $|J|$ 从而控制 �
 - **Enum+Sampling**：先枚举 $J$ 再抽样（通常在大 α 会失败/截断）
 - **Adaptive**：$|J|$ 小走枚举，$|J|$ 大回退到采样（通过阈值或 pilot 决策）
 
-> 论文写作建议：EXP‑3 主图一般只画 **Sampling + Adaptive**；Enum+Sampling 可在小 α 区间出现，超出后用失败标注/截断，不要强行跑满 0–300。
+> 论文写作建议：EXP‑3 主图一般只画 **Sampling + Adaptive**；  
+> Enum+Sampling 可在小 α 区间出现，超出后用失败标注/截断，不要强行跑满 0–300。
 
 ### 6.2 特殊说明：Rejection 方法的变体选择
 
@@ -120,21 +132,76 @@ EXP‑3 使用 **可控密度条带构造**（stripe 控制 $|J|$ 从而控制 �
 
 ------
 
-## 7. 如何运行 EXP‑3（推荐路径）
+## 7. 如何运行 EXP‑3（与 `run/run_exp3.sh` 对齐的推荐路径）
 
-### 7.1 编译（Release）
+### 7.1 一键运行（推荐）
 
-```
-mkdir -p build
-cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build . -j
-ctest --output-on-failure   # 可选但强烈建议
+在仓库根目录执行：
+
+```bash
+bash run/run_exp3.sh
 ```
 
-### 7.2 运行 sweep（最推荐：配置驱动）
+脚本会在 `run/temp/exp3` 产生中间产物，然后同步到 `results/raw/exp3`（或按时间戳保存）。
 
+#### 常用环境变量（脚本级）
+
+- **构建与测试**
+  - `EXP3_BUILD_TYPE=Release|Debug|RelWithDebInfo|MinSizeRel`
+  - `EXP3_CLEAN_BUILD=1`：清理 build 目录后重建
+  - `EXP3_JOBS=16`：编译并行度
+  - `EXP3_RUN_TESTS=1`：build 后跑 `ctest`
+
+- **实验控制（覆盖 sweep JSON 的关键参数）**
+  - `EXP3_NR`, `EXP3_NS`
+  - `EXP3_T`：采样次数 t
+  - `EXP3_REPEATS`
+  - `EXP3_JSTAR`：自适应阈值（决定理论换挡点）
+  - `EXP3_ENUM_CAP`：枚举上限（防止 OOM）
+  - `EXP3_THREADS`：`sys.threads`（默认 1）
+  - `EXP3_METHODS` / `EXP3_VARIANTS`：只跑部分方法/模式（开发时可用）
+
+- **α 列表（让“换挡点证据”更硬）**
+  - `EXP3_ALPHA_LIST="0,0.03,0.1,0.3,1,3,4,5,6,10,30,100,300"`：显式指定点位
+  - `EXP3_AUTO_ALPHA_LIST=1`（默认）：若未指定 `EXP3_ALPHA_LIST`，脚本会采用更 paper‑friendly 的默认列表；若能从 `EXP3_NR/EXP3_NS/EXP3_JSTAR` 推出 $\alpha_\star$，则会在 $\alpha_\star$ 附近自动加密整数点位。
+
+- **画图与输出**
+  - `EXP3_PLOT=0`：跳过画图
+  - `EXP3_PLOT_ENUM=1`：额外生成包含 enum_sampling 的图（用于附录）
+  - `EXP3_KEEP_HISTORY=1`：结果写入 `results/raw/exp3/<timestamp>/`，并更新 `results/raw/exp3/latest`（软链，best effort）
+
+#### 推荐命令示例
+
+1) **主文单线程、默认点位**（推荐）：
+
+```bash
+bash run/run_exp3.sh
 ```
+
+2) **明确加密换挡点附近 α（更像论文）**：
+
+```bash
+EXP3_ALPHA_LIST="0,0.03,0.1,0.3,1,3,4,5,6,10,30,100,300" \
+bash run/run_exp3.sh
+```
+
+3) **保留历史结果 + 生成附录 enum 图**：
+
+```bash
+EXP3_KEEP_HISTORY=1 EXP3_PLOT_ENUM=1 bash run/run_exp3.sh
+```
+
+4) **多线程附录实验（注意：主文仍建议单线程）**：
+
+```bash
+EXP3_KEEP_HISTORY=1 EXP3_THREADS=8 bash run/run_exp3.sh
+```
+
+### 7.2 手动运行（开发调试）
+
+如需跳过脚本、直接跑 sweep（例如调参/单点 debug）：
+
+```bash
 ./sjs_sweep --config=../config/sweeps/sweep_alpha.json
 ```
 
@@ -142,7 +209,7 @@ ctest --output-on-failure   # 可选但强烈建议
 
 ### 7.3（可选）先跑一次 sanity（质量与几何判定）
 
-```
+```bash
 ./sjs_verify \
   --dataset_source=synthetic --gen=stripe --dataset=verify \
   --n_r=2000 --n_s=2000 --alpha=0.3 --gen_seed=1 \
@@ -153,12 +220,25 @@ ctest --output-on-failure   # 可选但强烈建议
 
 ## 8. 输出文件与字段解读（读结果必看）
 
-### 8.1 输出文件
+### 8.1 输出目录结构（脚本产物）
 
-默认输出目录（由 sweep config 决定）下应包含：
+脚本会先写到：
+
+- `run/temp/exp3/`
+
+然后同步到：
+
+- 默认覆盖模式：`results/raw/exp3/`
+- 若 `EXP3_KEEP_HISTORY=1`：`results/raw/exp3/<timestamp>/`，并尝试更新 `results/raw/exp3/latest`
+
+典型文件：
 
 - `sweep_raw.csv`：每次 repeat 一行（最细粒度）
 - `sweep_summary.csv`：按 (alpha, method, variant, …) 聚合（画主图首选）
+- `derived/adaptive_branch_ratio.csv`：从 raw 导出的自适应分支比例
+- `meta/manifest.txt`：运行环境、git 信息、参数覆盖等（artifact 友好）
+- `sweep_exp3_effective.json`：本次实验真正使用的 effective config（可复现）
+- `plots/`：图像输出目录（见第 9 节）
 
 ### 8.2 `sweep_summary.csv` 常用字段（主图用）
 
@@ -178,7 +258,7 @@ ctest --output-on-failure   # 可选但强烈建议
 
 ------
 
-## 9. 作图规范（EXP‑3 推荐两张图 + 可选解释图）
+## 9. 作图规范（与脚本输出目录对齐）
 
 ### 9.1 主图：runtime vs α（用 summary）
 
@@ -208,6 +288,11 @@ ctest --output-on-failure   # 可选但强烈建议
 
 用于解释：某方法为何在大 α 爆炸（通常是 Count 或 Sample 阶段变慢）。
 
+### 9.4 与脚本生成图的对应关系
+
+- 默认主图输出：`plots/main/`（不含 enum_sampling；主文更干净）
+- 若 `EXP3_PLOT_ENUM=1`：额外输出 `plots/with_enum/`（含 enum_sampling；适合附录/小 α 子图）
+
 ------
 
 ## 10. 如何解释曲线（论文叙事模板）
@@ -230,7 +315,7 @@ $$
 
 **写作建议：**
 
-- sweep 点位要覆盖 $\alpha_\star$ 附近（建议加 α=4/5/6）
+- sweep 点位要覆盖 $\alpha_\star$ 附近（建议加 α=4/5/6；脚本默认会提供 paper‑friendly 列表）
 - 用 branch ratio 图证明换挡发生在接近 $\alpha_\star$ 的位置
 
 ### 10.3 稠密区（α 很大）
@@ -267,8 +352,9 @@ $$
 
 ## 13. 推荐的“最小增强”（让 EXP‑3 更像论文）
 
-- 把 α 列表在换挡点附近加密：例如
-   `0,0.03,0.1,0.3,1,3,4,5,6,10,30,100,300`
+- 把 α 列表在换挡点附近加密：例如  
+  `0,0.03,0.1,0.3,1,3,4,5,6,10,30,100,300`  
+  （脚本默认会提供 paper‑friendly 列表；你也可以用 `EXP3_ALPHA_LIST` 显式指定。）
 - 主图只放 sampling/adaptive；enum+sampling 放一个“小 α 子图或附录”
 - 增加一张小图：phase breakdown（Build/Count/Sample）随 α 的变化（解释力极强）
 
@@ -276,5 +362,5 @@ $$
 
 ### 一句话总结（给论文的 caption 可用）
 
-> **EXP‑3（RQ3）**：在固定规模与固定样本量下扫描密度参数
->  $\alpha=|J|/(n_r+n_s)$，比较不同方法在稀疏→稠密 join 压力下的端到端采样时间，并用自适应分支比例与阶段分解解释退化分界与换挡行为（half‑open 相交语义，计时不含数据生成/读写，单线程，结果报告 median+p95）。
+> **EXP‑3（RQ3）**：在固定规模与固定样本量下扫描密度参数  
+> $\alpha=|J|/(n_r+n_s)$，比较不同方法在稀疏→稠密 join 压力下的端到端采样时间，并用自适应分支比例与阶段分解解释退化分界与换挡行为（half‑open 相交语义，计时不含数据生成/读写，单线程，结果报告 median+p95）。
