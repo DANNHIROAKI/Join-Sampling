@@ -11,10 +11,10 @@
 #   - Metric: end-to-end wall time (summary uses median/p95 + ok_rate)
 #   - Artifacts: sweep_raw.csv, sweep_summary.csv, phase/ratio heatmaps
 #
-# Repo-wide runner conventions (your 5 requirements):
+# Repo-wide runner conventions:
 #   1) Experiment logic/params align with EXP-6.md (RQ6 intent)
 #   2) Build output under: <repo_root>/build/<build_type>/
-#   3) Final results under: <repo_root>/results/raw/exp6  (OVERWRITE each run)
+#   3) Final results under: <repo_root>/results/raw/exp6  (OVERWRITE each run) [default]
 #   4) No embedded python in this bash: python lives under <repo_root>/run/include/
 #   5) All generated configs/logs/etc are written to: <repo_root>/run/temp/exp6
 #      and copied to results/raw/exp6 on success.
@@ -28,8 +28,8 @@
 #   EXP6_RUN_TESTS=0|1
 #   EXP6_BUILD_JOBS=8
 #
-#   # Dataset size
-#   EXP6_N=200000                 # sets n_r=n_s=EXP6_N
+#   # Dataset size (NOTE: EXP6_N sets each side, i.e., n_r=n_s=EXP6_N; total=2*EXP6_N)
+#   EXP6_N=100000
 #   EXP6_N_R=100000 EXP6_N_S=100000
 #   EXP6_GEN_SEED=1
 #
@@ -46,6 +46,10 @@
 #   EXP6_THREADS=1
 #   EXP6_J_STAR=1000000
 #   EXP6_ENUM_CAP=0
+#
+#   # Output dirs (optional)
+#   EXP6_OUT_DIR="results/raw/exp6"       # relative-to-repo-root or absolute
+#   EXP6_TEMP_DIR="run/temp/exp6"         # relative-to-repo-root or absolute
 #
 set -euo pipefail
 IFS=$'\n\t'
@@ -157,6 +161,22 @@ resolve_exe() {
   echo "$found"
 }
 
+# Absolute/relative path helper (relative paths are resolved against repo root)
+abs_path_under_root() {
+  local p="$1"
+  local root="$2"
+  if [[ "$p" == /* ]]; then
+    echo "$p"
+  else
+    echo "${root}/${p}"
+  fi
+}
+
+iso_timestamp() {
+  # Portable ISO-8601-ish timestamp for Linux/macOS
+  date +"%Y-%m-%dT%H:%M:%S%z"
+}
+
 # --------------------------
 # locate repo root
 # --------------------------
@@ -171,6 +191,7 @@ need_cmd python3
 need_cmd tee
 need_cmd find
 need_cmd awk
+need_cmd grep
 
 # --------------------------
 # parameters (override via env)
@@ -224,15 +245,22 @@ EXP6_THREADS="${EXP6_THREADS:-1}"
 EXP6_J_STAR="${EXP6_J_STAR:-1000000}"
 EXP6_ENUM_CAP="${EXP6_ENUM_CAP:-0}"
 
+if [[ "${EXP6_ENUM_CAP}" != "0" ]]; then
+  log "[WARN] EXP6_ENUM_CAP=${EXP6_ENUM_CAP} != 0. This can truncate enum_sampling and may invalidate oracle(min) unless you exclude truncated points in plotting."
+fi
+
 # --------------------------
-# directories (fixed per repo convention)
+# directories (default matches repo convention; allow override via env)
 # --------------------------
-TEMP_ROOT="${ROOT_DIR}/run/temp/exp6"
+EXP6_TEMP_DIR="${EXP6_TEMP_DIR:-run/temp/exp6}"
+EXP6_OUT_DIR="${EXP6_OUT_DIR:-results/raw/exp6}"
+
+TEMP_ROOT="$(abs_path_under_root "${EXP6_TEMP_DIR}" "${ROOT_DIR}")"
+FINAL_OUT="$(abs_path_under_root "${EXP6_OUT_DIR}" "${ROOT_DIR}")"
+
 META_DIR="${TEMP_ROOT}/meta"
 LOG_DIR="${TEMP_ROOT}/logs"
 FIGS_DIR="${TEMP_ROOT}/figs"
-
-FINAL_OUT="${ROOT_DIR}/results/raw/exp6"
 
 PLOT_HELPER="${ROOT_DIR}/run/include/exp6_plot.py"
 
@@ -240,7 +268,7 @@ PLOT_HELPER="${ROOT_DIR}/run/include/exp6_plot.py"
 rm -rf "${TEMP_ROOT}"
 mkdir -p "${META_DIR}" "${LOG_DIR}" "${FIGS_DIR}"
 
-# Ensure results/raw exists
+# Ensure results/raw exists (even if FINAL_OUT is elsewhere)
 mkdir -p "${ROOT_DIR}/results/raw"
 
 # --------------------------
@@ -256,7 +284,7 @@ export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-${EXP6_THREADS}}"
 # manifest + sysinfo
 # --------------------------
 {
-  echo "timestamp=$(date -Is)"
+  echo "timestamp=$(iso_timestamp)"
   echo "root_dir=${ROOT_DIR}"
   echo "build_type=${EXP6_BUILD_TYPE}"
   echo "build_dir=${BUILD_DIR}"
@@ -280,6 +308,8 @@ export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-${EXP6_THREADS}}"
   echo "stripe.shuffle_strips=${EXP6_SHUFFLE_STRIPS}"
   echo "stripe.shuffle_r=${EXP6_SHUFFLE_R}"
   echo "stripe.swap_sides=${EXP6_SWAP_SIDES}"
+  echo "temp_root=${TEMP_ROOT}"
+  echo "final_out=${FINAL_OUT}"
   if command -v git >/dev/null 2>&1 && git -C "${ROOT_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     echo "git_sha=$(git -C "${ROOT_DIR}" rev-parse HEAD)"
     echo "git_dirty=$(git -C "${ROOT_DIR}" status --porcelain | wc -l | awk '{print $1}')"
@@ -290,7 +320,7 @@ export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-${EXP6_THREADS}}"
 } > "${META_DIR}/manifest.txt"
 
 {
-  echo "date: $(date -Is)"
+  echo "date: $(iso_timestamp)"
   uname -a || true
   echo
   cmake --version || true
@@ -324,8 +354,13 @@ SJS_SWEEP="$(resolve_exe sjs_sweep "${BUILD_DIR}" || true)"
 [[ -n "${SJS_SWEEP}" ]] || die "Could not find executable 'sjs_sweep' under: ${BUILD_DIR}"
 log "Using sjs_sweep: ${SJS_SWEEP}"
 
+# Sanity check: ensure this sjs_sweep supports JSON config (--config)
+if ! "${SJS_SWEEP}" --help 2>&1 | grep -q -- "--config"; then
+  die "Resolved sjs_sweep does not support --config. You may have built the legacy CLI version (e.g., src/apps). Please build the JSON-config sjs_sweep from the root apps target."
+fi
+
 # --------------------------
-# generate sweep config (JSON) -> run/temp/exp6
+# generate sweep config (JSON) -> TEMP_ROOT
 # --------------------------
 ALPHAS_JSON="$(json_array_numbers_from_csv "${EXP6_ALPHAS}")"
 TS_JSON="$(json_array_numbers_from_csv "${EXP6_TS}")"
@@ -410,7 +445,7 @@ log "Wrote sweep config: ${CONFIG_PATH}"
 # run sweep
 # --------------------------
 SWEEP_LOG="${LOG_DIR}/sjs_sweep.log"
-log "Running sweep (this can take a while depending on methods/grid)"
+log "Running sweep"
 log "Log: ${SWEEP_LOG}"
 
 (
@@ -440,7 +475,7 @@ python3 "${PLOT_HELPER}" \
   2>&1 | tee "${LOG_DIR}/plot.log"
 
 # --------------------------
-# finalize -> results/raw/exp6 (overwrite)
+# finalize -> FINAL_OUT (overwrite)
 # --------------------------
 log "Copying artifacts to final results dir (overwrite): ${FINAL_OUT}"
 rm -rf "${FINAL_OUT}"

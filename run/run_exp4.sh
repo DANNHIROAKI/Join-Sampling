@@ -2,27 +2,35 @@
 # ==============================================================================
 # EXP-4: Scalability vs N (RQ4)
 #
-# This runner is aligned with EXP-4.md (Scalability vs N).
+# This runner is aligned with EXP-4_aligned.md (Scalability vs N).
 #
 # IMPORTANT (integrity):
 #   This script does NOT "rig" results by hiding baselines. Instead, it:
 #     (1) keeps the standard EXP-4 settings, and
-#     (2) optionally adds *additional* high-pressure settings that EXP-4.md explicitly
+#     (2) optionally adds *additional* high-pressure settings that EXP-4_aligned.md explicitly
 #         allows (e.g., higher alpha / larger t) to better expose output-oblivious stability.
 #
-# Core design (per EXP-4.md):
+# Core design (per EXP-4_aligned.md):
 #   - Sweep N (n_r=n_s=N) under fixed density alpha and fixed sample size t.
 #   - Prefer offline binary datasets (generated once) so algorithm wall_ms excludes I/O.
 #   - Measure peak RSS using GNU time -v (RSS only; runtime uses run.csv wall_ms).
 #   - Run method × variant × repeats; record failures and continue.
 #
 # ------------------------------------------------------------------
-# NEW: "RUN_PROFILE" presets
-#   RUN_PROFILE=balanced  -> EXP-4.md recommended defaults (alpha5 + alpha100, t=1e5, repeats=3)
-#   RUN_PROFILE=ours      -> Adds a stronger high-pressure regime and larger t to expose Ours' strengths
+# RUN_PROFILE presets (defaults only)
+#   RUN_PROFILE=balanced  -> EXP-4 recommended defaults (alpha5 + alpha100, t=1e5, repeats=3)
+#   RUN_PROFILE=ours      -> Adds stronger high-pressure regime and larger t
 #                            (alpha5 + alpha200, t in {1e5,1e6}, repeats=5 by default)
 #
-# You can still override ANY field via env variables.
+# NOTE (change vs previous script):
+#   - Default RUN_PROFILE is now "balanced" (paper-friendly default).
+#     If you want the previous behavior, run: RUN_PROFILE=ours bash run/run_exp4.sh
+#
+# Extras (opt-in):
+#   - KEEP_HISTORY=1: save each run under results/raw/exp4_runs/<RUN_ID>/ and
+#                     point results/raw/exp4 -> latest (symlink, best-effort).
+#   - ALLOW_REJECTION_SAMPLING=1: run method=rejection variant=sampling (disabled by default,
+#                                 since many builds mark it unsupported).
 # ------------------------------------------------------------------
 #
 # Quick usage:
@@ -31,12 +39,14 @@
 #
 # Common overrides:
 #   RUN_PROFILE=balanced                 bash run/run_exp4.sh
+#   RUN_PROFILE=ours                     bash run/run_exp4.sh
 #   REGIMES="alpha5:5 alpha200:200"      bash run/run_exp4.sh
 #   T_LIST="100000 1000000"              bash run/run_exp4.sh
 #   N_LIST="50000 100000 200000"         bash run/run_exp4.sh
 #   METHODS="ours pbsm kd_tree"          bash run/run_exp4.sh
 #   EXTRA_RUN_ARGS="--enum_cap=50000000" bash run/run_exp4.sh
 #   TIMEOUT_SEC=3600                     bash run/run_exp4.sh
+#   KEEP_HISTORY=1                       bash run/run_exp4.sh
 # ==============================================================================
 
 set -euo pipefail
@@ -116,6 +126,17 @@ run_with_optional_timeout() {
   "$@"
 }
 
+# best-effort symlink (fallback to copy if symlink is not supported)
+link_or_copy_latest() {
+  local target="$1"   # directory that holds the actual results
+  local link_path="$2"  # path to create/replace
+  rm -rf "$link_path" 2>/dev/null || true
+  ln -s "$target" "$link_path" 2>/dev/null || {
+    mkdir -p "$link_path"
+    cp -a "$target/." "$link_path/"
+  }
+}
+
 # --------------------------------------
 # locate repo root
 # --------------------------------------
@@ -130,9 +151,18 @@ RESULT_ROOT="${ROOT_DIR}/results/raw/exp4"
 DATA_ROOT="${ROOT_DIR}/data/synthetic/exp4"
 
 # --------------------------------------
+# History / unsupported combos
+# --------------------------------------
+KEEP_HISTORY="${KEEP_HISTORY:-0}"
+RESULT_RUNS_ROOT="${RESULT_RUNS_ROOT:-${ROOT_DIR}/results/raw/exp4_runs}"
+RESULT_LATEST_LINK="${RESULT_LATEST_LINK:-${ROOT_DIR}/results/raw/exp4_latest}"
+
+ALLOW_REJECTION_SAMPLING="${ALLOW_REJECTION_SAMPLING:-0}"
+
+# --------------------------------------
 # RUN_PROFILE presets (defaults only)
 # --------------------------------------
-RUN_PROFILE="${RUN_PROFILE:-ours}"
+RUN_PROFILE="${RUN_PROFILE:-balanced}"
 
 N_LIST_DEFAULT="50000 100000 200000 400000 800000"
 REPEATS_DEFAULT="3"
@@ -141,9 +171,9 @@ T_LIST_DEFAULT=""                 # if empty, use T_DEFAULT
 DEFAULT_REGIMES_SPEC="alpha5:5 alpha100:100"
 
 if [[ "$RUN_PROFILE" == "ours" ]]; then
-  # Per EXP-4.md, if alpha=100 does not show a clear cross-over, increase to 150/200.
+  # Per EXP-4_aligned.md, if alpha=100 does not show a clear cross-over, increase to 150/200.
   DEFAULT_REGIMES_SPEC="alpha5:5 alpha200:200"
-  # Make sample stage visible (EXP-4.md suggests t=1e6 as an alternative setting).
+  # Make sample stage visible (EXP-4_aligned.md suggests t=1e6 as an alternative setting).
   T_LIST_DEFAULT="100000 1000000"
   REPEATS_DEFAULT="5"
 fi
@@ -175,7 +205,7 @@ LINK_DATA_IN_TEMP="${LINK_DATA_IN_TEMP:-1}"
 
 WRITE_SAMPLES="${WRITE_SAMPLES:-0}"
 
-# Safety defaults (EXP-4.md strongly recommends enum_cap + timeout).
+# Safety defaults (EXP-4_aligned.md strongly recommends enum_cap + timeout).
 EXTRA_RUN_ARGS="${EXTRA_RUN_ARGS:-"--enum_cap=50000000"}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-3600}"
 
@@ -217,7 +247,7 @@ done
 
 # --------------------------------------
 # Thread fairness (FORCE caps to THREADS)
-# EXP-4.md requires single-thread fairness by env + --threads.
+# EXP-4_aligned.md requires single-thread fairness by env + --threads.
 # --------------------------------------
 export OMP_NUM_THREADS="$THREADS"
 export MKL_NUM_THREADS="$THREADS"
@@ -234,7 +264,7 @@ if ! command -v g++ >/dev/null 2>&1 && ! command -v clang++ >/dev/null 2>&1; the
 fi
 need_cmd awk; need_cmd sed; need_cmd find
 
-# GNU time for RSS (EXP-4.md: use ONLY for RSS).
+# GNU time for RSS (EXP-4_aligned.md: use ONLY for RSS).
 TIME_BIN=""
 if command -v gtime >/dev/null 2>&1; then
   TIME_BIN="$(command -v gtime)"
@@ -265,12 +295,27 @@ rm -f "$tmp_time_out"
 [[ "$rc_time" -eq 0 ]] && TIME_SUPPORTS_O=1
 
 # --------------------------------------
+# Basic warnings (paper hygiene)
+# --------------------------------------
+# If you plan to plot p95 error bars, repeats<5 is usually noisy.
+if [[ "$REPEATS" =~ ^[0-9]+$ ]] && (( REPEATS < 5 )); then
+  warn "REPEATS=$REPEATS (<5). If you plan to plot p95 error bars, consider REPEATS>=5 for stability."
+fi
+
+# Warn if enum_sampling is enabled but enum_cap is missing.
+if echo " $VARIANTS " | grep -q " enum_sampling "; then
+  if [[ -z "${EXTRA_RUN_ARGS// }" ]] || ! echo " $EXTRA_RUN_ARGS " | grep -q " --enum_cap="; then
+    warn "VARIANTS includes enum_sampling but EXTRA_RUN_ARGS does not include --enum_cap=... (risk of OOM / long stalls)."
+  fi
+fi
+
+# --------------------------------------
 # Clean temp (overwrite) + ensure dirs
 # --------------------------------------
 msg "Repo root:      $ROOT_DIR"
 msg "Build root:     $BUILD_ROOT"
 msg "Temp root:      $TEMP_ROOT"
-msg "Results root:   $RESULT_ROOT (overwritten)"
+msg "Results root:   $RESULT_ROOT (default overwrite; KEEP_HISTORY=$KEEP_HISTORY)"
 msg "Data root:      $DATA_ROOT"
 msg "RUN_PROFILE:    $RUN_PROFILE"
 msg "Build type:     $BUILD_TYPE"
@@ -288,6 +333,7 @@ msg "WRITE_SAMPLES:  $WRITE_SAMPLES"
 msg "EXTRA_RUN_ARGS: $EXTRA_RUN_ARGS"
 msg "TIMEOUT_SEC:    $TIMEOUT_SEC (timeout cmd: $(command -v timeout >/dev/null 2>&1 && echo yes || echo no))"
 msg "GNU time:       $TIME_BIN (supports -o: $TIME_SUPPORTS_O)"
+msg "ALLOW_REJECTION_SAMPLING: $ALLOW_REJECTION_SAMPLING"
 
 rm -rf "$TEMP_ROOT"
 mkdir -p "$TEMP_ROOT" "$DATA_ROOT" "$TEMP_ROOT/meta"
@@ -308,6 +354,9 @@ RUN_ID="$(date +%Y%m%d_%H%M%S)"
   echo "DATA_ROOT=$DATA_ROOT"
   echo "TEMP_ROOT=$TEMP_ROOT"
   echo "RESULT_ROOT=$RESULT_ROOT"
+  echo "KEEP_HISTORY=$KEEP_HISTORY"
+  echo "RESULT_RUNS_ROOT=$RESULT_RUNS_ROOT"
+  echo "RESULT_LATEST_LINK=$RESULT_LATEST_LINK"
   echo "BUILD_TYPE=$BUILD_TYPE"
   echo "JOBS=$JOBS_DETECTED"
   echo "THREADS=$THREADS"
@@ -321,6 +370,7 @@ RUN_ID="$(date +%Y%m%d_%H%M%S)"
   echo "WRITE_SAMPLES=$WRITE_SAMPLES"
   echo "EXTRA_RUN_ARGS=$EXTRA_RUN_ARGS"
   echo "TIMEOUT_SEC=$TIMEOUT_SEC"
+  echo "ALLOW_REJECTION_SAMPLING=$ALLOW_REJECTION_SAMPLING"
   echo "REGIMES_SPEC=$REGIMES_SPEC"
   echo "REGIMES_PARSED_COUNT=${#REG_NAMES[@]}"
   for i in "${!REG_NAMES[@]}"; do
@@ -444,7 +494,7 @@ for i in "${!REG_NAMES[@]}"; do
     STATUS_CSV="$REG_OUT_BASE/exp4_status.csv"
     COMMANDS_LOG="$REG_OUT_BASE/commands.log"
     echo "run_id,regime,alpha,t,repeats,seed,gen_seed,N,method,variant,exit_code,rss_kb,enum_truncated_any,run_csv" > "$RSS_CSV"
-    echo "run_id,regime,alpha,t,repeats,seed,gen_seed,N,method,variant,exit_code,out_dir,stderr_log,enum_truncated_any" > "$STATUS_CSV"
+    echo "run_id,regime,alpha,t,repeats,seed,gen_seed,N,method,variant,exit_code,out_dir,stderr_log,enum_truncated_any,note" > "$STATUS_CSV"
     : > "$COMMANDS_LOG"
 
     {
@@ -461,6 +511,8 @@ for i in "${!REG_NAMES[@]}"; do
       echo "EXTRA_RUN_ARGS=$EXTRA_RUN_ARGS"
       echo "TIMEOUT_SEC=$TIMEOUT_SEC"
       echo "DATE=$(date -Is)"
+      echo "KEEP_HISTORY=$KEEP_HISTORY"
+      echo "ALLOW_REJECTION_SAMPLING=$ALLOW_REJECTION_SAMPLING"
     } > "$REG_OUT_BASE/regime_manifest.txt"
 
     for N in $N_LIST; do
@@ -477,6 +529,16 @@ for i in "${!REG_NAMES[@]}"; do
           STDOUT_LOG="$OUT_DIR/stdout.log"
           STDERR_LOG="$OUT_DIR/stderr.log"
           MEM_LOG="$MEM_DIR/N${N}_${method}_${variant}.timev.log"
+
+          # Known unsupported combo (common in many builds): rejection × sampling
+          if [[ "$method" == "rejection" && "$variant" == "sampling" && "$ALLOW_REJECTION_SAMPLING" != "1" ]]; then
+            warn "skip unsupported combo: method=rejection variant=sampling (set ALLOW_REJECTION_SAMPLING=1 to run)"
+            echo "[EXP4][SKIP] method=rejection variant=sampling is skipped by default. Set ALLOW_REJECTION_SAMPLING=1 to run it." > "$STDERR_LOG"
+            : > "$STDOUT_LOG"
+            echo "$RUN_ID,$REG_DIR,$ALPHA_CUR,$T_CUR,$REPEATS,$SEED,$GEN_SEED,$N,$method,$variant,2,,," >> "$RSS_CSV"
+            echo "$RUN_ID,$REG_DIR,$ALPHA_CUR,$T_CUR,$REPEATS,$SEED,$GEN_SEED,$N,$method,$variant,2,$OUT_DIR,$STDERR_LOG,,unsupported_combo" >> "$STATUS_CSV"
+            continue
+          fi
 
           CMD=(
             "$SJS_RUN"
@@ -517,7 +579,7 @@ for i in "${!REG_NAMES[@]}"; do
           enum_trunc_any="$(parse_enum_truncated_any_from_run_csv "$RUN_CSV")"
 
           echo "$RUN_ID,$REG_DIR,$ALPHA_CUR,$T_CUR,$REPEATS,$SEED,$GEN_SEED,$N,$method,$variant,$rc,$rss_kb,$enum_trunc_any,$RUN_CSV" >> "$RSS_CSV"
-          echo "$RUN_ID,$REG_DIR,$ALPHA_CUR,$T_CUR,$REPEATS,$SEED,$GEN_SEED,$N,$method,$variant,$rc,$OUT_DIR,$STDERR_LOG,$enum_trunc_any" >> "$STATUS_CSV"
+          echo "$RUN_ID,$REG_DIR,$ALPHA_CUR,$T_CUR,$REPEATS,$SEED,$GEN_SEED,$N,$method,$variant,$rc,$OUT_DIR,$STDERR_LOG,$enum_trunc_any," >> "$STATUS_CSV"
 
           if [[ "$rc" -ne 0 ]]; then
             warn "failed (exit=$rc). See: $STDERR_LOG"
@@ -536,14 +598,30 @@ for i in "${!REG_NAMES[@]}"; do
 done
 
 # --------------------------------------
-# Sync temp -> results/raw/exp4 (overwrite)
+# Sync temp -> results (default overwrite; optional history)
 # --------------------------------------
-msg "[sync] Copy temp outputs -> results/raw/exp4 (overwrite)"
-rm -rf "$RESULT_ROOT"
-mkdir -p "$RESULT_ROOT"
-cp -a "$TEMP_ROOT/." "$RESULT_ROOT/"
+if [[ "$KEEP_HISTORY" == "1" ]]; then
+  HIST_DIR="${RESULT_RUNS_ROOT}/${RUN_ID}"
+  msg "[sync] KEEP_HISTORY=1 -> copy temp outputs -> $HIST_DIR"
+  rm -rf "$HIST_DIR"
+  mkdir -p "$HIST_DIR"
+  cp -a "$TEMP_ROOT/." "$HIST_DIR/"
+
+  msg "[sync] update latest links:"
+  msg "  - $RESULT_LATEST_LINK -> $HIST_DIR"
+  msg "  - $RESULT_ROOT -> $HIST_DIR"
+  mkdir -p "$(dirname "$RESULT_LATEST_LINK")" "$(dirname "$RESULT_ROOT")" 2>/dev/null || true
+  link_or_copy_latest "$HIST_DIR" "$RESULT_LATEST_LINK"
+  link_or_copy_latest "$HIST_DIR" "$RESULT_ROOT"
+else
+  msg "[sync] Copy temp outputs -> results/raw/exp4 (overwrite)"
+  rm -rf "$RESULT_ROOT"
+  mkdir -p "$RESULT_ROOT"
+  cp -a "$TEMP_ROOT/." "$RESULT_ROOT/"
+fi
 
 msg "[done] EXP-4 finished ✅"
 msg "  Temp:    $TEMP_ROOT"
 msg "  Results: $RESULT_ROOT"
 msg "  Data:    $DATA_ROOT"
+msg "  RUN_ID:  $RUN_ID"

@@ -22,20 +22,6 @@
 #   - If you choose to show a method subset in the main paper figure, keep the full outputs
 #     (mode=full) as supplementary material.
 #
-# Usage:
-#   bash run/run_exp2.sh
-#
-# Examples:
-#   # Paper-only (default), with explicit method set shown in paper figure:
-#   bash run/run_exp2.sh --t_profile paper --paper_methods "ours,pbsm,range_tree,kd_tree"
-#
-#   # Paper + Extended (to show eventual crossover / slope dominance):
-#   bash run/run_exp2.sh --t_profile both
-#
-#   # Override t lists:
-#   bash run/run_exp2.sh --t_list_paper "1000,3000,10000,30000,100000,300000,1000000" \
-#                        --t_list_ext   "1000,1000000,3000000,10000000,30000000"
-#
 # Outputs (fixed):
 #   - Temp (always overwritten):      <repo_root>/run/temp/exp2/
 #   - Final (overwritten on success): <repo_root>/results/raw/exp2/
@@ -75,7 +61,7 @@ Build options:
 Run options:
   --threads <int>                 Override base.sys.threads (default: 1)
   --write_samples <0|1>           Override base.run.write_samples (default: 0)
-  --j_star <u64>                  Override base.run.j_star (default: 100000)
+  --j_star <u64>                  Override base.run.j_star (default: 10000)
 
 Repeats:
   --repeats_paper <int>           Effective repeats for paper profile (default: 10)
@@ -161,7 +147,6 @@ csv_ints_to_json_array() {
 }
 
 # Merge two CSV integer lists into a sorted, unique CSV list.
-# This is useful to build a single "full-range" t sweep that includes both paper + extended points.
 merge_t_lists_csv() {
   local a="$(trim "$1")"
   local b="$(trim "$2")"
@@ -176,7 +161,6 @@ merge_t_lists_csv() {
   [[ -n "${merged}" ]] || die "Failed to merge t-lists into a non-empty CSV."
   echo "${merged}"
 }
-
 
 awk_col_idx() {
   local file="$1"
@@ -283,6 +267,26 @@ patch_config() {
     ' "${cfg_in}" > "${cfg_out}"
 }
 
+# ----------------------------
+# Plotter capability probe (best effort)
+# ----------------------------
+PLOT_HELP=""
+
+plot_supports_flag() {
+  local flag="$1"
+  [[ -n "${PLOT_HELP}" ]] || return 1
+  [[ "${PLOT_HELP}" == *"${flag}"* ]]
+}
+
+should_pass_plot_flag() {
+  local flag="$1"
+  # If we couldn't probe help, keep legacy behavior: pass the flag (better compatibility).
+  if [[ -z "${PLOT_HELP}" ]]; then
+    return 0
+  fi
+  plot_supports_flag "${flag}"
+}
+
 run_sweep_and_plot() {
   local profile="$1"
   local t_list_csv="$2"
@@ -379,23 +383,79 @@ run_sweep_and_plot() {
     log "[${profile}] count_mean over ok points: ${cnt_minmax:-<none>}"
   fi
 
-  # Plot
+  # Plot (non-fatal)
   if [[ "${DO_PLOT}" -eq 1 ]]; then
     if command -v python3 >/dev/null 2>&1; then
       log "Plotting profile=${profile} ..."
-      python3 "${PLOT_SCRIPT}" \
-        --out_dir "${out_dir}" \
-        --t0 "${PLOT_T0}" \
-        --error "${PLOT_ERROR}" \
-        --warmup_reps "${warmup_reps}" \
-        --mode "${PLOT_MODE}" \
-        --topk "${TOPK}" \
-        --always_include "${ALWAYS_INCLUDE}" \
-        --paper_methods "${PAPER_METHODS}" \
-        --exclude_methods "${EXCLUDE_METHODS}" \
-        --min_repeats "${repeats_eff}" \
-        --paper_with_sample_phase "${PAPER_WITH_SAMPLE_PHASE}" \
-        2>&1 | tee "${out_dir}/logs/plot_exp2.log"
+
+      # If we have help text, and it doesn't even contain required flags, skip plotting.
+      if [[ -n "${PLOT_HELP}" ]]; then
+        if ! plot_supports_flag "--out_dir" || ! plot_supports_flag "--t0"; then
+          log "[WARN] Plot script '${PLOT_SCRIPT}' does not appear to support --out_dir/--t0 (per --help). Skipping plot for profile=${profile}."
+          return 0
+        fi
+      fi
+
+      local plot_args=()
+      plot_args+=(--out_dir "${out_dir}")
+      plot_args+=(--t0 "${PLOT_T0}")
+
+      # Map --error auto -> p95 if plotter doesn't mention "auto" in --help.
+      local plot_error_eff="${PLOT_ERROR}"
+      if [[ "${PLOT_ERROR}" == "auto" && -n "${PLOT_HELP}" && "${PLOT_HELP}" != *"auto"* ]]; then
+        plot_error_eff="p95"
+        log "[WARN] Plot script help does not mention 'auto' for --error; using --error ${plot_error_eff}"
+      fi
+      if should_pass_plot_flag "--error"; then
+        plot_args+=(--error "${plot_error_eff}")
+      fi
+
+      if should_pass_plot_flag "--warmup_reps"; then
+        plot_args+=(--warmup_reps "${warmup_reps}")
+      fi
+      if should_pass_plot_flag "--mode"; then
+        plot_args+=(--mode "${PLOT_MODE}")
+      fi
+
+      if should_pass_plot_flag "--topk"; then
+        plot_args+=(--topk "${TOPK}")
+      fi
+      if should_pass_plot_flag "--always_include"; then
+        plot_args+=(--always_include "${ALWAYS_INCLUDE}")
+      fi
+
+      # Only pass paper_methods/exclude_methods if non-empty (avoid "empty string means empty set").
+      if [[ -n "${PAPER_METHODS}" ]]; then
+        if should_pass_plot_flag "--paper_methods"; then
+          plot_args+=(--paper_methods "${PAPER_METHODS}")
+        else
+          log "[WARN] Plot script does not support --paper_methods; ignoring PAPER_METHODS for profile=${profile}."
+        fi
+      fi
+
+      if [[ -n "${EXCLUDE_METHODS}" ]]; then
+        if should_pass_plot_flag "--exclude_methods"; then
+          plot_args+=(--exclude_methods "${EXCLUDE_METHODS}")
+        else
+          log "[WARN] Plot script does not support --exclude_methods; ignoring EXCLUDE_METHODS for profile=${profile}."
+        fi
+      fi
+
+      if should_pass_plot_flag "--min_repeats"; then
+        plot_args+=(--min_repeats "${repeats_eff}")
+      fi
+      if should_pass_plot_flag "--paper_with_sample_phase"; then
+        plot_args+=(--paper_with_sample_phase "${PAPER_WITH_SAMPLE_PHASE}")
+      fi
+
+      set +e
+      python3 "${PLOT_SCRIPT}" "${plot_args[@]}" 2>&1 | tee "${out_dir}/logs/plot_exp2.log"
+      local rc_plot="${PIPESTATUS[0]}"
+      set -e
+
+      if [[ "${rc_plot}" -ne 0 ]]; then
+        log "[WARN] Plot step failed for profile=${profile} (exit=${rc_plot}). Raw/summary are kept; see ${out_dir}/logs/plot_exp2.log"
+      fi
     else
       log "python3 not found; skipping plot step for profile=${profile}."
     fi
@@ -416,9 +476,6 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CONFIG="config/sweeps/sweep_t.json"
 T_PROFILE="full"
 
-# Default t-lists:
-# - paper:   standard range (as in EXP-2 doc)
-# - ext:     includes bigger t to make slope dominance / crossover visible
 T_LIST_PAPER="1000,3000,10000,30000,100000,300000,1000000"
 T_LIST_EXT="1000,1000000,3000000,10000000,30000000"
 T_LIST_FULL=""  # If empty, will be set to union(t_list_paper, t_list_ext)
@@ -495,7 +552,6 @@ if [[ "${CONFIG}" != /* ]]; then
   CONFIG="${REPO_ROOT}/${CONFIG}"
 fi
 
-# If full t-list not specified, derive it from the union of paper + extended lists.
 if [[ -z "${T_LIST_FULL}" ]]; then
   T_LIST_FULL="$(merge_t_lists_csv "${T_LIST_PAPER}" "${T_LIST_EXT}")"
 fi
@@ -537,7 +593,6 @@ if [[ "${PLOT_ERROR}" != "auto" && "${PLOT_ERROR}" != "p95" && "${PLOT_ERROR}" !
 if ! [[ "${TOPK}" =~ ^[0-9]+$ ]] || [[ "${TOPK}" -le 0 ]]; then die "--topk must be a positive integer"; fi
 if [[ "${PAPER_WITH_SAMPLE_PHASE}" != "0" && "${PAPER_WITH_SAMPLE_PHASE}" != "1" ]]; then die "--paper_with_sample_phase must be 0 or 1"; fi
 
-# Clean temp (always overwrite temp)
 rm -rf "${TEMP_DIR}"
 mkdir -p "${TEMP_DIR}/logs"
 
@@ -568,14 +623,12 @@ log "exclude_methods: ${EXCLUDE_METHODS:-<none>}"
 log "Temp dir       : ${TEMP_DIR}"
 log "Final results  : ${RESULT_DIR} (will be overwritten on success)"
 
-# Force single-thread behavior for common libs
 export OMP_NUM_THREADS="${THREADS}"
 export MKL_NUM_THREADS="${THREADS}"
 export OPENBLAS_NUM_THREADS="${THREADS}"
 export VECLIB_MAXIMUM_THREADS="${THREADS}"
 export NUMEXPR_NUM_THREADS="${THREADS}"
 
-# Save environment
 {
   echo "timestamp=${TS}"
   echo "repo_root=${REPO_ROOT}"
@@ -651,6 +704,11 @@ if [[ ! -f "${PLOT_SCRIPT}" ]]; then
   PLOT_SCRIPT="${REPO_ROOT}/run/plot_exp2.py"
 fi
 [[ -f "${PLOT_SCRIPT}" ]] || die "Missing plot script at run/include/exp2_plot.py or run/plot_exp2.py"
+
+# Probe plotter help once (best effort). If it fails, we keep legacy behavior.
+if [[ "${DO_PLOT}" -eq 1 ]] && command -v python3 >/dev/null 2>&1; then
+  PLOT_HELP="$(python3 "${PLOT_SCRIPT}" --help 2>&1 || true)"
+fi
 
 # ----------------------------
 # Run profiles

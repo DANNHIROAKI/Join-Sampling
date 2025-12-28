@@ -32,6 +32,11 @@
 #   ENUM_CAP=0
 #   INCLUDE_ENUM_SPARSE=1  SPARSE_ALPHA=0.1
 #
+# 重要（修复点）：
+#   EXCLUDE_ENUM_TRUNCATED=0|1  (默认 0)
+#     - 0：保留 enum_truncated==1 的行（对 adaptive 的 fallback pilot 截断是“设计行为”，应纳入分解）
+#     - 1：过滤 enum_truncated==1 的行（更适合只想分析完整枚举的 enum_sampling 场景）
+#
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -122,6 +127,11 @@ ENUM_CAP="${ENUM_CAP:-0}"
 INCLUDE_ENUM_SPARSE="${INCLUDE_ENUM_SPARSE:-1}"
 SPARSE_ALPHA="${SPARSE_ALPHA:-0.1}"
 
+# Postprocess filtering:
+# Default 0 to KEEP adaptive fallback pilot truncation in breakdown.
+EXCLUDE_ENUM_TRUNCATED_DEFAULT="${EXCLUDE_ENUM_TRUNCATED:-0}"
+EXCLUDE_ENUM_TRUNCATED="${EXP7_EXCLUDE_ENUM_TRUNCATED:-${EXCLUDE_ENUM_TRUNCATED_DEFAULT}}"
+
 # --------------------------
 # fixed directories (per your global requirements)
 # --------------------------
@@ -147,7 +157,7 @@ need_cmd find
 [[ -f "${PY_POST}" ]] || die "Missing helper: ${PY_POST}"
 
 # numeric sanity checks
-for v in NR NS T REPEATS GEN_SEED SEED THREADS J_STAR ENUM_CAP; do
+for v in NR NS T REPEATS GEN_SEED SEED THREADS J_STAR ENUM_CAP EXCLUDE_ENUM_TRUNCATED; do
   val="${!v}"
   if ! [[ "${val}" =~ ^[0-9]+$ ]]; then
     die "${v} must be an integer (got: '${val}')"
@@ -158,6 +168,9 @@ for v in NR NS T REPEATS GEN_SEED SEED THREADS J_STAR ENUM_CAP; do
 done
 if [[ "${THREADS}" -le 0 ]]; then
   die "THREADS must be >= 1 (got: '${THREADS}')"
+fi
+if [[ "${EXCLUDE_ENUM_TRUNCATED}" != "0" && "${EXCLUDE_ENUM_TRUNCATED}" != "1" ]]; then
+  die "EXCLUDE_ENUM_TRUNCATED must be 0 or 1 (got: '${EXCLUDE_ENUM_TRUNCATED}')"
 fi
 
 # clean temp (always overwrite temp)
@@ -179,6 +192,7 @@ log "threads      : ${THREADS}"
 log "J_STAR       : ${J_STAR}"
 log "ENUM_CAP     : ${ENUM_CAP}"
 log "enum sparse  : INCLUDE_ENUM_SPARSE=${INCLUDE_ENUM_SPARSE} SPARSE_ALPHA=${SPARSE_ALPHA}"
+log "postprocess  : EXCLUDE_ENUM_TRUNCATED=${EXCLUDE_ENUM_TRUNCATED}"
 
 # Thread caps (fairness + reproducibility)
 export OMP_NUM_THREADS="${THREADS}"
@@ -210,6 +224,8 @@ export NUMEXPR_NUM_THREADS="${THREADS}"
   echo "ENUM_CAP=${ENUM_CAP}"
   echo "INCLUDE_ENUM_SPARSE=${INCLUDE_ENUM_SPARSE}"
   echo "SPARSE_ALPHA=${SPARSE_ALPHA}"
+  echo
+  echo "EXCLUDE_ENUM_TRUNCATED=${EXCLUDE_ENUM_TRUNCATED}"
 } > "${TEMP_DIR}/MANIFEST.txt"
 
 {
@@ -345,7 +361,7 @@ python3 "${PY_POST}" \
   --out_md "${OUT_MD}" \
   --fig_dir "${FIG_DIR}" \
   --merged_raw "${MERGED_RAW}" \
-  --exclude_enum_truncated 1 \
+  --exclude_enum_truncated "${EXCLUDE_ENUM_TRUNCATED}" \
   2>&1 | tee "${TEMP_DIR}/logs/postprocess.log"
 
 [[ -f "${OUT_BREAKDOWN}" ]] || die "Missing expected output: ${OUT_BREAKDOWN}"
