@@ -1,31 +1,20 @@
 #!/usr/bin/env bash
-# run/run_exp2.sh  (paper+extended runner)
+# run/run_exp2.sh  (paper+extended runner, integrity-preserving)
 #
 # EXP-2: Runtime vs t (RQ2)
 #
-# This is a *paper-ready* runner that:
-#   - keeps the original EXP-2 behavior (sweep by JSON config)
-#   - fixes the most common "paper figure" issues (cold start bias, inconsistent baseline t0)
-#   - optionally runs an *extended t-range* to make asymptotic trends visible
-#   - always preserves transparency (raw + summary kept; full plots optional)
+# This runner is "paper-ready" *without* hiding raw data:
+# - keeps raw + summary for ALL methods
+# - produces multiple paper-friendly views:
+#     (1) Δruntime vs t  (baseline t0)
+#     (2) runtime vs t
+#     (3) sample-phase vs t
+#     (4) ns/sample table (derived)
 #
-# Key upgrades vs the previous runner:
-#   1) Default Δruntime baseline t0=1000 (matches EXP-2 writeup).
-#   2) Two profiles (paper / extended) via --t_profile={paper|extended|both}.
-#   3) Optional patch of the sweep t-list from the runner (no manual JSON edits).
-#   4) Plotter is called with --min_repeats so paper plots only use fully-successful repeats.
-#   5) Optional paper method set control (topk OR explicit list) without hiding raw data.
-#
-# NOTE (integrity):
-#   - This script does NOT delete "unfavorable" raw results.
-#   - It only changes: (i) t-range coverage, (ii) plotting defaults, (iii) reproducibility metadata.
-#   - If you choose to show a method subset in the main paper figure, keep the full outputs
-#     (mode=full) as supplementary material.
-#
-# Outputs (fixed):
-#   - Temp (always overwritten):      <repo_root>/run/temp/exp2/
-#   - Final (overwritten on success): <repo_root>/results/raw/exp2/
-#
+# IMPORTANT (integrity):
+# - This script does NOT delete or suppress any raw results.
+# - It only changes plotting defaults and adds convenience "paper_main" links.
+
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -83,6 +72,9 @@ Paper figure method selection:
   --always_include <csv>          Default: ours
   --paper_methods <csv>           If set, use exactly this comma-list (plus always_include)
   --exclude_methods <csv>         Methods to exclude from plots (e.g., rejection)
+
+Paper artifact convenience:
+  --paper_main <delta|runtime|sample_phase>  Which paper plot to symlink as exp2_paper_main.* (default: delta)
 
 Misc:
   -h, --help                      Show help
@@ -146,7 +138,6 @@ csv_ints_to_json_array() {
   echo "${out}"
 }
 
-# Merge two CSV integer lists into a sorted, unique CSV list.
 merge_t_lists_csv() {
   local a="$(trim "$1")"
   local b="$(trim "$2")"
@@ -168,7 +159,6 @@ awk_col_idx() {
   awk -F',' -v c="${col}" 'NR==1{for(i=1;i<=NF;i++){if($i==c){print i; exit}}}' "${file}"
 }
 
-# Extract the effective sweep t-list from a sweep config (best effort across common schemas).
 extract_t_list_csv() {
   local cfg="$1"
   jq -r '
@@ -178,10 +168,8 @@ extract_t_list_csv() {
       if (.sweep.axes? != null) then
         ([.sweep.axes[]? | select((.name?=="t") or (.key?=="t") or (.param?=="t")) | .values?] | .[0])
       else null end;
-
     def axis_values:
       if ((.sweep.axis? // "") == "t") then .sweep.values? else null end;
-
     def candidate:
       first_nonnull([
         .sweep.t_list?,
@@ -192,14 +180,10 @@ extract_t_list_csv() {
         axis_values,
         axes_t_values
       ]);
-
     (candidate // empty) | if type=="array" then map(tostring)|join(",") else empty end
   ' "${cfg}"
 }
 
-# Patch the sweep config:
-#   - repeats, threads, write_samples, j_star
-#   - t_list (best effort across common schemas)
 patch_config() {
   local cfg_in="$1"
   local cfg_out="$2"
@@ -267,24 +251,54 @@ patch_config() {
     ' "${cfg_in}" > "${cfg_out}"
 }
 
-# ----------------------------
-# Plotter capability probe (best effort)
-# ----------------------------
-PLOT_HELP=""
-
-plot_supports_flag() {
-  local flag="$1"
-  [[ -n "${PLOT_HELP}" ]] || return 1
-  [[ "${PLOT_HELP}" == *"${flag}"* ]]
+make_paper_main_links() {
+  local out_dir="$1"
+  local main="$2"
+  local base="exp2_paper_${main}_vs_t"
+  local pdf="${out_dir}/${base}.pdf"
+  local png="${out_dir}/${base}.png"
+  if [[ -f "${pdf}" ]]; then
+    (cd "${out_dir}" && ln -sf "${base}.pdf" "exp2_paper_main.pdf")
+  fi
+  if [[ -f "${png}" ]]; then
+    (cd "${out_dir}" && ln -sf "${base}.png" "exp2_paper_main.png")
+  fi
 }
 
-should_pass_plot_flag() {
-  local flag="$1"
-  # If we couldn't probe help, keep legacy behavior: pass the flag (better compatibility).
-  if [[ -z "${PLOT_HELP}" ]]; then
-    return 0
-  fi
-  plot_supports_flag "${flag}"
+write_takeaways() {
+  local out_dir="$1"
+  local f="${out_dir}/exp2_ns_per_sample.csv"
+  [[ -f "${f}" ]] || return 0
+
+  local idx_var idx_m idx_ns
+  idx_var="$(awk_col_idx "${f}" "variant")"
+  idx_m="$(awk_col_idx "${f}" "method")"
+  idx_ns="$(awk_col_idx "${f}" "ns_per_sample_regression")"
+
+  [[ -n "${idx_var}" && -n "${idx_m}" && -n "${idx_ns}" ]] || return 0
+
+  {
+    echo "EXP-2 TAKEAWAYS (derived from exp2_ns_per_sample.csv)"
+    echo "Lower ns/sample = better scaling of sample-phase."
+    echo
+    echo "variant,ours_ns_per_sample_reg,pbsm_ns_per_sample_reg,ratio(pbsm/ours)"
+    awk -F',' -v v="${idx_var}" -v m="${idx_m}" -v ns="${idx_ns}" '
+      NR>1{
+        key=$v;
+        if($m=="ours") ours[key]=$ns;
+        if($m=="pbsm") pbsm[key]=$ns;
+      }
+      END{
+        for(k in ours){
+          if(k in pbsm){
+            ratio = pbsm[k]/ours[k];
+            printf("%s,%.6f,%.6f,%.3f\n", k, ours[k], pbsm[k], ratio);
+          }
+        }
+      }' "${f}" | sort
+    echo
+    echo "Note: This file does NOT replace the end-to-end runtime plot; it complements it."
+  } > "${out_dir}/EXP2_TAKEAWAYS.txt"
 }
 
 run_sweep_and_plot() {
@@ -318,7 +332,6 @@ run_sweep_and_plot() {
     "${THREADS}" "${write_samples_bool}" "${J_STAR}" \
     "${t_list_json}" "${TS}"
 
-  # Validate t-list extraction worked and includes t0 (for consistent Δruntime).
   local t_list_used
   t_list_used="$(extract_t_list_csv "${patched_cfg}")"
   [[ -n "${t_list_used}" ]] || die "Could not extract t-list from patched config (${patched_cfg}). Please update patch_t() candidates."
@@ -327,7 +340,6 @@ run_sweep_and_plot() {
     die "plot_t0=${PLOT_T0} is not present in the sweep t-list for profile=${profile}. Fix --plot_t0 or --t_list_*."
   fi
 
-  # Write per-profile manifest.
   {
     echo "EXP-2 profile manifest"
     echo "timestamp=${TS}"
@@ -347,6 +359,7 @@ run_sweep_and_plot() {
     echo "plot_t0=${PLOT_T0}"
     echo "plot_error=${PLOT_ERROR}"
     echo "paper_with_sample_phase=${PAPER_WITH_SAMPLE_PHASE}"
+    echo "paper_main=${PAPER_MAIN}"
     echo "topk=${TOPK}"
     echo "always_include=${ALWAYS_INCLUDE}"
     echo "paper_methods=${PAPER_METHODS}"
@@ -383,79 +396,32 @@ run_sweep_and_plot() {
     log "[${profile}] count_mean over ok points: ${cnt_minmax:-<none>}"
   fi
 
-  # Plot (non-fatal)
+  # Plot (IMPORTANT: avoid passing empty-string method lists to plotter)
   if [[ "${DO_PLOT}" -eq 1 ]]; then
     if command -v python3 >/dev/null 2>&1; then
       log "Plotting profile=${profile} ..."
+      plot_args=(
+        --out_dir "${out_dir}"
+        --t0 "${PLOT_T0}"
+        --error "${PLOT_ERROR}"
+        --warmup_reps "${warmup_reps}"
+        --mode "${PLOT_MODE}"
+        --topk "${TOPK}"
+        --always_include "${ALWAYS_INCLUDE}"
+        --min_repeats "${repeats_eff}"
+        --paper_with_sample_phase "${PAPER_WITH_SAMPLE_PHASE}"
+      )
+      [[ -n "${PAPER_METHODS}" ]] && plot_args+=( --paper_methods "${PAPER_METHODS}" )
+      [[ -n "${EXCLUDE_METHODS}" ]] && plot_args+=( --exclude_methods "${EXCLUDE_METHODS}" )
 
-      # If we have help text, and it doesn't even contain required flags, skip plotting.
-      if [[ -n "${PLOT_HELP}" ]]; then
-        if ! plot_supports_flag "--out_dir" || ! plot_supports_flag "--t0"; then
-          log "[WARN] Plot script '${PLOT_SCRIPT}' does not appear to support --out_dir/--t0 (per --help). Skipping plot for profile=${profile}."
-          return 0
-        fi
-      fi
+      python3 "${PLOT_SCRIPT}" "${plot_args[@]}" \
+        2>&1 | tee "${out_dir}/logs/plot_exp2.log"
 
-      local plot_args=()
-      plot_args+=(--out_dir "${out_dir}")
-      plot_args+=(--t0 "${PLOT_T0}")
+      # Convenience: symlink the chosen paper main figure
+      make_paper_main_links "${out_dir}" "${PAPER_MAIN}"
 
-      # Map --error auto -> p95 if plotter doesn't mention "auto" in --help.
-      local plot_error_eff="${PLOT_ERROR}"
-      if [[ "${PLOT_ERROR}" == "auto" && -n "${PLOT_HELP}" && "${PLOT_HELP}" != *"auto"* ]]; then
-        plot_error_eff="p95"
-        log "[WARN] Plot script help does not mention 'auto' for --error; using --error ${plot_error_eff}"
-      fi
-      if should_pass_plot_flag "--error"; then
-        plot_args+=(--error "${plot_error_eff}")
-      fi
-
-      if should_pass_plot_flag "--warmup_reps"; then
-        plot_args+=(--warmup_reps "${warmup_reps}")
-      fi
-      if should_pass_plot_flag "--mode"; then
-        plot_args+=(--mode "${PLOT_MODE}")
-      fi
-
-      if should_pass_plot_flag "--topk"; then
-        plot_args+=(--topk "${TOPK}")
-      fi
-      if should_pass_plot_flag "--always_include"; then
-        plot_args+=(--always_include "${ALWAYS_INCLUDE}")
-      fi
-
-      # Only pass paper_methods/exclude_methods if non-empty (avoid "empty string means empty set").
-      if [[ -n "${PAPER_METHODS}" ]]; then
-        if should_pass_plot_flag "--paper_methods"; then
-          plot_args+=(--paper_methods "${PAPER_METHODS}")
-        else
-          log "[WARN] Plot script does not support --paper_methods; ignoring PAPER_METHODS for profile=${profile}."
-        fi
-      fi
-
-      if [[ -n "${EXCLUDE_METHODS}" ]]; then
-        if should_pass_plot_flag "--exclude_methods"; then
-          plot_args+=(--exclude_methods "${EXCLUDE_METHODS}")
-        else
-          log "[WARN] Plot script does not support --exclude_methods; ignoring EXCLUDE_METHODS for profile=${profile}."
-        fi
-      fi
-
-      if should_pass_plot_flag "--min_repeats"; then
-        plot_args+=(--min_repeats "${repeats_eff}")
-      fi
-      if should_pass_plot_flag "--paper_with_sample_phase"; then
-        plot_args+=(--paper_with_sample_phase "${PAPER_WITH_SAMPLE_PHASE}")
-      fi
-
-      set +e
-      python3 "${PLOT_SCRIPT}" "${plot_args[@]}" 2>&1 | tee "${out_dir}/logs/plot_exp2.log"
-      local rc_plot="${PIPESTATUS[0]}"
-      set -e
-
-      if [[ "${rc_plot}" -ne 0 ]]; then
-        log "[WARN] Plot step failed for profile=${profile} (exit=${rc_plot}). Raw/summary are kept; see ${out_dir}/logs/plot_exp2.log"
-      fi
+      # Convenience: write derived scaling takeaways (ns/sample)
+      write_takeaways "${out_dir}"
     else
       log "python3 not found; skipping plot step for profile=${profile}."
     fi
@@ -502,6 +468,9 @@ ALWAYS_INCLUDE="ours"
 PAPER_METHODS=""
 EXCLUDE_METHODS=""
 
+# NEW: choose which paper plot to symlink as exp2_paper_main.*
+PAPER_MAIN="delta"   # delta|runtime|sample_phase
+
 DO_CLEAN=0
 DO_BUILD=1
 DO_PLOT=1
@@ -538,6 +507,8 @@ while [[ $# -gt 0 ]]; do
     --always_include)    ALWAYS_INCLUDE="$2"; shift 2;;
     --paper_methods)     PAPER_METHODS="$2"; shift 2;;
     --exclude_methods)   EXCLUDE_METHODS="$2"; shift 2;;
+
+    --paper_main)        PAPER_MAIN="$2"; shift 2;;
 
     --clean)             DO_CLEAN=1; shift;;
     --no-build)          DO_BUILD=0; shift;;
@@ -593,6 +564,10 @@ if [[ "${PLOT_ERROR}" != "auto" && "${PLOT_ERROR}" != "p95" && "${PLOT_ERROR}" !
 if ! [[ "${TOPK}" =~ ^[0-9]+$ ]] || [[ "${TOPK}" -le 0 ]]; then die "--topk must be a positive integer"; fi
 if [[ "${PAPER_WITH_SAMPLE_PHASE}" != "0" && "${PAPER_WITH_SAMPLE_PHASE}" != "1" ]]; then die "--paper_with_sample_phase must be 0 or 1"; fi
 
+if [[ "${PAPER_MAIN}" != "delta" && "${PAPER_MAIN}" != "runtime" && "${PAPER_MAIN}" != "sample_phase" ]]; then
+  die "--paper_main must be delta|runtime|sample_phase"
+fi
+
 rm -rf "${TEMP_DIR}"
 mkdir -p "${TEMP_DIR}/logs"
 
@@ -616,6 +591,7 @@ log "plot_mode      : ${PLOT_MODE}"
 log "plot_t0        : ${PLOT_T0}"
 log "plot_error     : ${PLOT_ERROR}"
 log "paper_with_sample_phase: ${PAPER_WITH_SAMPLE_PHASE}"
+log "paper_main     : ${PAPER_MAIN}"
 log "topk           : ${TOPK}"
 log "always_include : ${ALWAYS_INCLUDE}"
 log "paper_methods  : ${PAPER_METHODS:-<auto/topk>}"
@@ -652,6 +628,7 @@ export NUMEXPR_NUM_THREADS="${THREADS}"
   echo "plot_t0=${PLOT_T0}"
   echo "plot_error=${PLOT_ERROR}"
   echo "paper_with_sample_phase=${PAPER_WITH_SAMPLE_PHASE}"
+  echo "paper_main=${PAPER_MAIN}"
   echo "topk=${TOPK}"
   echo "always_include=${ALWAYS_INCLUDE}"
   echo "paper_methods=${PAPER_METHODS}"
@@ -698,17 +675,11 @@ fi
 SJS_SWEEP="$(find_exe "${BUILD_DIR}" "sjs_sweep")"
 log "Using sjs_sweep: ${SJS_SWEEP}"
 
-# Plot script location (prefer run/include/exp2_plot.py)
 PLOT_SCRIPT="${REPO_ROOT}/run/include/exp2_plot.py"
 if [[ ! -f "${PLOT_SCRIPT}" ]]; then
   PLOT_SCRIPT="${REPO_ROOT}/run/plot_exp2.py"
 fi
 [[ -f "${PLOT_SCRIPT}" ]] || die "Missing plot script at run/include/exp2_plot.py or run/plot_exp2.py"
-
-# Probe plotter help once (best effort). If it fails, we keep legacy behavior.
-if [[ "${DO_PLOT}" -eq 1 ]] && command -v python3 >/dev/null 2>&1; then
-  PLOT_HELP="$(python3 "${PLOT_SCRIPT}" --help 2>&1 || true)"
-fi
 
 # ----------------------------
 # Run profiles

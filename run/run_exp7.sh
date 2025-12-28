@@ -3,39 +3,33 @@
 #
 # EXP-7：阶段分解与解释性 Profiling（Phase Breakdown）
 # ----------------------------------------------------
-# 与 EXP-7.md 对齐的实验目标：
-#   - 在 2–3 个代表性密度点（alpha）上，对每个 method × variant
-#     的端到端运行时间做阶段拆分（Build/Count/Enumerate/Sample），
-#     用于解释 EXP-2/3/6 的趋势（谁在什么阶段赢，瓶颈在哪）。
+# 修正点（重要）：
+#   (A) 默认不再用 --exclude_enum_truncated 1 全局过滤，
+#       因为 adaptive/fallback 的 pilot 截断（enum_truncated==1）是“预期行为”，
+#       EXP-7 需要展示它来解释 dense regime 的机制。
+#       -> 新增 EXCLUDE_ENUM_TRUNCATED（默认 0），用于控制后处理过滤。
 #
-# 本脚本遵循你给出的全局目录与工程规范（5 条要求）：
-#   1) 逻辑/参数/口径与 EXP-7.md 对齐（sampling+adaptive 全 alpha；enum_sampling 仅稀疏点可选）
-#   2) Build 统一放在 <repo_root>/build/<build_type>/ 下（默认 Release -> build/release）
-#   3) 实验结果统一覆盖写入 <repo_root>/results/raw/exp7/
-#   4) Bash 内不包含任何“内嵌 Python”（所有 Python 放在 <repo_root>/run/include/ 下）
-#   5) 本脚本运行产生的 json/csv/png/md/log 等“必要文件”均先落到 <repo_root>/run/temp/exp7/
-#      成功后再覆盖同步到 results/raw/exp7/
+#   (B) 默认 ALPHAS 改为 "0.1 3 5 30"（与 EXP-7.md 的“推荐增强”一致，
+#       在阈值附近加点更能解释 adaptive 拐点）。
+#
+# 其余目录/规范保持与你现有脚本一致。
 #
 # 用法：
 #   bash run/run_exp7.sh
 #
-# 常用覆盖参数（环境变量，默认值与 EXP-7.md 一致）：
-#   BUILD_TYPE=Release|Debug|RelWithDebInfo|MinSizeRel   (默认 Release)
-#   CLEAN_BUILD=0|1                                      (默认 0)
+# 常用覆盖参数（环境变量）：
+#   BUILD_TYPE=Release|Debug|RelWithDebInfo|MinSizeRel
+#   CLEAN_BUILD=0|1
 #   NR=100000  NS=100000
 #   T=100000   REPEATS=3
 #   GEN_SEED=1 SEED=1
 #   THREADS=1
-#   ALPHAS="0.1 3 30"
+#   ALPHAS="0.1 3 5 30"
 #   METHODS="ours aabb interval_tree kd_tree r_tree range_tree pbsm tlsop sirs rejection tsunami"
 #   J_STAR=1000000
 #   ENUM_CAP=0
 #   INCLUDE_ENUM_SPARSE=1  SPARSE_ALPHA=0.1
-#
-# 重要（修复点）：
-#   EXCLUDE_ENUM_TRUNCATED=0|1  (默认 0)
-#     - 0：保留 enum_truncated==1 的行（对 adaptive 的 fallback pilot 截断是“设计行为”，应纳入分解）
-#     - 1：过滤 enum_truncated==1 的行（更适合只想分析完整枚举的 enum_sampling 场景）
+#   EXCLUDE_ENUM_TRUNCATED=0   # ✅关键：默认 0，避免误删 adaptive fallback
 #
 set -euo pipefail
 IFS=$'\n\t'
@@ -105,7 +99,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # --------------------------
-# parameters (aligned with EXP-7.md)
+# parameters (aligned with EXP-7.md; with fixes)
 # --------------------------
 BUILD_TYPE="${EXP7_BUILD_TYPE:-${BUILD_TYPE:-Release}}"
 CLEAN_BUILD="${EXP7_CLEAN_BUILD:-${CLEAN_BUILD:-0}}"
@@ -118,7 +112,9 @@ GEN_SEED="${GEN_SEED:-1}"
 SEED="${SEED:-1}"
 THREADS="${THREADS:-1}"
 
-ALPHAS="${ALPHAS:-0.1 3 30}"
+# ✅改动：默认加入阈值附近点 5（更容易解释 adaptive 拐点）
+ALPHAS="${ALPHAS:-0.1 3 5 30}"
+
 METHODS="${METHODS:-ours aabb interval_tree kd_tree r_tree range_tree pbsm tlsop sirs rejection tsunami}"
 
 J_STAR="${J_STAR:-1000000}"
@@ -127,10 +123,8 @@ ENUM_CAP="${ENUM_CAP:-0}"
 INCLUDE_ENUM_SPARSE="${INCLUDE_ENUM_SPARSE:-1}"
 SPARSE_ALPHA="${SPARSE_ALPHA:-0.1}"
 
-# Postprocess filtering:
-# Default 0 to KEEP adaptive fallback pilot truncation in breakdown.
-EXCLUDE_ENUM_TRUNCATED_DEFAULT="${EXCLUDE_ENUM_TRUNCATED:-0}"
-EXCLUDE_ENUM_TRUNCATED="${EXP7_EXCLUDE_ENUM_TRUNCATED:-${EXCLUDE_ENUM_TRUNCATED_DEFAULT}}"
+# ✅关键改动：默认不排除 enum_truncated（避免误删 adaptive/fallback 的 pilot 截断）
+EXCLUDE_ENUM_TRUNCATED="${EXP7_EXCLUDE_ENUM_TRUNCATED:-${EXCLUDE_ENUM_TRUNCATED:-0}}"
 
 # --------------------------
 # fixed directories (per your global requirements)
@@ -169,7 +163,7 @@ done
 if [[ "${THREADS}" -le 0 ]]; then
   die "THREADS must be >= 1 (got: '${THREADS}')"
 fi
-if [[ "${EXCLUDE_ENUM_TRUNCATED}" != "0" && "${EXCLUDE_ENUM_TRUNCATED}" != "1" ]]; then
+if [[ "${EXCLUDE_ENUM_TRUNCATED}" -ne 0 && "${EXCLUDE_ENUM_TRUNCATED}" -ne 1 ]]; then
   die "EXCLUDE_ENUM_TRUNCATED must be 0 or 1 (got: '${EXCLUDE_ENUM_TRUNCATED}')"
 fi
 
@@ -192,7 +186,13 @@ log "threads      : ${THREADS}"
 log "J_STAR       : ${J_STAR}"
 log "ENUM_CAP     : ${ENUM_CAP}"
 log "enum sparse  : INCLUDE_ENUM_SPARSE=${INCLUDE_ENUM_SPARSE} SPARSE_ALPHA=${SPARSE_ALPHA}"
-log "postprocess  : EXCLUDE_ENUM_TRUNCATED=${EXCLUDE_ENUM_TRUNCATED}"
+log "postprocess  : EXCLUDE_ENUM_TRUNCATED=${EXCLUDE_ENUM_TRUNCATED} (0 keeps adaptive fallback pilot; 1 may hide it)"
+
+if [[ "${INCLUDE_ENUM_SPARSE}" == "1" ]]; then
+  if ! echo " ${ALPHAS} " | grep -q " ${SPARSE_ALPHA} "; then
+    log "[WARN] SPARSE_ALPHA=${SPARSE_ALPHA} is not in ALPHAS='${ALPHAS}'. enum_sparse will run at an extra alpha point."
+  fi
+fi
 
 # Thread caps (fairness + reproducibility)
 export OMP_NUM_THREADS="${THREADS}"
@@ -383,7 +383,7 @@ log "Final results : ${RESULT_DIR}"
 cat <<EOF
 
 EXP-7 outputs (final):
-  - sampling_adaptive raw     : ${RESULT_DIR}/sampling_adaptive/sweep_raw.csv
+  - sampling_adaptive raw      : ${RESULT_DIR}/sampling_adaptive/sweep_raw.csv
   - sampling_adaptive summary  : ${RESULT_DIR}/sampling_adaptive/sweep_summary.csv
 EOF
 

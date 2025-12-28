@@ -3,53 +3,32 @@
 #
 # EXP-6 (RQ6): Adaptivity effectiveness on an (alpha, t) grid.
 #
-# Aligned with EXP-6.md:
-#   - Data: synthetic "stripe" (alias of stripe_ctrl_alpha), where
-#       alpha = |J| / (n_r + n_s)  and  |J| = round(alpha * (n_r+n_s))
-#   - Sweep: a grid over (alpha, t)
-#   - Compare variants (fixed): sampling vs enum_sampling vs adaptive
-#   - Metric: end-to-end wall time (summary uses median/p95 + ok_rate)
-#   - Artifacts: sweep_raw.csv, sweep_summary.csv, phase/ratio heatmaps
+# This version is "paper-safe":
+#   - Do NOT cherry-pick grid points.
+#   - Adds a denser alpha grid around the default turning point (~5 for n_r+n_s=200k, j_star=1e6).
+#   - Supports a j_star sensitivity sweep via EXP6_J_STARS (CSV), producing one sub-run per j_star.
 #
-# Repo-wide runner conventions:
-#   1) Experiment logic/params align with EXP-6.md (RQ6 intent)
-#   2) Build output under: <repo_root>/build/<build_type>/
-#   3) Final results under: <repo_root>/results/raw/exp6  (OVERWRITE each run) [default]
-#   4) No embedded python in this bash: python lives under <repo_root>/run/include/
-#   5) All generated configs/logs/etc are written to: <repo_root>/run/temp/exp6
-#      and copied to results/raw/exp6 on success.
+# Output layout (overwritten on each script run):
+#   run/temp/exp6/
+#     meta/, sysinfo.txt, manifest.txt, index.txt
+#     jstar_<J>/  (one folder per j_star)
+#       exp6_alpha_t.json
+#       logs/, figs/, sweep_raw.csv, sweep_summary.csv
+#   results/raw/exp6/  <- exact copy of run/temp/exp6 (overwrite)
 #
-# Usage:
+# Usage examples:
+#   # Single j_star (default)
 #   bash run/run_exp6.sh
 #
-# Common overrides (env vars):
-#   EXP6_BUILD_TYPE=Release|Debug|RelWithDebInfo|MinSizeRel
-#   EXP6_CLEAN_BUILD=0|1
-#   EXP6_RUN_TESTS=0|1
-#   EXP6_BUILD_JOBS=8
+#   # Sensitivity sweep over j_star (recommended for paper)
+#   EXP6_J_STARS="600000,800000,1000000,1200000" bash run/run_exp6.sh
 #
-#   # Dataset size (NOTE: EXP6_N sets each side, i.e., n_r=n_s=EXP6_N; total=2*EXP6_N)
-#   EXP6_N=100000
-#   EXP6_N_R=100000 EXP6_N_S=100000
-#   EXP6_GEN_SEED=1
-#
-#   # Grid sweep
-#   EXP6_ALPHAS="0.01,0.03,0.1,0.3,1,3,10,30"
+# Common overrides:
+#   EXP6_ALPHAS="0.01,0.03,0.1,0.3,1,3,4,5,6,8,10,30"
 #   EXP6_TS="1000,3000,10000,30000,100000,300000,1000000"
-#
-#   # Which methods to include (comma-separated)
+#   EXP6_REPEATS=5
 #   EXP6_METHODS="ours,kd_tree,r_tree"
-#
-#   # Run controls
-#   EXP6_REPEATS=3
-#   EXP6_RUN_SEED=1
 #   EXP6_THREADS=1
-#   EXP6_J_STAR=1000000
-#   EXP6_ENUM_CAP=0
-#
-#   # Output dirs (optional)
-#   EXP6_OUT_DIR="results/raw/exp6"       # relative-to-repo-root or absolute
-#   EXP6_TEMP_DIR="run/temp/exp6"         # relative-to-repo-root or absolute
 #
 set -euo pipefail
 IFS=$'\n\t'
@@ -161,22 +140,6 @@ resolve_exe() {
   echo "$found"
 }
 
-# Absolute/relative path helper (relative paths are resolved against repo root)
-abs_path_under_root() {
-  local p="$1"
-  local root="$2"
-  if [[ "$p" == /* ]]; then
-    echo "$p"
-  else
-    echo "${root}/${p}"
-  fi
-}
-
-iso_timestamp() {
-  # Portable ISO-8601-ish timestamp for Linux/macOS
-  date +"%Y-%m-%dT%H:%M:%S%z"
-}
-
 # --------------------------
 # locate repo root
 # --------------------------
@@ -191,7 +154,6 @@ need_cmd python3
 need_cmd tee
 need_cmd find
 need_cmd awk
-need_cmd grep
 
 # --------------------------
 # parameters (override via env)
@@ -227,48 +189,45 @@ EXP6_SHUFFLE_R="${EXP6_SHUFFLE_R:-false}"
 EXP6_SWAP_SIDES="${EXP6_SWAP_SIDES:-false}"
 
 # Sweep grid
-EXP6_ALPHAS="${EXP6_ALPHAS:-0.01,0.03,0.1,0.3,1,3,10,30}"
+# Default grid is slightly denser around the turning point (~5 for default size & j_star).
+EXP6_ALPHAS="${EXP6_ALPHAS:-0.01,0.03,0.1,0.3,1,3,4,5,6,8,10,30}"
 EXP6_TS="${EXP6_TS:-1000,3000,10000,30000,100000,300000,1000000}"
 
 # Methods to run
 EXP6_METHODS="${EXP6_METHODS:-ours}"
 
-# Variants are fixed for EXP-6; allow override only for debugging.
+# Variants fixed for EXP-6; allow override only for debugging.
 EXP6_VARIANTS="${EXP6_VARIANTS:-sampling,enum_sampling,adaptive}"
 
 # Run control
-EXP6_REPEATS="${EXP6_REPEATS:-3}"
+# Paper recommendation: >=5 repeats
+EXP6_REPEATS="${EXP6_REPEATS:-5}"
 EXP6_RUN_SEED="${EXP6_RUN_SEED:-1}"
 EXP6_THREADS="${EXP6_THREADS:-1}"
 
 # Adaptive / enumeration knobs
 EXP6_J_STAR="${EXP6_J_STAR:-1000000}"
+# Optional CSV list to run a sensitivity sweep (recommended).
+# If set, overrides EXP6_J_STAR.
+EXP6_J_STARS="${EXP6_J_STARS:-${EXP6_J_STAR}}"
+
 EXP6_ENUM_CAP="${EXP6_ENUM_CAP:-0}"
 
-if [[ "${EXP6_ENUM_CAP}" != "0" ]]; then
-  log "[WARN] EXP6_ENUM_CAP=${EXP6_ENUM_CAP} != 0. This can truncate enum_sampling and may invalidate oracle(min) unless you exclude truncated points in plotting."
-fi
-
 # --------------------------
-# directories (default matches repo convention; allow override via env)
+# directories (fixed per repo convention)
 # --------------------------
-EXP6_TEMP_DIR="${EXP6_TEMP_DIR:-run/temp/exp6}"
-EXP6_OUT_DIR="${EXP6_OUT_DIR:-results/raw/exp6}"
-
-TEMP_ROOT="$(abs_path_under_root "${EXP6_TEMP_DIR}" "${ROOT_DIR}")"
-FINAL_OUT="$(abs_path_under_root "${EXP6_OUT_DIR}" "${ROOT_DIR}")"
-
+TEMP_ROOT="${ROOT_DIR}/run/temp/exp6"
 META_DIR="${TEMP_ROOT}/meta"
 LOG_DIR="${TEMP_ROOT}/logs"
-FIGS_DIR="${TEMP_ROOT}/figs"
 
+FINAL_OUT="${ROOT_DIR}/results/raw/exp6"
 PLOT_HELPER="${ROOT_DIR}/run/include/exp6_plot.py"
 
 # Clean temp every run (keeps runs deterministic + avoids stale artifacts)
 rm -rf "${TEMP_ROOT}"
-mkdir -p "${META_DIR}" "${LOG_DIR}" "${FIGS_DIR}"
+mkdir -p "${META_DIR}" "${LOG_DIR}"
 
-# Ensure results/raw exists (even if FINAL_OUT is elsewhere)
+# Ensure results/raw exists
 mkdir -p "${ROOT_DIR}/results/raw"
 
 # --------------------------
@@ -281,10 +240,10 @@ export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-${EXP6_THREADS}}"
 export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-${EXP6_THREADS}}"
 
 # --------------------------
-# manifest + sysinfo
+# manifest + sysinfo (top-level)
 # --------------------------
 {
-  echo "timestamp=$(iso_timestamp)"
+  echo "timestamp=$(date -Is)"
   echo "root_dir=${ROOT_DIR}"
   echo "build_type=${EXP6_BUILD_TYPE}"
   echo "build_dir=${BUILD_DIR}"
@@ -298,7 +257,7 @@ export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-${EXP6_THREADS}}"
   echo "run_seed=${EXP6_RUN_SEED}"
   echo "repeats=${EXP6_REPEATS}"
   echo "threads=${EXP6_THREADS}"
-  echo "j_star=${EXP6_J_STAR}"
+  echo "j_stars=${EXP6_J_STARS}"
   echo "enum_cap=${EXP6_ENUM_CAP}"
   echo "stripe.control_axis=${EXP6_CONTROL_AXIS}"
   echo "stripe.core_lo=${EXP6_CORE_LO}"
@@ -308,8 +267,6 @@ export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-${EXP6_THREADS}}"
   echo "stripe.shuffle_strips=${EXP6_SHUFFLE_STRIPS}"
   echo "stripe.shuffle_r=${EXP6_SHUFFLE_R}"
   echo "stripe.swap_sides=${EXP6_SWAP_SIDES}"
-  echo "temp_root=${TEMP_ROOT}"
-  echo "final_out=${FINAL_OUT}"
   if command -v git >/dev/null 2>&1 && git -C "${ROOT_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     echo "git_sha=$(git -C "${ROOT_DIR}" rev-parse HEAD)"
     echo "git_dirty=$(git -C "${ROOT_DIR}" status --porcelain | wc -l | awk '{print $1}')"
@@ -320,7 +277,7 @@ export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-${EXP6_THREADS}}"
 } > "${META_DIR}/manifest.txt"
 
 {
-  echo "date: $(iso_timestamp)"
+  echo "date: $(date -Is)"
   uname -a || true
   echo
   cmake --version || true
@@ -354,13 +311,13 @@ SJS_SWEEP="$(resolve_exe sjs_sweep "${BUILD_DIR}" || true)"
 [[ -n "${SJS_SWEEP}" ]] || die "Could not find executable 'sjs_sweep' under: ${BUILD_DIR}"
 log "Using sjs_sweep: ${SJS_SWEEP}"
 
-# Sanity check: ensure this sjs_sweep supports JSON config (--config)
-if ! "${SJS_SWEEP}" --help 2>&1 | grep -q -- "--config"; then
-  die "Resolved sjs_sweep does not support --config. You may have built the legacy CLI version (e.g., src/apps). Please build the JSON-config sjs_sweep from the root apps target."
+# Sanity check: ensure we are using the JSON-config sweep app
+if ! "${SJS_SWEEP}" --help 2>/dev/null | grep -q -- "--config"; then
+  die "The resolved sjs_sweep does not appear to support --config (JSON sweep). Check your build artifacts."
 fi
 
 # --------------------------
-# generate sweep config (JSON) -> TEMP_ROOT
+# common JSON fragments (grid/methods/variants)
 # --------------------------
 ALPHAS_JSON="$(json_array_numbers_from_csv "${EXP6_ALPHAS}")"
 TS_JSON="$(json_array_numbers_from_csv "${EXP6_TS}")"
@@ -371,9 +328,54 @@ SHUFFLE_STRIPS_JSON="$(json_bool "${EXP6_SHUFFLE_STRIPS}")"
 SHUFFLE_R_JSON="$(json_bool "${EXP6_SHUFFLE_R}")"
 SWAP_SIDES_JSON="$(json_bool "${EXP6_SWAP_SIDES}")"
 
-CONFIG_PATH="${TEMP_ROOT}/exp6_alpha_t.json"
+# --------------------------
+# parse j_star list
+# --------------------------
+J_STARS_CSV="$(trim_spaces "${EXP6_J_STARS}")"
+IFS=',' read -r -a J_STARS_ARR <<< "${J_STARS_CSV}"
+if [[ "${#J_STARS_ARR[@]}" -le 0 ]]; then
+  die "EXP6_J_STARS parsed empty (value: '${EXP6_J_STARS}')"
+fi
 
-cat > "${CONFIG_PATH}" <<EOF
+# Index file for convenience
+{
+  echo "EXP6 index (one sub-run per j_star)"
+  echo "timestamp=$(date -Is)"
+  echo "j_stars=${J_STARS_CSV}"
+  echo "grid.alphas=${EXP6_ALPHAS}"
+  echo "grid.t_list=${EXP6_TS}"
+  echo "methods=${EXP6_METHODS}"
+  echo "variants=${EXP6_VARIANTS}"
+} > "${TEMP_ROOT}/index.txt"
+
+# --------------------------
+# run one sweep per j_star
+# --------------------------
+[[ -f "${PLOT_HELPER}" ]] || die "Missing plot helper: ${PLOT_HELPER} (expected under run/include/)"
+
+for JSTAR in "${J_STARS_ARR[@]}"; do
+  [[ -n "${JSTAR}" ]] || continue
+  RUN_TAG="jstar_${JSTAR}"
+  RUN_ROOT="${TEMP_ROOT}/${RUN_TAG}"
+  RUN_META="${RUN_ROOT}/meta"
+  RUN_LOGS="${RUN_ROOT}/logs"
+  RUN_FIGS="${RUN_ROOT}/figs"
+
+  mkdir -p "${RUN_META}" "${RUN_LOGS}" "${RUN_FIGS}"
+
+  # Per-run manifest (explicitly records j_star)
+  {
+    echo "run_tag=${RUN_TAG}"
+    echo "j_star=${JSTAR}"
+    echo "enum_cap=${EXP6_ENUM_CAP}"
+    echo "repeats=${EXP6_REPEATS}"
+    echo "run_seed=${EXP6_RUN_SEED}"
+    echo "gen_seed=${EXP6_GEN_SEED}"
+    echo "threads=${EXP6_THREADS}"
+  } > "${RUN_META}/manifest_run.txt"
+
+  CONFIG_PATH="${RUN_ROOT}/exp6_alpha_t.json"
+  cat > "${CONFIG_PATH}" <<EOF
 {
   "base": {
     "dataset": {
@@ -406,14 +408,14 @@ cat > "${CONFIG_PATH}" <<EOF
       "seed": ${EXP6_RUN_SEED},
       "repeats": ${EXP6_REPEATS},
       "enum_cap": ${EXP6_ENUM_CAP},
-      "j_star": ${EXP6_J_STAR},
+      "j_star": ${JSTAR},
       "write_samples": false,
       "verify": false,
       "extra": {}
     },
 
     "output": {
-      "out_dir": "${TEMP_ROOT}"
+      "out_dir": "${RUN_ROOT}"
     },
 
     "logging": {
@@ -439,43 +441,30 @@ cat > "${CONFIG_PATH}" <<EOF
 }
 EOF
 
-log "Wrote sweep config: ${CONFIG_PATH}"
+  log "[$RUN_TAG] Running sweep with j_star=${JSTAR}"
+  SWEEP_LOG="${RUN_LOGS}/sjs_sweep.log"
+  (
+    cd "${ROOT_DIR}"
+    "${SJS_SWEEP}" --config="${CONFIG_PATH}"
+  ) 2>&1 | tee "${SWEEP_LOG}"
+
+  RAW_CSV="${RUN_ROOT}/sweep_raw.csv"
+  SUMMARY_CSV="${RUN_ROOT}/sweep_summary.csv"
+  [[ -f "${RAW_CSV}" ]] || die "[$RUN_TAG] Missing expected output: ${RAW_CSV}"
+  [[ -f "${SUMMARY_CSV}" ]] || die "[$RUN_TAG] Missing expected output: ${SUMMARY_CSV}"
+
+  log "[$RUN_TAG] Plotting"
+  python3 "${PLOT_HELPER}" \
+    --summary_csv "${SUMMARY_CSV}" \
+    --raw_csv "${RAW_CSV}" \
+    --out_dir "${RUN_FIGS}" \
+    2>&1 | tee "${RUN_LOGS}/plot.log"
+
+  echo "${RUN_TAG}: ${RUN_ROOT}" >> "${TEMP_ROOT}/index.txt"
+done
 
 # --------------------------
-# run sweep
-# --------------------------
-SWEEP_LOG="${LOG_DIR}/sjs_sweep.log"
-log "Running sweep"
-log "Log: ${SWEEP_LOG}"
-
-(
-  cd "${ROOT_DIR}"
-  "${SJS_SWEEP}" --config="${CONFIG_PATH}"
-) 2>&1 | tee "${SWEEP_LOG}"
-
-RAW_CSV="${TEMP_ROOT}/sweep_raw.csv"
-SUMMARY_CSV="${TEMP_ROOT}/sweep_summary.csv"
-[[ -f "${RAW_CSV}" ]] || die "Missing expected output: ${RAW_CSV}"
-[[ -f "${SUMMARY_CSV}" ]] || die "Missing expected output: ${SUMMARY_CSV}"
-
-log "Sweep done."
-log "  raw:     ${RAW_CSV}"
-log "  summary: ${SUMMARY_CSV}"
-
-# --------------------------
-# plot (phase + ratio + adaptive_branch heatmap)
-# --------------------------
-[[ -f "${PLOT_HELPER}" ]] || die "Missing plot helper: ${PLOT_HELPER} (expected under run/include/)"
-
-log "Plotting via: ${PLOT_HELPER}"
-python3 "${PLOT_HELPER}" \
-  --summary_csv "${SUMMARY_CSV}" \
-  --raw_csv "${RAW_CSV}" \
-  --out_dir "${FIGS_DIR}" \
-  2>&1 | tee "${LOG_DIR}/plot.log"
-
-# --------------------------
-# finalize -> FINAL_OUT (overwrite)
+# finalize -> results/raw/exp6 (overwrite)
 # --------------------------
 log "Copying artifacts to final results dir (overwrite): ${FINAL_OUT}"
 rm -rf "${FINAL_OUT}"
@@ -484,9 +473,4 @@ cp -a "${TEMP_ROOT}/." "${FINAL_OUT}/"
 
 log "DONE ✅"
 log "Final results: ${FINAL_OUT}"
-log "Key files:"
-log "  ${FINAL_OUT}/sweep_raw.csv"
-log "  ${FINAL_OUT}/sweep_summary.csv"
-log "  ${FINAL_OUT}/figs/exp6_phase_<method>.png (if matplotlib)"
-log "  ${FINAL_OUT}/figs/exp6_ratio_<method>.png (if matplotlib)"
-log "  ${FINAL_OUT}/figs/exp6_adaptive_branch_<method>.png (if raw supports adaptive_branch)"
+log "Index: ${FINAL_OUT}/index.txt"
