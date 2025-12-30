@@ -1,0 +1,12 @@
+dataset,generator,alpha,n_r,n_s,method,variant,t,repeats,ok_rate,wall_mean_ms,wall_stdev_ms,wall_median_ms,wall_p95_ms,count_mean,count_stdev,exact_frac,note
+exp7_stripe__nr100000__ns100000__a1_000em01__g1,stripe_ctrl_alpha,0.1,100000,100000,ours,enum_sampling,100000,3,1,461.26,12.283,465.969,470.04,20000,0,1,
+exp7_stripe__nr100000__ns100000__a1_000em01__g1,stripe_ctrl_alpha,0.1,100000,100000,aabb,enum_sampling,100000,3,1,1140.14,1.41147,1140.79,1141.08,20000,0,1,
+exp7_stripe__nr100000__ns100000__a1_000em01__g1,stripe_ctrl_alpha,0.1,100000,100000,interval_tree,enum_sampling,100000,3,1,822.427,24.1518,820.683,844.732,20000,0,1,
+exp7_stripe__nr100000__ns100000__a1_000em01__g1,stripe_ctrl_alpha,0.1,100000,100000,kd_tree,enum_sampling,100000,3,1,630.595,0.872106,630.687,631.344,20000,0,1,
+exp7_stripe__nr100000__ns100000__a1_000em01__g1,stripe_ctrl_alpha,0.1,100000,100000,r_tree,enum_sampling,100000,3,1,724.177,1.94857,725.112,725.445,20000,0,1,
+exp7_stripe__nr100000__ns100000__a1_000em01__g1,stripe_ctrl_alpha,0.1,100000,100000,range_tree,enum_sampling,100000,3,1,1924.63,1.12851,1924.57,1925.67,20000,0,1,
+exp7_stripe__nr100000__ns100000__a1_000em01__g1,stripe_ctrl_alpha,0.1,100000,100000,pbsm,enum_sampling,100000,3,1,36.9854,0.164343,36.9021,37.1474,20000,0,1,
+exp7_stripe__nr100000__ns100000__a1_000em01__g1,stripe_ctrl_alpha,0.1,100000,100000,tlsop,enum_sampling,100000,3,1,1422.44,5.47056,1420.1,1427.84,20000,0,1,
+exp7_stripe__nr100000__ns100000__a1_000em01__g1,stripe_ctrl_alpha,0.1,100000,100000,sirs,enum_sampling,100000,3,1,3477.74,0.835571,3478.15,3478.28,20000,0,1,
+exp7_stripe__nr100000__ns100000__a1_000em01__g1,stripe_ctrl_alpha,0.1,100000,100000,rejection,enum_sampling,100000,3,1,1596.65,7.5731,1596.76,1603.42,20000,0,1,
+exp7_stripe__nr100000__ns100000__a1_000em01__g1,stripe_ctrl_alpha,0.1,100000,100000,tsunami,enum_sampling,100000,3,1,5768.73,2.52211,5768.75,5770.99,20000,0,1,

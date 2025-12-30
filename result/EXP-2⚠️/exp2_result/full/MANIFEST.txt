@@ -1,0 +1,24 @@
+EXP-2 profile manifest
+timestamp=20251228_165357
+profile=full
+repo_root=/home/dhy/PhD/SIGMOD-EXP/EXP-2
+config_in=/home/dhy/PhD/SIGMOD-EXP/EXP-2/config/sweeps/sweep_t.json
+config_used=/home/dhy/PhD/SIGMOD-EXP/EXP-2/run/temp/exp2/full/sweep_used.json
+threads=1
+write_samples=0
+j_star=10000
+t_list_requested=1000,3000,10000,30000,100000,300000,1000000,3000000,10000000,30000000
+t_list_used=1000,3000,10000,30000,100000,300000,1000000,3000000,10000000,30000000
+repeats_effective=5
+warmup_reps=1
+repeats_total=6
+plot_mode=paper
+plot_t0=1000
+plot_error=auto
+paper_with_sample_phase=1
+paper_main=delta
+topk=6
+always_include=ours
+paper_methods=
+exclude_methods=
+out_dir=/home/dhy/PhD/SIGMOD-EXP/EXP-2/run/temp/exp2/full

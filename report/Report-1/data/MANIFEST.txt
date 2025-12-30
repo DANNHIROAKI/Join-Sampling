@@ -1,0 +1,55 @@
+EXP-1 manifest
+-------------
+date: 2025-12-24T10:13:43+00:00
+uname: Linux ta 5.4.0-216-generic #236-Ubuntu SMP Fri Apr 11 19:53:21 UTC 2025 x86_64 x86_64 x86_64 GNU/Linux
+cmake: cmake version 4.2.0
+git_head: 6b9b481
+git_status:
+ D docs/Test.md
+ D run/include/csv_check.py
+ D run/run_test_all.sh
+
+paths:
+  repo_root=/home/dhy/PhD/SIGMOD-EXP/Join-Sampling
+  build_dir=/home/dhy/PhD/SIGMOD-EXP/Join-Sampling/build/release
+  temp_dir=/home/dhy/PhD/SIGMOD-EXP/Join-Sampling/run/temp/exp1
+  results_dir=/home/dhy/PhD/SIGMOD-EXP/Join-Sampling/results/raw/exp1
+
+dataset_source=synthetic
+dataset_label=exp1_stripe_nr2000_ns2000_a1_g1
+gen=stripe
+n_r=2000
+n_s=2000
+alpha=1   # alpha=|J|/(n_r+n_s)
+gen_seed=1
+
+t=100000
+seed0=1
+repeats=5
+
+oracle_max_checks=50000000
+oracle_collect_limit=1000000
+oracle_cap=0
+
+methods=ours
+aabb
+interval_tree
+kd_tree
+r_tree
+range_tree
+pbsm
+tlsop
+sirs
+rejection
+tsunami
+variants=sampling
+enum_sampling
+adaptive
+
+thread_caps:
+  OMP_NUM_THREADS=1
+  OPENBLAS_NUM_THREADS=1
+  MKL_NUM_THREADS=1
+  NUMEXPR_NUM_THREADS=1
+  VECLIB_MAXIMUM_THREADS=1
+  THREADS(flag)=1

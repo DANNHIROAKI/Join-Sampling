@@ -1,0 +1,14 @@
+RUN_ID=20251228_165406
+REG_NAME=alpha5
+REG_DIR=alpha5
+ALPHA=5
+T=100000
+N_LIST=50000 100000 200000 400000 800000
+METHODS=ours aabb interval_tree kd_tree r_tree range_tree pbsm tlsop sirs rejection tsunami
+VARIANTS=sampling enum_sampling adaptive
+THREADS=1
+WRITE_SAMPLES=0
+EXTRA_RUN_ARGS=--enum_cap=50000000
+TIMEOUT_SEC=3600
+ALLOW_REJECTION_SAMPLING=1
+DATE=2025-12-28T16:54:27+00:00

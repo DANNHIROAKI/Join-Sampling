@@ -1,0 +1,1 @@
+{"generator":"stripe_ctrl_alpha","dataset":"exp4_alpha5_N50000","n_r":50000,"n_s":50000,"has_exact_k":true,"k_target":500000,"k_achieved":500000,"alpha_target":5,"alpha_achieved":5,"notes":"control_axis=1, core=[0.45,0.55], g=1.99996e-06, h=1.8e-05, delta=4.9999e-07, shuffle_strips=1, shuffle_r=0, k_overridden=0"}

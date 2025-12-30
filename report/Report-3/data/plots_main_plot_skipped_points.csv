@@ -1,0 +1,14 @@
+method,variant,alpha,ok_rate,wall_median_ms,wall_p95_ms,reason
+rejection,sampling,0.0,0.0,-1.0,-1.0,ok_rate==0
+rejection,sampling,0.03,0.0,-1.0,-1.0,ok_rate==0
+rejection,sampling,0.1,0.0,-1.0,-1.0,ok_rate==0
+rejection,sampling,0.3,0.0,-1.0,-1.0,ok_rate==0
+rejection,sampling,1.0,0.0,-1.0,-1.0,ok_rate==0
+rejection,sampling,3.0,0.0,-1.0,-1.0,ok_rate==0
+rejection,sampling,4.0,0.0,-1.0,-1.0,ok_rate==0
+rejection,sampling,5.0,0.0,-1.0,-1.0,ok_rate==0
+rejection,sampling,6.0,0.0,-1.0,-1.0,ok_rate==0
+rejection,sampling,10.0,0.0,-1.0,-1.0,ok_rate==0
+rejection,sampling,30.0,0.0,-1.0,-1.0,ok_rate==0
+rejection,sampling,100.0,0.0,-1.0,-1.0,ok_rate==0
+rejection,sampling,300.0,0.0,-1.0,-1.0,ok_rate==0

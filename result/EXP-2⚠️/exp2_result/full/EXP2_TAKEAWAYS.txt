@@ -1,0 +1,8 @@
+EXP-2 TAKEAWAYS (derived from exp2_ns_per_sample.csv)
+Lower ns/sample = better scaling of sample-phase.
+
+variant,ours_ns_per_sample_reg,pbsm_ns_per_sample_reg,ratio(pbsm/ours)
+adaptive,40.810913,105.168722,2.577
+sampling,40.406384,104.844089,2.595
+
+Note: This file does NOT replace the end-to-end runtime plot; it complements it.

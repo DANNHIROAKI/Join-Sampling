@@ -1,0 +1,27 @@
+EXP=exp4
+RUN_ID=20251228_165406
+DATE=2025-12-28T16:54:06+00:00
+RUN_PROFILE=balanced
+ROOT_DIR=/home/dhy/PhD/SIGMOD-EXP/EXP-4
+BUILD_ROOT=/home/dhy/PhD/SIGMOD-EXP/EXP-4/build
+DATA_ROOT=/home/dhy/PhD/SIGMOD-EXP/EXP-4/data/synthetic/exp4
+TEMP_ROOT=/home/dhy/PhD/SIGMOD-EXP/EXP-4/run/temp/exp4
+RESULT_ROOT=/home/dhy/PhD/SIGMOD-EXP/EXP-4/results/raw/exp4
+BUILD_TYPE=Release
+JOBS=128
+THREADS=1
+N_LIST=50000 100000 200000 400000 800000
+T_LIST=100000
+REPEATS=5
+SEED=1
+GEN_SEED=1
+METHODS=ours aabb interval_tree kd_tree r_tree range_tree pbsm tlsop sirs rejection tsunami
+VARIANTS=sampling enum_sampling adaptive
+WRITE_SAMPLES=0
+EXTRA_RUN_ARGS=--enum_cap=50000000
+TIMEOUT_SEC=3600
+REGIMES_SPEC=alpha5:5 alpha100:100
+ALLOW_REJECTION_SAMPLING=1
+REGIMES_PARSED_COUNT=2
+REGIME_0=alpha5 (dir=alpha5) alpha=5
+REGIME_1=alpha100 (dir=alpha100) alpha=100

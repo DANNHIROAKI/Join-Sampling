@@ -1,0 +1,112 @@
+{
+    "base": {
+      "dataset": {
+        "source": "synthetic",
+        "name": "stripe_t",
+        "dim": 2,
+        "synthetic": {
+          "generator": "stripe_ctrl_alpha",
+          "n_r": 100000,
+          "n_s": 100000,
+          "alpha": 1.0,
+          "seed": 1,
+          "params": {
+            "control_axis": 1,
+            "core_lo": 0.45,
+            "core_hi": 0.55,
+            "gap_factor": 0.1,
+            "delta_factor": 0.25,
+            "shuffle_strips": true,
+            "shuffle_r": false,
+            "swap_sides": false
+          }
+        }
+      },
+  
+      "run": {
+        "method": "ours",
+        "variant": "sampling",
+        "t": 10000,
+        "seed": 1,
+        "repeats": 3,
+        "j_star": 1000000,
+        "enum_cap": 0,
+        "write_samples": false,
+        "verify": false,
+        "extra": {
+          "pbsm_scheme": "stripes",
+          "pbsm_k": 0,
+          "pbsm_part_axis": 0,
+          "pbsm_sweep": "orthogonal",
+  
+          "tlsop_nx": 128,
+          "tlsop_ny": 128,
+          "tlsop_reuse_sort": true,
+  
+          "sirs_outer": "",
+          "sirs_leaf_size": 32,
+  
+          "rej_index": "S",
+          "rej_rep_center": false,
+          "rej_count_draws": 50000,
+          "rej_max_factor": 10000
+        }
+      },
+  
+      "output": {
+        "out_dir": "results/sweeps/t",
+        "run_tag": "t_sweep"
+      },
+  
+      "logging": {
+        "level": "info",
+        "with_timestamp": true,
+        "with_thread_id": false
+      },
+  
+      "sys": {
+        "threads": 1
+      }
+    },
+  
+    "sweep": {
+      "t": [
+        1000,
+        3000,
+        10000,
+        30000,
+        100000,
+        300000,
+        1000000
+      ],
+  
+      "method": [
+        "ours",
+        "aabb",
+        "interval_tree",
+        "kd_tree",
+        "r_tree",
+        "range_tree",
+        "pbsm",
+        "tlsop",
+        "sirs",
+        "rejection"
+      ],
+  
+      "variant": [
+        "sampling",
+        "enum_sampling",
+        "adaptive"
+      ]
+    },
+  
+    "files": {
+      "raw": "sweep_raw.csv",
+      "summary": "sweep_summary.csv"
+    },
+  
+    "meta": {
+      "note": "Sweep sample size t with a fixed synthetic dataset. Keep alpha moderate so EnumSampling stays feasible."
+    }
+  }
+  

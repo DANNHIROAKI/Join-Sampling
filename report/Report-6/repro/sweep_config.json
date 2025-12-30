@@ -1,0 +1,63 @@
+{
+  "base": {
+    "dataset": {
+      "source": "synthetic",
+      "name": "exp6_stripe",
+      "dim": 2,
+      "synthetic": {
+        "generator": "stripe",
+        "n_r": 100000,
+        "n_s": 100000,
+        "alpha": 0.1,
+        "seed": 1,
+        "params": {
+          "control_axis": 1,
+          "core_lo": 0.45,
+          "core_hi": 0.55,
+          "gap_factor": 0.10,
+          "delta_factor": 0.25,
+          "shuffle_strips": true,
+          "shuffle_r": false,
+          "swap_sides": false
+        }
+      }
+    },
+
+    "run": {
+      "method": "ours",
+      "variant": "sampling",
+      "t": 100000,
+      "seed": 1,
+      "repeats": 3,
+      "enum_cap": 0,
+      "j_star": 1000000,
+      "write_samples": false,
+      "verify": false,
+      "extra": {}
+    },
+
+    "output": {
+      "out_dir": "/home/dhy/PhD/SIGMOD-EXP/EXP-2/run/temp/exp6"
+    },
+
+    "logging": {
+      "level": "info"
+    },
+
+    "sys": {
+      "threads": 1
+    }
+  },
+
+  "sweep": {
+    "alpha": [0.01, 0.03, 0.1, 0.3, 1, 3, 10, 30],
+    "t": [1000, 3000, 10000, 30000, 100000, 300000, 1000000],
+    "method": ["ours"],
+    "variant": ["sampling", "enum_sampling", "adaptive"]
+  },
+
+  "files": {
+    "raw": "sweep_raw.csv",
+    "summary": "sweep_summary.csv"
+  }
+}
