@@ -1,0 +1,56 @@
+{
+  "dataset": {
+    "source": "synthetic",
+    "name": "default_rectgen_highdims",
+    "dim": 4,
+    "path_r": "",
+    "path_s": "",
+    "synthetic": {
+      "generator": "alacarte_rectgen",
+      "n_r": 100000,
+      "n_s": 100000,
+      "alpha": 10.0,
+      "seed": 1,
+      "params": {
+        "audit_pairs": 2000000,
+        "audit_seed": 0
+      }
+    }
+  },
+
+  "run": {
+    "method": "ours",
+    "variant": "sampling",
+    "t": 100000,
+    "seed": 1,
+    "repeats": 5,
+
+    "j_star": 1000000,
+    "enum_cap": 0,
+    "write_samples": false,
+    "verify": false,
+
+    "extra": {
+      "csv_sep": "tab"
+    }
+  },
+
+  "output": {
+    "out_dir": "results/raw",
+    "run_tag": "demo"
+  },
+
+  "sys": {
+    "threads": 1
+  },
+
+  "logging": {
+    "level": "info",
+    "with_timestamp": true,
+    "with_thread_id": false
+  },
+
+  "meta": {
+    "note": "Human-friendly template. Apps mainly read config from CLI; sweep harness reads JSON under {base:{...}, sweep:{...}}. Dim is runtime parameter and will be dispatched to template Run<Dim> via dim_dispatch."
+  }
+}

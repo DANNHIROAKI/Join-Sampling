@@ -1,0 +1,84 @@
+{
+  "base": {
+    "dataset": {
+      "source": "synthetic",
+      "name": "rectgen_alpha",
+      "dim": 4,
+      "path_r": "",
+      "path_s": "",
+      "synthetic": {
+        "generator": "alacarte_rectgen",
+        "n_r": 1000000,
+        "n_s": 1000000,
+        "alpha": 0.1,
+        "seed": 1,
+        "params": {
+          "audit_pairs": 2000000,
+          "audit_seed": 0
+        }
+      }
+    },
+
+    "run": {
+      "method": "ours",
+      "variant": "sampling",
+      "t": 100000,
+      "seed": 1,
+      "repeats": 3,
+
+      "j_star": 1000000,
+      "enum_cap": 0,
+      "write_samples": false,
+      "verify": false,
+
+      "extra": {
+        "csv_sep": "tab"
+      }
+    },
+
+    "output": {
+      "out_dir": "results/sweeps/alpha",
+      "run_tag": "alpha_sweep"
+    },
+
+    "logging": {
+      "level": "info",
+      "with_timestamp": true,
+      "with_thread_id": false
+    },
+
+    "sys": {
+      "threads": 1
+    }
+  },
+
+  "sweep": {
+    "alpha": [
+      0.1,
+      0.3,
+      1.0,
+      3.0,
+      10.0,
+      30.0,
+      100.0
+    ],
+    "method": [
+      "ours",
+      "range_tree",
+      "kd_tree"
+    ],
+    "variant": [
+      "sampling",
+      "adaptive"
+    ]
+  },
+
+  "files": {
+    "raw": "sweep_raw.csv",
+    "summary": "sweep_summary.csv"
+  },
+
+  "meta": {
+    "note": "Sweep alpha_out (|J|/(|R|+|S|)) for synthetic alacarte_rectgen. Fixed dim=4, N=1e6 per side, t=1e5. EnumSampling is excluded because its cost scales with |J| and becomes infeasible at high alpha."
+  }
+}

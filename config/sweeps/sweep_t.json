@@ -1,0 +1,84 @@
+{
+  "base": {
+    "dataset": {
+      "source": "synthetic",
+      "name": "rectgen_t",
+      "dim": 4,
+      "path_r": "",
+      "path_s": "",
+      "synthetic": {
+        "generator": "alacarte_rectgen",
+        "n_r": 1000000,
+        "n_s": 1000000,
+        "alpha": 10.0,
+        "seed": 1,
+        "params": {
+          "audit_pairs": 2000000,
+          "audit_seed": 0
+        }
+      }
+    },
+
+    "run": {
+      "method": "ours",
+      "variant": "sampling",
+      "t": 1000,
+      "seed": 1,
+      "repeats": 3,
+
+      "j_star": 1000000,
+      "enum_cap": 0,
+      "write_samples": false,
+      "verify": false,
+
+      "extra": {
+        "csv_sep": "tab"
+      }
+    },
+
+    "output": {
+      "out_dir": "results/sweeps/t",
+      "run_tag": "t_sweep"
+    },
+
+    "logging": {
+      "level": "info",
+      "with_timestamp": true,
+      "with_thread_id": false
+    },
+
+    "sys": {
+      "threads": 1
+    }
+  },
+
+  "sweep": {
+    "t": [
+      1000,
+      3000,
+      10000,
+      30000,
+      100000,
+      300000,
+      1000000
+    ],
+    "method": [
+      "ours",
+      "range_tree",
+      "kd_tree"
+    ],
+    "variant": [
+      "sampling",
+      "adaptive"
+    ]
+  },
+
+  "files": {
+    "raw": "sweep_raw.csv",
+    "summary": "sweep_summary.csv"
+  },
+
+  "meta": {
+    "note": "Sweep sample size t with fixed synthetic dataset. Synthetic generator: alacarte_rectgen. Fixed dim=4, N=1e6 per side, alpha_out=10. EnumSampling excluded because it scales with |J| rather than t."
+  }
+}

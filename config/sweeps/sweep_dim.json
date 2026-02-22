@@ -1,0 +1,85 @@
+{
+  "base": {
+    "dataset": {
+      "source": "synthetic",
+      "name": "rectgen_dim",
+      "dim": 4,
+      "path_r": "",
+      "path_s": "",
+      "synthetic": {
+        "generator": "alacarte_rectgen",
+        "n_r": 1000000,
+        "n_s": 1000000,
+        "alpha": 10.0,
+        "seed": 1,
+        "params": {
+          "audit_pairs": 2000000,
+          "audit_seed": 0
+        }
+      }
+    },
+
+    "run": {
+      "method": "ours",
+      "variant": "sampling",
+      "t": 100000,
+      "seed": 1,
+      "repeats": 3,
+
+      "j_star": 1000000,
+      "enum_cap": 0,
+      "write_samples": false,
+      "verify": false,
+
+      "extra": {
+        "csv_sep": "tab"
+      }
+    },
+
+    "output": {
+      "out_dir": "results/sweeps/dim",
+      "run_tag": "dim_sweep"
+    },
+
+    "logging": {
+      "level": "info",
+      "with_timestamp": true,
+      "with_thread_id": false
+    },
+
+    "sys": {
+      "threads": 1
+    }
+  },
+
+  "sweep": {
+    "dim": [
+      2,
+      3,
+      4,
+      5,
+      6
+    ],
+    "method": [
+      "ours",
+      "range_tree",
+      "kd_tree"
+    ],
+    "variant": [
+      "sampling",
+      "adaptive"
+    ],
+    "t": [
+      100000
+    ]
+  },
+
+  "files": {
+    "raw": "sweep_raw.csv",
+    "summary": "sweep_summary.csv"
+  },
+
+  "meta": {
+    "note": "Dim sweep (dim>=2). Synthetic generator: alacarte_rectgen. Fixed N=1e6 per side, alpha_out=10, t=1e5. Requires compilation with SJS_DIMS including the dims listed here; unsupported dims will be skipped by runtime dispatch."
+  }
+}
