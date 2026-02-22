@@ -13,7 +13,7 @@
 # Key env knobs (safe defaults):
 #   BUILD_TYPE=Release
 #   PARALLEL_LIGHT=8
-#   PARALLEL_HEAVY=1
+#   PARALLEL_HEAVY=1 
 #   HEAVY_T=30000000
 #   TIME_LIMIT_SEC=7200
 #   TIME_KILL_GRACE_SEC=30
