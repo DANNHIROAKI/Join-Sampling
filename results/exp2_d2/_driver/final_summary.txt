@@ -1,0 +1,9 @@
+Experiment II (d=2) - Final Summary
+timestamp=2026-02-22 00:08:51
+total_jobs=161
+results_dir=results/exp2_d2
+
+done_jobs=161
+failed_or_skipped_jobs=0
+
+All jobs DONE.

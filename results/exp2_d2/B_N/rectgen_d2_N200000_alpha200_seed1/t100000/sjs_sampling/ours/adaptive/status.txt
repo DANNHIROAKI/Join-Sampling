@@ -1,0 +1,11 @@
+timestamp=2026-02-21 22:45:27
+attempt=1
+exp=B_N
+dataset=rectgen_d2_N200000_alpha200_seed1
+t=100000
+label=sjs_sampling
+method=ours
+variant=adaptive
+exit_code=0
+reason=OK
+out_dir=results/exp2_d2/B_N/rectgen_d2_N200000_alpha200_seed1/t100000/sjs_sampling/ours/adaptive

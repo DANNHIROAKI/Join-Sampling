@@ -1,0 +1,11 @@
+timestamp=2026-02-21 22:26:58
+attempt=1
+exp=A_alpha
+dataset=rectgen_d2_N1000000_alpha3_seed1
+t=100000
+label=rt_sampling
+method=range_tree
+variant=adaptive
+exit_code=0
+reason=OK
+out_dir=results/exp2_d2/A_alpha/rectgen_d2_N1000000_alpha3_seed1/t100000/rt_sampling/range_tree/adaptive

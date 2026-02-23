@@ -1,0 +1,11 @@
+timestamp=2026-02-21 22:45:42
+attempt=1
+exp=B_N
+dataset=rectgen_d2_N500000_alpha200_seed1
+t=100000
+label=kds_sampling
+method=kd_tree
+variant=sampling
+exit_code=0
+reason=OK
+out_dir=results/exp2_d2/B_N/rectgen_d2_N500000_alpha200_seed1/t100000/kds_sampling/kd_tree/sampling
