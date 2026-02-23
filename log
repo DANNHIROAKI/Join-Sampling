@@ -1,0 +1,51 @@
+nohup: ignoring input
+[2026-02-21 16:47:49] BUILD_TYPE=Release
+[2026-02-21 16:47:49] PARALLEL_LIGHT=8 PARALLEL_HEAVY=1 HEAVY_T=30000000
+[2026-02-21 16:47:49] TIME_LIMIT_SEC=7200 (kill grace 30s)
+[2026-02-21 16:47:49] REPEATS=5 (warmup 1) MASTER_SEED=1
+[2026-02-21 16:47:49] [WARN] CLEAN_RESULTS=1: removing results/exp2_d2
+[2026-02-21 16:47:49] Building C++ binaries (this may take a while the first time)...
+[run.sh] Repo root : /home/dhy/PhD/SJS
+[run.sh] Build type: Release
+[run.sh] Build dir : /home/dhy/PhD/SJS/build/release
+[run.sh] JOBS      : 128
+[run.sh] Building...
+[ 14%] Built target sjs
+[ 21%] Built target sjs_run
+[ 28%] Built target sjs_test_rank_space
+[ 35%] Built target sjs_sweep
+[ 42%] Built target sjs_test_segtree_1d
+[ 50%] Built target sjs_verify
+[ 64%] Built target sjs_test_mode_family_nd
+[ 64%] Built target sjs_test_sampling_quality_nd
+[ 78%] Built target sjs_test_mode_index_nd
+[ 78%] Built target sjs_test_geometry_nd
+[ 85%] Built target sjs_gen_dataset
+[ 96%] Built target sjs_test_baselines_smoke_nd
+[100%] Built target sjs_test_event_sweep_nd
+[2026-02-21 16:47:49] Using sjs_run: build/release/sjs_run
+[2026-02-21 16:47:49] Generating (or reusing) all required synthetic datasets...
+[2026-02-21 16:47:49] [DS] OK cached: rectgen_d2_N1000000_alpha0p1_seed1
+[2026-02-21 16:47:49] [DS] OK cached: rectgen_d2_N1000000_alpha0p3_seed1
+[2026-02-21 16:47:49] [DS] OK cached: rectgen_d2_N1000000_alpha1_seed1
+[2026-02-21 16:47:49] [DS] OK cached: rectgen_d2_N1000000_alpha3_seed1
+[2026-02-21 16:47:49] [DS] OK cached: rectgen_d2_N1000000_alpha10_seed1
+[2026-02-21 16:47:49] [DS] OK cached: rectgen_d2_N1000000_alpha30_seed1
+[2026-02-21 16:47:49] [DS] OK cached: rectgen_d2_N1000000_alpha100_seed1
+[2026-02-21 16:47:49] [DS] OK cached: rectgen_d2_N1000000_alpha300_seed1
+[2026-02-21 16:47:49] [DS] OK cached: rectgen_d2_N1000000_alpha1000_seed1
+[2026-02-21 16:47:49] [DS] OK cached: rectgen_d2_N100000_alpha200_seed1
+[2026-02-21 16:47:49] [DS] OK cached: rectgen_d2_N200000_alpha200_seed1
+[2026-02-21 16:47:49] [DS] OK cached: rectgen_d2_N500000_alpha200_seed1
+[2026-02-21 16:47:49] [DS] OK cached: rectgen_d2_N1000000_alpha200_seed1
+[2026-02-21 16:47:49] [DS] OK cached: rectgen_d2_N2000000_alpha200_seed1
+[2026-02-21 16:47:49] [DS] OK cached: rectgen_d2_N5000000_alpha200_seed1
+[2026-02-21 16:47:49] Wrote job manifest: results/exp2_d2/_driver/jobs_all.tsv (lines=161)
+[2026-02-21 16:47:49] Starting Experiment II (d=2) job execution...
+[2026-02-21 16:47:49] Attempt 1/3: pending light=100 heavy=61
+[2026-02-21 16:47:49] Running jobs_pending_heavy_attempt1.tsv (jobs=61, parallel=1, attempt=1)
+[2026-02-21 22:19:07] Running jobs_pending_light_attempt1.tsv (jobs=100, parallel=8, attempt=1)
+[2026-02-22 00:08:51] Attempt 2/3: pending light=0 heavy=0
+[2026-02-22 00:08:51] Collecting final status summary...
+[2026-02-22 00:08:52] DONE. Summary written to: results/exp2_d2/_driver/final_summary.txt
+[2026-02-22 00:08:52] Finished jobs: 161 / 161

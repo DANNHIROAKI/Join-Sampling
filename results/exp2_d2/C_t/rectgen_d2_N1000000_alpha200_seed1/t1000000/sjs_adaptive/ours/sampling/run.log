@@ -1,0 +1,33 @@
+2026-02-21 23:49:51.796 [INFO] Loaded dataset: rectgen_d2_N1000000_alpha200_seed1 Dim= 2 R= 1000000 S= 1000000
+2026-02-21 23:49:51.796 [INFO] Baseline: ours_highdims_sampling method= ours variant= sampling Dim= 2
+2026-02-21 23:50:43.323 [INFO] Run ok (rep= 0 ) Dim= 2 wall_ms= 51527.2 count= 4.03242e+08 (exact) samples= 1000000
+2026-02-21 23:51:37.793 [INFO] Run ok (rep= 1 ) Dim= 2 wall_ms= 54469.9 count= 4.03242e+08 (exact) samples= 1000000
+2026-02-21 23:52:33.159 [INFO] Run ok (rep= 2 ) Dim= 2 wall_ms= 55365.3 count= 4.03242e+08 (exact) samples= 1000000
+2026-02-21 23:53:27.538 [INFO] Run ok (rep= 3 ) Dim= 2 wall_ms= 54379.4 count= 4.03242e+08 (exact) samples= 1000000
+2026-02-21 23:54:21.898 [INFO] Run ok (rep= 4 ) Dim= 2 wall_ms= 54359.2 count= 4.03242e+08 (exact) samples= 1000000
+2026-02-21 23:54:21.898 [INFO] Wall-time summary (ms) [all]: {"n":5,"mean":54020.2,"stdev":1455.19,"sem":650.782,"min":51527.2,"max":55365.3,"median":54379.4,"p90":55007.1,"p95":55186.2,"p99":55329.5}
+2026-02-21 23:54:21.898 [INFO] Wall-time summary (ms) [ok-only]: {"n":5,"mean":54020.2,"stdev":1455.19,"sem":650.782,"min":51527.2,"max":55365.3,"median":54379.4,"p90":55007.1,"p95":55186.2,"p99":55329.5} ok_rate= 1
+2026-02-21 23:54:21.898 [INFO] Wrote results to: results/exp2_d2/C_t/rectgen_d2_N1000000_alpha200_seed1/t1000000/sjs_adaptive/ours/sampling/run.csv
+	Command being timed: "timeout -k 30s 7200s /home/dhy/PhD/SJS/build/release/sjs_run --dataset_source=binary --dataset=rectgen_d2_N1000000_alpha200_seed1 --dim=2 --path_r=data/synthetic/exp2_d2/rectgen_d2_N1000000_alpha200_seed1/R.bin --path_s=data/synthetic/exp2_d2/rectgen_d2_N1000000_alpha200_seed1/S.bin --method=ours --variant=sampling --t=1000000 --seed=1 --repeats=5 --threads=1 --out_dir=results/exp2_d2/C_t/rectgen_d2_N1000000_alpha200_seed1/t1000000/sjs_adaptive/ours/sampling --results_file=results/exp2_d2/C_t/rectgen_d2_N1000000_alpha200_seed1/t1000000/sjs_adaptive/ours/sampling/run.csv --write_samples=0 --verify=0 --enum_cap=0 --budget=10000000 --w_small=1024 --prefetch=1"
+	User time (seconds): 271.83
+	System time (seconds): 1.53
+	Percent of CPU this job got: 99%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 4:33.48
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 1515692
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 517676
+	Voluntary context switches: 3
+	Involuntary context switches: 28165
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 64
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
