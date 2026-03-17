@@ -1,0 +1,127 @@
+# -----------------------------------------------------------------------------
+# Build system outputs (CMake / Ninja)
+# -----------------------------------------------------------------------------
+/build/
+/build_*/
+/build-local/
+/build_local/
+/cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+install_manifest.txt
+Testing/
+build.ninja
+.ninja_*
+*.ninja_deps
+*.ninja_log
+
+# -----------------------------------------------------------------------------
+# Compiled objects / binaries
+# -----------------------------------------------------------------------------
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+*.pdb
+*.dSYM/
+
+# -----------------------------------------------------------------------------
+# Coverage / profiling artifacts
+# -----------------------------------------------------------------------------
+*.gcda
+*.gcno
+*.gcov
+*.profraw
+*.profdata
+*.coverage
+coverage/
+htmlcov/
+
+# -----------------------------------------------------------------------------
+# Experiment runtime artifacts
+# -----------------------------------------------------------------------------
+/log/
+/run/temp/
+/results/
+/log_temp
+nohup.out
+*.log
+*.pid
+*.tmp
+*.temp
+*.bak
+*.meta
+*.ok
+*.nr
+*.fail
+*.exit
+gen.log
+gen_report.json
+DONE
+FAILURES.tsv
+
+# Generated datasets (keep placeholders if these dirs exist)
+/data/real/*
+!/data/real/.gitkeep
+/data/synthetic/*
+!/data/synthetic/.gitkeep
+
+# -----------------------------------------------------------------------------
+# Python cache / virtual environments
+# -----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.eggs/
+*.egg-info/
+dist/
+pip-wheel-metadata/
+*.whl
+
+# -----------------------------------------------------------------------------
+# Archives and packaged outputs
+# -----------------------------------------------------------------------------
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+
+# -----------------------------------------------------------------------------
+# IDE / editor
+# -----------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+*.sublime-*
+
+# -----------------------------------------------------------------------------
+# OS junk
+# -----------------------------------------------------------------------------
+.DS_Store
+.DS_Store?
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.cache/
