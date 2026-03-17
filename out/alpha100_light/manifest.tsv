@@ -1,5 +1,0 @@
-dim	n	alpha	t_list	gen_seeds	run_seeds	config	out_dir
-2	10000	100	10000 50000 100000	7 17	1 2 3	/home/dhy/PhD/v2/out/alpha100_light/_configs/alpha100_lite_d2.json	/home/dhy/PhD/v2/out/alpha100_light/d2
-3	2000	100	10000 50000 100000	7 17	1 2 3	/home/dhy/PhD/v2/out/alpha100_light/_configs/alpha100_lite_d3.json	/home/dhy/PhD/v2/out/alpha100_light/d3
-4	500	100	10000 50000 100000	7 17	1 2 3	/home/dhy/PhD/v2/out/alpha100_light/_configs/alpha100_lite_d4.json	/home/dhy/PhD/v2/out/alpha100_light/d4
-5	200	100	10000 50000 100000	7 17	1 2 3	/home/dhy/PhD/v2/out/alpha100_light/_configs/alpha100_lite_d5.json	/home/dhy/PhD/v2/out/alpha100_light/d5
